@@ -290,6 +290,38 @@
   box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.3) !important;
 }
 
+/* Focus for the settings-card controls that are NOT .settings-gate__btn: the
+   "+ Add More Bots" / "Disconnect" text links, the per-bot row buttons and the addon
+   links. All real <button>s, so a D-pad lands on them — but with no focus rule the
+   screen did not change when it did. Measured on a device: the ring showed on the
+   close button, and the very next press lost every visible indicator, leaving the
+   user pressing keys blind in the middle of the settings card. */
+.settings-gate__link:focus-visible,
+.settings-gate__link:focus,
+.settings-gate__addon-link:focus-visible,
+.settings-gate__addon-link:focus {
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  outline-offset: 2px;
+  border-radius: 3px;
+  color: #fff !important;
+}
+
+.bot-pool-item__set-btn:focus-visible,
+.bot-pool-item__set-btn:focus,
+.bot-pool-item__remove-btn:focus-visible,
+.bot-pool-item__remove-btn:focus {
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  border-radius: 4px;
+  color: #fff !important;
+}
+
+/* Light the whole row, not just the ~14px button, so it is obvious which bot the
+   remote is about to act on. */
+.bot-pool-item:focus-within {
+  background: rgba(255, 107, 53, 0.16) !important;
+  outline: 2px solid var(--accent, #ff6b35) !important;
+}
+
 .settings-gate__card {
   position: relative;
 }
