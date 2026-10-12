@@ -7,6 +7,7 @@
 
 <p align="center">
   <a href="#-quick-install">Quick Install</a> •
+  <a href="#-1-click-cloud-deployment">Cloud Deploy</a> •
   <a href="#-docker--environment-variables">Docker & .env</a> •
   <a href="#-stremio-nuvio--eclipse-music-setup">App Setup</a> •
   <a href="#-server-security--remote-token-auth">Security & Auth</a> •
@@ -91,6 +92,22 @@ Once started, open the web dashboard:
 
 ---
 
+## ☁️ 1-Click Cloud Deployment
+
+Deploy your personal PencariMovie Server to the cloud with a single click:
+
+| Platform    | One-Click Deploy                                                                                                                                                                                                           | Description                                                                |
+| :---------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------- |
+| **Orkestr** | [![Deploy on Orkestr](https://img.shields.io/badge/Deploy%20on-Orkestr-0070f3?style=for-the-badge&logo=docker&logoColor=white)](https://orkestr.eu/new?repo=https%3A%2F%2Fgithub.com%2Faiskendi%2Fpencarimovie-server.git) | Quick container setup on European cloud infrastructure.                    |
+| **Railway** | [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/ZHHNFC)                                                                                                                                  | Pre-configured template with automatic networking and Docker build.        |
+| **Render**  | [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/aiskendi/pencarimovie-server)                                                               | Deploys using native Docker configuration in `render.yaml`.                |
+| **Heroku**  | [![Deploy to Heroku](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/aiskendi/pencarimovie-server&env[SERVER_TOKEN]=66ff097863dedb7ccd8401d5ffe616f2)                  | Deploys via `app.json` container stack with a pre-configured access token. |
+
+> 💡 **Permanent Addon URL on Cloud / PaaS**:
+> Always set a static **`SERVER_TOKEN`** (e.g. `66ff097863dedb7ccd8401d5ffe616f2`) in your cloud provider's environment variables. This keeps your Stremio / Nuvio manifest URL (`https://<your-app>.up.railway.app/<token>/manifest.json`) permanent so you never need to re-install addons when your container restarts or redeploys.
+
+---
+
 ## 🐳 Docker & Environment Variables
 
 PencariMovie Server can be fully configured using a `.env` file or container environment variables, allowing you to set static passwords, tokens, ports, and thread limits.
@@ -116,51 +133,67 @@ services:
 Create a `.env` file in your project directory:
 
 ```ini
-# Server Port
+# Server Port (auto-assigned by PaaS or default 8088)
 PORT=8088
 
-# Remote Access & Security (Required only when accessed publicly / VPS)
+# Remote Access & Security (Permanent token and dashboard password)
 SERVER_PASSWORD=your_secure_password
-SERVER_TOKEN=a1b2c3d4e5f67890123456789abcdef0
+SERVER_TOKEN=66ff097863dedb7ccd8401d5ffe616f2
 
-# Optional: Cloudflare Named Tunnel Token (auto-starts tunnel on launch)
+# Optional: Cloudflare Zero Trust Named Tunnel Token (auto-connects on startup)
 TUNNEL_TOKEN=eyJh...
 
-# Optional: Custom Telegram Bot Token (overrides guest auto-provisioning)
+# Optional: Custom Telegram Bot API Token (overrides guest auto-provisioning)
 BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
-# Optional: Local Network IP Override
+# Optional: Local Network IP Override (if running behind multi-adapter Docker bridge)
 # LAN_IP=192.168.1.100
 
 # Performance & Concurrency Tuning
 FRANKENPHP_NUM_THREADS=8
 FRANKENPHP_MAX_THREADS=16
+FRANKENPHP_MAX_WAIT_TIME=20s
 FD_DOWNLOAD_PARALLEL_CHUNKS=4
+
+# Memory & Runtime Optimization
+MALLOC_ARENA_MAX=2
+# GOMEMLIMIT=550MiB
+# PHP_MEMORY_LIMIT=256M
 
 # Optional: External Database for Session ORM (Redis / MySQL / Postgres)
 # REDIS_URI=redis://127.0.0.1:6379
 # MYSQL_URI=mysql://user:pass@127.0.0.1:3306/pencarimovie
+# POSTGRES_URI=postgres://user:pass@127.0.0.1:5432/pencarimovie
 
-# Debug Mode
+# Optional: Custom DNS Resolution Pinning (e.g. host:port:ip)
+# FD_CURL_RESOLVE=pencarimovie.com:443:104.21.15.194
+
+# Debug Logging (0 = off, 1 = verbose storage/debug.log)
 DEBUG=0
 ```
 
 ### Configuration Variables Reference
 
-| Variable                      | Default            | Description                                                                                         |
-| :---------------------------- | :----------------- | :-------------------------------------------------------------------------------------------------- |
-| `PORT`                        | `8088`             | Port where the server listens.                                                                      |
-| `SERVER_PASSWORD`             | `123456`           | Password for web dashboard access on public VPS IPs and Cloudflare Tunnels (LAN is password-free).  |
-| `SERVER_TOKEN`                | _(auto-generated)_ | 32-character static access token for public remote addon URLs (`/<token>/manifest.json`).           |
-| `TUNNEL_TOKEN`                | _(empty)_          | Cloudflare Zero Trust Named Tunnel token. Automatically launches connector on container start.      |
-| `BOT_TOKEN`                   | _(auto-provision)_ | Specific Telegram Bot API token. If omitted, the server automatically mints and rotates guest bots. |
-| `LAN_IP`                      | _(auto-detected)_  | Manually overrides the host's LAN IPv4 address for multi-device Wi-Fi manifests.                    |
-| `FRANKENPHP_NUM_THREADS`      | `8`                | Initial FrankenPHP worker threads for concurrent request handling.                                  |
-| `FRANKENPHP_MAX_THREADS`      | `16`               | Maximum FrankenPHP thread scaling ceiling under high stream load.                                   |
-| `FD_DOWNLOAD_PARALLEL_CHUNKS` | `4`                | Parallel chunk download concurrency per active stream.                                              |
-| `REDIS_URI`                   | _(empty)_          | Redis connection string (`redis://...`) to offload session ORM state.                               |
-| `MYSQL_URI`                   | _(empty)_          | MySQL connection string (`mysql://...`) for external database session storage.                      |
-| `DEBUG`                       | `0`                | Set to `1` or `true` to enable verbose stream and MadelineProto logging in `storage/debug.log`.     |
+| Variable                      | Default            | Description                                                                                                                                     |
+| :---------------------------- | :----------------- | :---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                        | `8088`             | Port where the server listens (or provided by PaaS runtime).                                                                                    |
+| `SERVER_PASSWORD`             | `123456`           | Static password for web dashboard access on public IPs, tunnels, and cloud hosts. LAN is password-free.                                         |
+| `SERVER_TOKEN`                | _(auto-generated)_ | 32-character static access token for public addon URLs (`/<token>/manifest.json`). Set this to make your addon link permanent across redeploys. |
+| `TUNNEL_TOKEN`                | _(empty)_          | Cloudflare Zero Trust Named Tunnel token. Automatically launches connector on container start.                                                  |
+| `BOT_TOKEN`                   | _(auto-provision)_ | Custom Telegram Bot API token. If omitted, the server automatically mints and rotates guest bots.                                               |
+| `LAN_IP`                      | _(auto-detected)_  | Manually overrides the host's LAN IPv4 address for multi-device Wi-Fi manifests.                                                                |
+| `FRANKENPHP_NUM_THREADS`      | `8`                | Initial FrankenPHP worker threads for concurrent request handling (auto-tuned in Docker containers).                                            |
+| `FRANKENPHP_MAX_THREADS`      | `16`               | Maximum FrankenPHP thread scaling ceiling under high stream load.                                                                               |
+| `FRANKENPHP_MAX_WAIT_TIME`    | `20s`              | Maximum wait time for thread availability before failing fast.                                                                                  |
+| `FD_DOWNLOAD_PARALLEL_CHUNKS` | `4`                | Parallel chunk download concurrency per active stream (reduced to 2-3 on low-RAM containers).                                                   |
+| `MALLOC_ARENA_MAX`            | `2`                | Caps glibc memory arenas to prevent virtual memory inflation and fragmentation in long-running containers.                                      |
+| `GOMEMLIMIT`                  | _(auto-detected)_  | Go runtime memory ceiling, automatically calibrated from container cgroups to avoid OOM crashes.                                                |
+| `PHP_MEMORY_LIMIT`            | `512M`             | PHP memory limit per request (scaled to 96M-256M in containers).                                                                                |
+| `REDIS_URI`                   | _(empty)_          | Redis connection string (`redis://...`) to offload MadelineProto session ORM state.                                                             |
+| `MYSQL_URI`                   | _(empty)_          | MySQL connection string (`mysql://...`) for external database session storage.                                                                  |
+| `POSTGRES_URI`                | _(empty)_          | PostgreSQL connection string (`postgres://...`) for external database session storage.                                                          |
+| `FD_CURL_RESOLVE`             | _(empty)_          | Custom DNS mapping (`host:port:ip`) to bypass restrictive ISP firewalls or DNS blocks.                                                          |
+| `DEBUG`                       | `0`                | Set to `1` or `true` to enable verbose stream, IPC, and MadelineProto diagnostics in `storage/debug.log`.                                       |
 
 ---
 

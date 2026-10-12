@@ -1,14 +1,28 @@
 {
   "name": "pencarimovie-server",
-  "description": "PencariMovie Server - Telegram file streamer and Stremio/Eclipse media addon",
+  "description": "PencariMovie Server - Telegram file streamer and Stremio/Nuvio media addon",
+  "repository": "https://github.com/aiskendi/pencarimovie-server",
   "keywords": [
     "telegram",
     "stremio",
+    "nuvio",
     "frankenphp",
     "madelineproto",
     "streamer"
   ],
   "stack": "container",
+  "env": {
+    "SERVER_TOKEN": {
+      "description": "32-character static access token for public addon URLs (e.g. /<token>/manifest.json)",
+      "value": "66ff097863dedb7ccd8401d5ffe616f2",
+      "required": false
+    },
+    "SERVER_PASSWORD": {
+      "description": "Password for web dashboard access on public deployments",
+      "value": "123456",
+      "required": false
+    }
+  },
   "formation": {
     "web": {
       "quantity": 1
