@@ -222,9 +222,72 @@
   z-index: 1;
 }
 
-.settings-gate__close:hover {
-  background: rgba(255, 255, 255, 0.12);
+.settings-gate__close:hover,
+.settings-gate__close:focus-visible,
+.settings-gate__close:focus {
+  background: rgba(255, 255, 255, 0.25);
   color: #fff;
+  outline: 2px solid var(--accent, #ff6b35) !important;
+}
+
+.settings-gate__btn:focus-visible,
+.settings-gate__btn:focus {
+  outline: 2px solid #fff !important;
+  box-shadow: 0 0 0 4px rgba(255, 107, 53, 0.45) !important;
+  filter: brightness(1.2);
+}
+
+.addon-catalog-mode-opt:focus-within {
+  border-color: var(--accent, #ff6b35) !important;
+  background: rgba(255, 107, 53, 0.12) !important;
+  outline: 2px solid var(--accent, #ff6b35) !important;
+}
+
+.addon-catalog-pill:focus-within {
+  border-color: #00d26a !important;
+  background: rgba(0, 210, 106, 0.15) !important;
+  outline: 2px solid #00d26a !important;
+}
+
+.addon-catalog-item:focus-within {
+  border-color: var(--accent, #ff6b35) !important;
+  background: rgba(255, 107, 53, 0.22) !important;
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  color: #fff !important;
+  box-shadow: 0 0 8px rgba(255, 107, 53, 0.5) !important;
+}
+
+.addon-mode-toggle__option:focus-within {
+  border-color: var(--accent, #ff6b35) !important;
+  background: rgba(255, 107, 53, 0.22) !important;
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  color: #fff !important;
+  box-shadow: 0 0 8px rgba(255, 107, 53, 0.5) !important;
+}
+
+#upstreamEnabledToggle:focus,
+#upstreamEnabledToggle:focus-visible {
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  box-shadow: 0 0 8px rgba(255, 107, 53, 0.6) !important;
+}
+
+#upstreamAddonsList button:focus,
+#upstreamAddonsList button:focus-visible {
+  outline: 2px solid #ff5e57 !important;
+  background: rgba(255, 94, 87, 0.2) !important;
+  border-radius: 4px;
+}
+
+.addon-catalog-link-btn:focus-visible,
+.addon-catalog-link-btn:focus {
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  color: #fff !important;
+}
+
+.addon-country-select:focus-visible,
+.addon-country-select:focus {
+  outline: 2px solid var(--accent, #ff6b35) !important;
+  box-shadow: 0 0 0 3px rgba(255, 107, 53, 0.3) !important;
 }
 
 .settings-gate__card {

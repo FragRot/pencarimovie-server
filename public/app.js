@@ -2689,7 +2689,106 @@ class PencariMovieApp {
         window.__pmLoadShellBundle?.();
       }
     }
+    this._ensureOverlayDpadNav();
     return visible;
+  }
+
+  _ensureOverlayDpadNav() {
+    if (this._overlayDpadInstalled) return;
+    this._overlayDpadInstalled = true;
+
+    const getOverlayFocusables = (modal) => {
+      return Array.from(modal.querySelectorAll(
+        'a[href],button:not([disabled]),input:not([type=hidden]):not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+      )).filter((el) => {
+        const b = el.getBoundingClientRect();
+        return b.width > 0 && b.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+      });
+    };
+
+    document.addEventListener('keydown', (e) => {
+      const modal = document.querySelector('#addonModal:not(.hidden), #settingsGate:not(.hidden), #authGate:not(.hidden)');
+      if (!modal) return;
+
+      const code = e.keyCode || e.which;
+      const keyName = String(e.key || '');
+      const isDown = code === 40;
+      const isUp = code === 38;
+      const isRight = code === 39;
+      const isLeft = code === 37;
+      const isEnter = code === 13 || code === 23 || code === 66 || keyName === 'Enter' || keyName === 'OK' || keyName === 'Select';
+      const isSpace = code === 32 || keyName === ' ' || keyName === 'Space';
+
+      const active = document.activeElement;
+
+      // Handle Enter / Space / OK toggle on checkboxes and radio buttons in modals
+      if ((isEnter || isSpace) && active && active.tagName === 'INPUT') {
+        if (active.type === 'checkbox') {
+          e.preventDefault();
+          e.stopPropagation();
+          active.checked = !active.checked;
+          active.dispatchEvent(new Event('change', { bubbles: true }));
+          return;
+        }
+        if (active.type === 'radio' && !active.checked) {
+          e.preventDefault();
+          e.stopPropagation();
+          active.checked = true;
+          active.dispatchEvent(new Event('change', { bubbles: true }));
+          return;
+        }
+      }
+
+      // If active element is a button inside modal, ensure Enter/OK clicks it
+      if (isEnter && active && active.tagName === 'BUTTON') {
+        e.preventDefault();
+        e.stopPropagation();
+        active.click();
+        return;
+      }
+
+      if (!isDown && !isUp && !isRight && !isLeft) return;
+
+      const focusables = getOverlayFocusables(modal);
+      if (!focusables.length) return;
+
+      let idx = focusables.indexOf(active);
+
+      // If nothing in the modal is focused, initial D-pad jumps to the first focusable
+      if (idx === -1) {
+        e.preventDefault();
+        focusables[0].focus();
+        if (typeof focusables[0].scrollIntoView === 'function') {
+          focusables[0].scrollIntoView({ block: 'nearest' });
+        }
+        return;
+      }
+
+      const isText = (active.tagName === 'INPUT' && !/^(checkbox|radio|button|submit|reset)$/i.test(active.type)) || active.tagName === 'TEXTAREA';
+
+      // Within a text input, left/right navigate cursor unless at ends
+      if (isText && (isLeft || isRight)) {
+        return;
+      }
+
+      // Within select or radio inputs, up/down or left/right move focus to next/prev control instead of trapping
+      let nextIdx = idx;
+      if (isDown || isRight) {
+        nextIdx = idx < focusables.length - 1 ? idx + 1 : 0;
+      } else if (isUp || isLeft) {
+        nextIdx = idx > 0 ? idx - 1 : focusables.length - 1;
+      }
+
+      if (nextIdx !== idx && focusables[nextIdx]) {
+        e.preventDefault();
+        e.stopPropagation();
+        const target = focusables[nextIdx];
+        target.focus();
+        if (typeof target.scrollIntoView === 'function') {
+          target.scrollIntoView({ block: 'nearest' });
+        }
+      }
+    }, true);
   }
 
   showSettingsGate(options = {}) {
