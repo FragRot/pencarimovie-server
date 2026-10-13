@@ -20,6 +20,8 @@ for /f "tokens=4" %%i in ('route print -4 0.0.0.0 ^| findstr /R /C:" 0\.0\.0\.0[
   if not defined LAN_IP set "LAN_IP=%%i"
 )
 
+call :runtime_check
+
 if exist "%FRANKENPHP_EXE%" goto start_server
 php -v >nul 2>nul
 if errorlevel 1 (
@@ -73,6 +75,25 @@ if not exist "%ROOT%\start-hidden.ps1" (
   goto :eof
 )
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\start-hidden.ps1" -FilePath powershell.exe -CommandLine "-NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File ""%ROOT%\tray.ps1"" -Port %PORT% -OpenUrl http://127.0.0.1:%PORT% -StopBat ""%ROOT%\stop.bat"" -StartServer"
+goto :eof
+
+:runtime_check
+rem Surface the two environment failures that otherwise kill the server with no
+rem visible error: a missing MSVC runtime (frankenphp.exe exits 0xC0000135 and
+rem prints nothing) and Windows Smart App Control blocking the unsigned PHP
+rem binaries and extension DLLs (every extension then reports as missing).
+if not exist "%SystemRoot%\System32\vcruntime140.dll" (
+    echo   [x] Microsoft Visual C++ 2015-2022 x64 runtime is missing.
+    echo       frankenphp.exe cannot start without it ^(exit code 0xC0000135^).
+    echo       Install: https://aka.ms/vs/17/release/vc_redist.x64.exe
+)
+set "SAC_STATE="
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "try { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction Stop).VerifiedAndReputablePolicyState } catch { -1 }"`) do set "SAC_STATE=%%S"
+if "!SAC_STATE!"=="1" (
+    echo   [x] Windows Smart App Control is ON and blocks the bundled PHP runtime.
+    echo       Turn it off: Windows Security ^> App ^& browser control ^> Smart App Control ^> Off
+    echo       ^(One-way: only a Windows reinstall re-enables it.^)
+)
 goto :eof
 
 :print_banner

@@ -52,6 +52,7 @@ if not "%1"=="" (
 )
 
 :start
+call :runtime_check
 if exist "%APP_DIR%\backend.php" set "HAD_APP=1"
 call :install_or_update
 call :register_cmd_path
@@ -404,6 +405,25 @@ if not exist "%APP_DIR%" mkdir "%APP_DIR%" 2>nul
 
 set "PENCARIMOVIE_PATH_DIR=%APP_DIR%"
 powershell -NoProfile -Command "& { $dir = $env:PENCARIMOVIE_PATH_DIR; if (-not $dir) { $dir = Join-Path $env:USERPROFILE 'pencarimovie-server' }; $curr = [Environment]::GetEnvironmentVariable('Path', 'User'); if ($curr -notlike ('*' + $dir + '*')) { [Environment]::SetEnvironmentVariable('Path', ($curr.TrimEnd(';') + ';' + $dir), 'User'); $env:Path += ';' + $dir } }" >nul 2>&1
+goto :eof
+
+:runtime_check
+rem Surface the two environment failures that otherwise kill the server with no
+rem visible error: a missing MSVC runtime (frankenphp.exe exits 0xC0000135 and
+rem prints nothing) and Windows Smart App Control blocking the unsigned PHP
+rem binaries and extension DLLs (every extension then reports as missing).
+if not exist "%SystemRoot%\System32\vcruntime140.dll" (
+    echo   [x] Microsoft Visual C++ 2015-2022 x64 runtime is missing.
+    echo       frankenphp.exe cannot start without it ^(exit code 0xC0000135^).
+    echo       Install: https://aka.ms/vs/17/release/vc_redist.x64.exe
+)
+set "SAC_STATE="
+for /f "usebackq delims=" %%S in (`powershell -NoProfile -Command "try { (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -Name VerifiedAndReputablePolicyState -ErrorAction Stop).VerifiedAndReputablePolicyState } catch { -1 }"`) do set "SAC_STATE=%%S"
+if "!SAC_STATE!"=="1" (
+    echo   [x] Windows Smart App Control is ON and blocks the bundled PHP runtime.
+    echo       Turn it off: Windows Security ^> App ^& browser control ^> Smart App Control ^> Off
+    echo       ^(One-way: only a Windows reinstall re-enables it.^)
+)
 goto :eof
 
 :print_banner

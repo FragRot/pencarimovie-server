@@ -117,13 +117,29 @@ if (-not (Test-Path -LiteralPath (Join-Path $AppDir 'backend.php'))) {
     exit 1
 }
 
-# Ensure bin\php.ini has Windows extension=fileinfo enabled
+# sanity-check the Windows runtime: a truncated bin\frankenphp.exe means the old
+# server held a lock during extraction, which leaves an install that dies on
+# launch with no visible error.
+$frankenExe = Join-Path $AppDir 'bin\frankenphp.exe'
+if (Test-Path -LiteralPath $frankenExe) {
+    $frankenLen = (Get-Item -LiteralPath $frankenExe).Length
+    if ($frankenLen -lt 1000000) {
+        Write-Host "Warning: bin\frankenphp.exe is only $frankenLen bytes; extraction may have been blocked by a running server."
+    }
+}
+
+# Ensure bin\php.ini exists with the required extensions AND an absolute
+# extension_dir. A relative "ext" is resolved against the caller's working
+# directory, so when frankenphp runs from the app root (not bin\) every
+# extension fails to load and the app reports fileinfo/curl/openssl/mbstring as
+# missing.
 $iniPath = Join-Path $AppDir 'bin\php.ini'
 $extDll = Join-Path $AppDir 'bin\ext\php_fileinfo.dll'
+$extDir = Join-Path $AppDir 'bin\ext'
 if ((Test-Path -LiteralPath $extDll) -and ((-not (Test-Path -LiteralPath $iniPath)) -or ((Get-Content $iniPath -ErrorAction SilentlyContinue | Select-String -Pattern '^\s*extension=fileinfo') -eq $null))) {
-    $defaultIni = @'
+    $defaultIni = @"
 ; TG FastDownloader bundled PHP/FrankenPHP config
-extension_dir="ext"
+extension_dir="$extDir"
 extension=fileinfo
 extension=curl
 extension=mbstring
@@ -134,8 +150,18 @@ memory_limit = 512M
 
 opcache.enable=0
 opcache.enable_cli=0
-'@
+"@
     Set-Content -LiteralPath $iniPath -Value $defaultIni -Encoding ASCII
+    Write-Host "Wrote bin\php.ini with extension_dir=$extDir"
+}
+elseif (Test-Path -LiteralPath $iniPath) {
+    # Repair an ini written by an older release that used the relative "ext".
+    $iniText = Get-Content -LiteralPath $iniPath -Raw -ErrorAction SilentlyContinue
+    if ($iniText -and ($iniText -match '(?m)^\s*extension_dir\s*=\s*"?ext"?\s*$')) {
+        $iniText = [regex]::Replace($iniText, '(?m)^\s*extension_dir\s*=.*$', ('extension_dir="' + $extDir + '"'))
+        Set-Content -LiteralPath $iniPath -Value $iniText -Encoding ASCII
+        Write-Host "Repaired bin\php.ini extension_dir -> $extDir"
+    }
 }
 
 Set-Content -LiteralPath (Join-Path $AppDir '.release-tag') -Value $Tag -Encoding ASCII
