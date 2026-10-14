@@ -3605,6 +3605,7 @@ function fd_spawn_warmup_resolve(array $shortCodes, string $botId = '', string $
     return true;
 }
 
+
 function fd_resolve_shortcodes_batch(array $shortCodes, string $botId = '', string $context = ''): array
 {
     $shortCodes = array_values(array_unique(array_filter(array_map('trim', $shortCodes))));
@@ -8327,15 +8328,49 @@ function fd_get_trending_keywords_map(): array
     $cacheFile = fd_cache_path('trending_keywords.json');
     $ttl = 600; // 10 minutes
 
-    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+    $readCache = static function () use ($cacheFile): array {
+        if (!is_file($cacheFile)) {
+            return [];
+        }
         $data = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($data) && !empty($data)) {
-            return $memoryCached = $data;
+        return (is_array($data) && !empty($data)) ? $data : [];
+    };
+
+    // Fresh cache: serve it immediately
+    if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+        $cached = $readCache();
+        if (!empty($cached)) {
+            return $memoryCached = $cached;
         }
     }
 
-    $cached = [];
+    // Cold/stale cache: single-flight refresh without blocking manifest requests
+    $lockFile = fd_cache_path('trending_keywords.lock');
+    $lockFp = @fopen($lockFile, 'c');
+    $isRefresher = false;
+    if ($lockFp) {
+        $isRefresher = @flock($lockFp, LOCK_EX | LOCK_NB);
+    }
+
+    if (!$isRefresher) {
+        if ($lockFp) {
+            @fclose($lockFp);
+        }
+        $stale = $readCache();
+        if (!empty($stale)) {
+            return $memoryCached = $stale;
+        }
+    }
+
     try {
+        if (is_file($cacheFile) && (time() - (int) filemtime($cacheFile)) < $ttl) {
+            $cached = $readCache();
+            if (!empty($cached)) {
+                return $memoryCached = $cached;
+            }
+        }
+
+        $cached = [];
         $trending = fd_fetch_stream_ajax('trending', ['limit' => 15]);
         if (is_array($trending)) {
             foreach ($trending as $item) {
@@ -8350,18 +8385,18 @@ function fd_get_trending_keywords_map(): array
         }
         if (!empty($cached)) {
             @file_put_contents($cacheFile, json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+            return $memoryCached = $cached;
         }
     } catch (\Throwable $e) {
-    }
-
-    if (empty($cached) && is_file($cacheFile)) {
-        $stale = json_decode((string) @file_get_contents($cacheFile), true);
-        if (is_array($stale) && !empty($stale)) {
-            return $memoryCached = $stale;
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
         }
     }
 
-    return $memoryCached = $cached;
+    $stale = $readCache();
+    return $memoryCached = (!empty($stale) ? $stale : []);
 }
 
 /**
@@ -11332,6 +11367,44 @@ if ($isNuvioRoute) {
 
     // ── Nuvio / Stremio Manifest ──
     if ($addonPath === '/manifest.json') {
+        $settingsFile = fd_storage_path('storage/catalog_settings.json');
+        $trendingFile = fd_cache_path('trending_keywords.json');
+        $mKeyParts = (string)($_SERVER['HTTP_HOST'] ?? '') . '_' .
+            (string)($_SERVER['HTTP_X_FORWARDED_HOST'] ?? '') . '_' .
+            (string)($_GET['mode'] ?? '') . '_' .
+            (is_file($settingsFile) ? filemtime($settingsFile) : 0) . '_' .
+            (is_file($trendingFile) ? filemtime($trendingFile) : 0);
+        $manifestCacheFile = fd_cache_path('manifest_cache_' . md5($mKeyParts) . '.json');
+
+        if (is_file($manifestCacheFile) && (time() - (int) filemtime($manifestCacheFile)) < 1800) {
+            $cachedJson = (string) @file_get_contents($manifestCacheFile);
+            if ($cachedJson !== '') {
+                $etag = '"' . md5($cachedJson) . '"';
+                $cleanClientEtag = trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''), '"\' ');
+                $cleanCurrentEtag = trim($etag, '"\' ');
+                if ($cleanClientEtag !== '' && $cleanClientEtag === $cleanCurrentEtag) {
+                    if (!headers_sent()) {
+                        http_response_code(304);
+                        header('ETag: ' . $etag);
+                        header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                        header('Access-Control-Allow-Origin: *');
+                    }
+                    exit;
+                }
+                if (!headers_sent()) {
+                    http_response_code(200);
+                    header('Content-Type: application/json; charset=utf-8');
+                    header('Access-Control-Allow-Origin: *');
+                    header('Access-Control-Allow-Methods: GET, OPTIONS');
+                    header('Access-Control-Allow-Headers: *');
+                    header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                    header('ETag: ' . $etag);
+                }
+                echo $cachedJson;
+                exit;
+            }
+        }
+
         // Fetch genre list from WordPress (matching public/app.js).
         // Cached to disk: this is a blocking remote call (12s timeout) and
         // /manifest.json is fetched by every client on every install/refresh.
@@ -11455,7 +11528,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'top',
                 'name' => 'Popular',
-                'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'search', 'isRequired' => false],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11468,7 +11540,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'year',
                 'name' => 'New',
-                'genres' => $allYearOptions,
                 'extra' => [
                     ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                     ['name' => 'skip', 'isRequired' => false],
@@ -11480,7 +11551,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => 'pm_search_movie',
                 'name' => 'Search Movies',
-                'genres' => $allGenreOptions,
                 'extra' => [
                     ['name' => 'search', 'isRequired' => true],
                     ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11498,7 +11568,6 @@ if ($isNuvioRoute) {
                 'type' => 'movie',
                 'id' => $catId,
                 'name' => $catName,
-                'genres' => $filterOptionsCombined,
                 'extra' => [
                     ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11513,7 +11582,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'top',
             'name' => 'Popular',
-            'genres' => $allGenreOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => false],
                 ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11526,7 +11594,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'pm_series_year',
             'name' => 'New',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                 ['name' => 'skip', 'isRequired' => false],
@@ -11538,7 +11605,6 @@ if ($isNuvioRoute) {
             'type' => 'series',
             'id' => 'pm_search_series',
             'name' => 'Search Series',
-            'genres' => $allGenreOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => true],
                 ['name' => 'genre', 'options' => $allGenreOptions, 'isRequired' => false],
@@ -11555,7 +11621,6 @@ if ($isNuvioRoute) {
                 'type' => 'series',
                 'id' => $catId,
                 'name' => $catName,
-                'genres' => $filterOptionsCombined,
                 'extra' => [
                     ['name' => 'genre', 'options' => $filterOptionsCombined, 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11570,7 +11635,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'top',
             'name' => 'Telegram Files',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => false],
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11582,7 +11646,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'pm_files_year',
             'name' => 'New',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => true],
                 ['name' => 'skip', 'isRequired' => false],
@@ -11594,7 +11657,6 @@ if ($isNuvioRoute) {
             'type' => 'other',
             'id' => 'pm_search_files',
             'name' => 'Telegram Files',
-            'genres' => $allYearOptions,
             'extra' => [
                 ['name' => 'search', 'isRequired' => true],
                 ['name' => 'genre', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11611,7 +11673,6 @@ if ($isNuvioRoute) {
                 'type' => 'other',
                 'id' => $catId,
                 'name' => ucwords($kw),
-                'genres' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'],
                 'extra' => [
                     ['name' => 'genre', 'options' => ['4K', '1080p', '720p', 'BluRay', 'WEB-DL', 'HEVC'], 'isRequired' => false],
                     ['name' => 'year', 'options' => $allYearOptions, 'isRequired' => false],
@@ -11722,9 +11783,6 @@ if ($isNuvioRoute) {
                         'id'   => $bridgeCatId,
                         'name' => ($uCat['name'] ?? 'Catalog') . " ({$mName})",
                     ];
-                    if (!empty($uCat['genres']) && is_array($uCat['genres'])) {
-                        $bridgeCat['genres'] = $uCat['genres'];
-                    }
                     if (!empty($uCat['extra']) && is_array($uCat['extra'])) {
                         $trimmedExtra = [];
                         foreach ($uCat['extra'] as $ex) {
@@ -11802,7 +11860,27 @@ if ($isNuvioRoute) {
             ],
         ];
 
-        fd_stremio_json($manifest, 200, 'no-cache, no-store, must-revalidate');
+        $jsonBytes = json_encode($manifest, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (!empty($manifestCacheFile) && $jsonBytes !== false) {
+            @file_put_contents($manifestCacheFile, $jsonBytes, LOCK_EX);
+        }
+        $etag = '"' . md5($jsonBytes) . '"';
+        $cleanClientEtag = trim((string) ($_SERVER['HTTP_IF_NONE_MATCH'] ?? ''), '"\' ');
+        $cleanCurrentEtag = trim($etag, '"\' ');
+        if ($cleanClientEtag !== '' && $cleanClientEtag === $cleanCurrentEtag) {
+            if (!headers_sent()) {
+                http_response_code(304);
+                header('ETag: ' . $etag);
+                header('Cache-Control: max-age=1800, stale-while-revalidate=3600');
+                header('Access-Control-Allow-Origin: *');
+            }
+            exit;
+        }
+        if (!headers_sent()) {
+            header('ETag: ' . $etag);
+        }
+
+        fd_stremio_json($manifest, 200, 'max-age=1800, stale-while-revalidate=3600');
     }
 
     // ── Nuvio Catalog: /catalog/:type/:id[/:extra].json ──
@@ -12041,6 +12119,26 @@ if ($isNuvioRoute) {
                             $fileMetaItem['releaseInfo'] = $fReleaseYear;
                         }
                         $metas[] = $fileMetaItem;
+
+                        // Pre-seed meta cache for direct file (instant 0ms click in Stremio/Nuvio)
+                        $fileMetaCacheFile = fd_cache_path('meta_cache_' . md5('file_' . $fCode) . '.json');
+                        if (!is_file($fileMetaCacheFile)) {
+                            $fullFileMeta = [
+                                'meta' => [
+                                    'id' => 'pm_file_' . $fCode,
+                                    'type' => $catalogType !== '' ? $catalogType : 'other',
+                                    'name' => $fTitle,
+                                    'poster' => $fThumb,
+                                    'posterShape' => 'poster',
+                                    'background' => $fThumb,
+                                    'logo' => $fThumb,
+                                    'description' => "⚡ Direct Telegram Cloud File\n" . $pillLine . "\n\n📄 File: " . $fTitle,
+                                    'genres' => $genres,
+                                    'releaseInfo' => $fReleaseYear,
+                                ]
+                            ];
+                            @file_put_contents($fileMetaCacheFile, json_encode($fullFileMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                        }
                     }
                 }
             }
@@ -12119,7 +12217,7 @@ if ($isNuvioRoute) {
                         default => "⚡ Direct Telegram File",
                     };
 
-                    $metas[] = [
+                    $fileMetaItem = [
                         'id' => 'pm_file_' . $fCode,
                         'type' => 'other',
                         'name' => $fTitle,
@@ -12128,6 +12226,27 @@ if ($isNuvioRoute) {
                         'description' => "{$descriptionPrefix} · {$pillLine}\n\n{$fTitle}",
                         'genres' => $genres,
                     ];
+                    $metas[] = $fileMetaItem;
+
+                    // Pre-seed meta cache for direct file
+                    $fileMetaCacheFile = fd_cache_path('meta_cache_' . md5('file_' . $fCode) . '.json');
+                    if (!is_file($fileMetaCacheFile)) {
+                        $fullFileMeta = [
+                            'meta' => [
+                                'id' => 'pm_file_' . $fCode,
+                                'type' => 'other',
+                                'name' => $fTitle,
+                                'poster' => $fThumb,
+                                'posterShape' => 'poster',
+                                'background' => $fThumb,
+                                'logo' => $fThumb,
+                                'description' => "{$descriptionPrefix} · {$pillLine}\n\n📄 File: " . $fTitle,
+                                'genres' => $genres,
+                                'releaseInfo' => $year,
+                            ]
+                        ];
+                        @file_put_contents($fileMetaCacheFile, json_encode($fullFileMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    }
                 }
             }
         } else {
@@ -12240,6 +12359,28 @@ if ($isNuvioRoute) {
                         $metaItem['releaseInfo'] = $releaseYear;
                     }
                     $metas[] = $metaItem;
+
+                    // Pre-seed meta cache for movie posts (instant 0ms click in Stremio/Nuvio)
+                    if ($itemType === 'movie') {
+                        $postMetaCacheFile = fd_cache_path('meta_cache_' . md5('post_' . $pId) . '.json');
+                        if (!is_file($postMetaCacheFile)) {
+                            $fullMeta = [
+                                'meta' => [
+                                    'id' => 'pm:post:' . $pId,
+                                    'type' => 'movie',
+                                    'name' => $cleanName,
+                                    'poster' => $pThumb,
+                                    'posterShape' => 'poster',
+                                    'background' => $pThumb,
+                                    'description' => fd_clean_post_plot($pExcerpt),
+                                    'genres' => $itemGenres,
+                                    'releaseInfo' => $releaseYear,
+                                    'year' => $releaseYear,
+                                ]
+                            ];
+                            @file_put_contents($postMetaCacheFile, json_encode($fullMeta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                        }
+                    }
                 }
             }
         }
