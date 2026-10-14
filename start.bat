@@ -13,6 +13,7 @@ set CADDY_GLOBAL_OPTIONS=skip_install_trust
 set FRANKENPHP_CONFIG=
 set CADDY_EXTRA_CONFIG=
 if not defined GOGC set GOGC=80
+if not defined FD_DOWNLOAD_PARALLEL_CHUNKS set FD_DOWNLOAD_PARALLEL_CHUNKS=4
 
 rem Detect LAN IP via default gateway route (avoids virtual adapter IPs)
 set "LAN_IP="
