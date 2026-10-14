@@ -7402,8 +7402,8 @@ function fd_fetch_series_episode_files(int $postId, ?array $preloadedPost = null
         }
     }
 
-    // If explicit episodes exist and there are no missing episode gaps, post files are complete.
-    if ($hasExplicitEp && !$hasGaps) {
+    // If explicit episodes exist, post files are sufficient for metadata.
+    if ($hasExplicitEp) {
         return $all;
     }
 
