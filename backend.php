@@ -2959,6 +2959,47 @@ function fd_save_resolve_cache(string $shortCode, string $botId, array $data): v
 }
 
 /**
+ * Resolves a short_code with the cache bypassed (force=1&nocache=1) — the file-reference refresh —
+ * memoised for a few seconds. Port of the native server's freshResolveMemo
+ * (FRESH_RESOLVE_MEMO_MS = 10 s, NativeHttpServer.resolveFreshFileId).
+ *
+ * A failed download makes every in-flight range request for the same short_code refresh its file
+ * reference at the same moment, because the player opens several range requests at once. Each of
+ * those then pays a full `resolve-file?force=1&nocache=1` (measured there: 0.5-25 s when the
+ * resolver is busy, plus the retry polling in fd_resolve_shortcode) before its first byte. One
+ * refresh is enough — the reference bytes belong to the account, not to the request.
+ *
+ * On disk rather than a static, because with FrankenPHP each concurrent range request can land in
+ * a different worker and a static would collapse nothing. Short TTL on purpose: this collapses a
+ * burst, it is not a cache of the reference.
+ */
+function fd_resolve_shortcode_fresh(string $shortCode, string $botId): array
+{
+    // Prefixed resolve_cache_ so fd_prune_cache_files() already expires it (2h) - the 10s below is
+    // what makes it a burst-collapser, the prune only stops dead memo files from accumulating.
+    $memoFile = fd_cache_path('resolve_cache_fresh_' . md5($shortCode . ':' . $botId) . '.json');
+    $memoAge = is_file($memoFile) ? time() - (int) @filemtime($memoFile) : PHP_INT_MAX;
+    if ($memoAge < 10) {
+        $memo = json_decode((string) @file_get_contents($memoFile), true);
+        if (is_array($memo) && (!empty($memo['file_id_mt']) || !empty($memo['file_id']))) {
+            fd_log('fresh resolve memo hit - reusing the refresh', [
+                'short_code' => $shortCode,
+                'bot_id' => $botId,
+                'age_ms' => $memoAge * 1000,
+            ]);
+            return $memo;
+        }
+    }
+
+    fd_log('fresh resolve memo miss - resolving with nocache', ['short_code' => $shortCode, 'bot_id' => $botId]);
+    $res = fd_resolve_shortcode($shortCode, $botId, true);
+    if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
+        @file_put_contents($memoFile, json_encode($res, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+    }
+    return $res;
+}
+
+/**
  * Concurrently resolves a shortCode across all available bots in parallel using curl_multi.
  * Returns immediately as soon as ANY bot successfully resolves a file ID.
  */
@@ -3000,10 +3041,51 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
         }
     }
 
+    // One request resolves a cold code; the others wait for it instead of minting their own.
+    // A player opens several ranges at once, so a cold code is otherwise resolved by all of them at
+    // the same moment - measured with 8 simultaneous ranges on a fresh code: 3 requests minted their
+    // own reference, and the mints that lost the race came back with a reference that was already
+    // superseded, so their first download failed with FILE_REFERENCE_EXPIRED.
+    // Port of the native server's resolveInFlight (NativeHttpServer:1522): the marker is STAMPED,
+    // not locked, so a request that dies or returns early cannot wedge the key - an entry older than
+    // 25 s is ignored and the request resolves for itself.
+    $inflightFile = fd_cache_path('resolve_inflight_' . md5($shortCode) . '.txt');
+    $inflightAge = is_file($inflightFile) ? time() - (int) @filemtime($inflightFile) : PHP_INT_MAX;
+    if ($inflightAge < 25) {
+        fd_log('resolve already in flight - waiting for it', ['short_code' => $shortCode, 'age_s' => $inflightAge]);
+        $inflightDeadline = microtime(true) + 9.0;
+        while (microtime(true) < $inflightDeadline) {
+            usleep(120000);
+            foreach ($candidateBots as $bId) {
+                $inherited = fd_resolve_shortcode_cached($shortCode, $bId);
+                if ($inherited !== null) {
+                    if (empty($inherited['bot_id'])) {
+                        $inherited['bot_id'] = $bId;
+                    }
+                    fd_log('resolve inherited from the in-flight request', ['short_code' => $shortCode, 'bot_id' => $bId]);
+                    return $inherited;
+                }
+            }
+        }
+        fd_log('in-flight resolve did not land in time - resolving ourselves', ['short_code' => $shortCode]);
+    }
+    @touch($inflightFile);
+
+    // Nothing cached for this code on any candidate bot: nothing plain resolution can give us is
+    // worth having. The id a plain resolve returns is bound to whichever account the resolver used,
+    // and this box's session cannot read that file_reference - measured while stress-testing fresh
+    // short_codes on 127.0.0.1:8088, every one of them failed its first downloadToBrowser
+    // ("FILE_REFERENCE_EXPIRED" / "Could not refresh file reference for any of the 1 locations") and
+    // only streamed after the force=1&nocache=1 refresh. Asking for the session-bound id up front
+    // costs the same resolve round trip and skips a download attempt that always fails - which is
+    // the native server's shape too (NativeHttpServer.primeFirstChunk budgets ONE short round
+    // before refreshing, "every fresh shortcode needed that refresh").
+    $forceMint = true;
+
     // Single bot fast path
     if (count($candidateBots) === 1) {
         $bId = (string) reset($candidateBots);
-        return fd_resolve_shortcode($shortCode, $bId);
+        return fd_resolve_shortcode($shortCode, $bId, $forceMint);
     }
 
     // Race all candidate bots simultaneously. Amp is the preferred client;
@@ -3031,10 +3113,11 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
 
     $raceUrls = [];
     foreach ($candidateBots as $bId) {
-        $raceUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
-            'short_code' => $shortCode,
-            'bot_id' => $bId,
-        ]);
+        $raceUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query(
+            $forceMint
+                ? ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
+                : ['short_code' => $shortCode, 'bot_id' => $bId]
+        );
     }
 
     $client = fd_get_amphp_client();
@@ -3172,8 +3255,18 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
     // If all bots returned 404 on the initial race, WordPress has just triggered a background
     // Telegram forward/copy relay. Telegram takes 1.5s - 4.5s to finish relaying and populate tg_file_id.
     // Poll up to 4 passes (1.2s, 1.5s, 1.5s, 1.5s) so the stream or player plays directly on first click.
+    //
+    // But "File ID not found for this request, try to Reset and enter new bot token." is WordPress
+    // refusing the code outright, not a relay still running - polling cannot fix it. Measured in the
+    // fresh-code stress run: two dead codes were polled for 59 s and 63 s before the endpoint
+    // answered 404, with the same message and the same code on every pass, from both pool bots.
     $all404 = !empty($botStatuses) && count(array_filter($botStatuses, fn($s) => ($s['http'] ?? 0) === 404)) === count($botStatuses);
-    if ($all404) {
+    $resolveNotFound = is_array($lastErrorResult)
+        && stripos((string) ($lastErrorResult['message'] ?? ''), 'not found for this request') !== false;
+    if ($resolveNotFound) {
+        fd_log('resolve: WordPress says not found - skipping the relay poll passes', ['short_code' => $shortCode]);
+    }
+    if ($all404 && !$resolveNotFound) {
         $delays = [1200000, 1500000, 1500000, 1500000]; // in microseconds (total ~5.7s max)
 
         foreach ($delays as $retryIdx => $sleepUs) {
@@ -3182,10 +3275,11 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
             // Re-race candidate bots (Amp preferred, curl_multi fallback).
             $retryUrls = [];
             foreach ($candidateBots as $bId) {
-                $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query([
-                    'short_code' => $shortCode,
-                    'bot_id' => $bId,
-                ]);
+                $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query(
+                    $forceMint
+                        ? ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
+                        : ['short_code' => $shortCode, 'bot_id' => $bId]
+                );
             }
 
             $ampRetry = fd_http_get_many_amp($retryUrls, ['headers' => $headers, 'timeout' => 6]);
@@ -3312,6 +3406,12 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
     $res = fd_http_json($url, $params, 'GET', 6);
     if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
         fd_save_resolve_cache($shortCode, $botId, $res);
+        return $res;
+    }
+
+    // A definitive "not found for this request" is WordPress refusing the code - polling cannot fix
+    // it, so answer now instead of sleeping through the relay poll below.
+    if (stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
         return $res;
     }
 
@@ -15253,6 +15353,25 @@ if (str_starts_with($path, '/api/')) {
             $cBotId = !empty($res['bot_id']) ? (string) $res['bot_id'] : $botId;
             $resolved = $res;
 
+            // A definitive "File ID not found for this request" is WordPress refusing the code, and
+            // nothing below can change that answer: the guest-bot provisioning loop and the three
+            // session-boot fallbacks each pay for a boot that cannot help. Measured on dead
+            // short_codes (tuPpIB / agk9oH): the resolve gave up in ~2 s, the answer reached the
+            // client 9-16 s later, all of it boot attempts. Answer with what we already know.
+            if ($candidateFileId === '' && stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
+                fd_log('download refused - WordPress does not have this short_code', [
+                    'short_code' => $shortCode,
+                    'message' => (string) $res['message'],
+                ]);
+                fd_json([
+                    'ok' => 0,
+                    'message' => (string) $res['message'],
+                    'short_code' => $shortCode,
+                    'bot_id' => $botId,
+                    'retried_bots' => count($candidateBots),
+                ], 404);
+            }
+
             if ($candidateFileId !== '') {
                 // Try booting MadelineProto for this winning bot
                 [$bootedMadeline, $bootErr] = fd_boot_madeline(null, [], $cBotId);
@@ -15448,6 +15567,12 @@ if (str_starts_with($path, '/api/')) {
         // a fresh guest bot while watching). On an IPC-death error we re-boot with
         // whichever bot/IPC worker is currently active and retry the same file.
         $maxDownloadAttempts = ($shortCode !== '') ? 4 : 1;
+        // A dead file reference is recovered by re-resolving, and that is worth doing ONCE per
+        // request - the native server's `refreshed` flag (NativeHttpServer.primeFirstChunk).
+        // Measured there: all 14 refreshes of a concurrent burst returned the same file id the
+        // request already held, so attempts 2-4 re-read with that id instead of paying resolve-file
+        // again (each of those costs its own 6 s HTTP timeout plus up to 4.2 s of retry polling).
+        $refRefreshed = false;
 
         // The abort callback is a Closure. Over IPC, MadelineProto wraps it in
         // danog\MadelineProto\Ipc\Wrapper, which cannot serialize a Closure —
@@ -15520,14 +15645,24 @@ if (str_starts_with($path, '/api/')) {
                 ]);
 
                 // If FILE_REFERENCE_EXPIRED or could not refresh file reference and we have a short_code,
-                // re-resolve the shortcode with cache bypassed to get a fresh file_id and retry
+                // re-resolve the shortcode with cache bypassed to get a fresh file_id and retry.
+                // At most once per request - see $refRefreshed above.
                 $isRefExpired = (stripos($errStr, 'FILE_REFERENCE_EXPIRED') !== false || stripos($errStr, 'refresh file reference') !== false);
-                if ($isRefExpired && $shortCode !== '') {
+                if ($isRefExpired && $shortCode !== '' && $downloadAttempt < $maxDownloadAttempts) {
+                    if ($refRefreshed) {
+                        fd_log('file reference expired again - already refreshed once, re-reading with the same id', [
+                            'short_code' => $shortCode,
+                            'attempt' => $downloadAttempt,
+                        ]);
+                        continue;
+                    }
+                    $refRefreshed = true;
                     fd_log('file reference expired, re-resolving short_code with nocache', ['short_code' => $shortCode]);
-                    // Re-resolve bypassing local cache
-                    $reResolved = fd_resolve_shortcode($shortCode, $botId, true);
+                    // Re-resolve bypassing local cache, memoised for 10 s so the other range requests
+                    // the player already has in flight reuse this one refresh instead of repeating it.
+                    $reResolved = fd_resolve_shortcode_fresh($shortCode, $botId);
                     $newFileId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
-                    if ($newFileId !== '' && $newFileId !== $fileId && $downloadAttempt < $maxDownloadAttempts) {
+                    if ($newFileId !== '' && $newFileId !== $fileId) {
                         $fileId = $newFileId;
                         $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
                         if (!empty($reResolved['bot_id']) && (string) $reResolved['bot_id'] !== $botId) {
@@ -15543,7 +15678,7 @@ if (str_starts_with($path, '/api/')) {
                     }
 
                     // If same bot returned identical or empty file_id, try candidate bots in pool
-                    if (($newFileId === '' || $newFileId === $fileId) && $downloadAttempt < $maxDownloadAttempts) {
+                    if ($newFileId === '' || $newFileId === $fileId) {
                         $pool = fd_get_bot_pool();
                         foreach ($pool as $pBot) {
                             $altBotId = (string) ($pBot['bot_id'] ?? '');
