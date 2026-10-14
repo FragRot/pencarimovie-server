@@ -6834,6 +6834,35 @@ function fd_fetch_post_files_paged(int $postId, array $opts = []): array
         }
 
         if ($untilUnique) {
+            if (!empty($seenEps)) {
+                $epsBySeason = [];
+                foreach (array_keys($seenEps) as $epKey) {
+                    $parts = explode('_', $epKey);
+                    $s = (int) ($parts[0] ?? 1);
+                    $e = (int) ($parts[1] ?? 0);
+                    if ($e > 0) {
+                        $epsBySeason[$s][$e] = true;
+                    }
+                }
+                $complete = !empty($epsBySeason);
+                foreach ($epsBySeason as $epMap) {
+                    $maxE = max(array_keys($epMap));
+                    if ($maxE <= 0) {
+                        $complete = false;
+                        break;
+                    }
+                    for ($ck = 1; $ck <= $maxE; $ck++) {
+                        if (empty($epMap[$ck])) {
+                            $complete = false;
+                            break;
+                        }
+                    }
+                    if (!$complete) break;
+                }
+                if ($complete) {
+                    break;
+                }
+            }
             if ($newEpsThisPage === 0) {
                 $stalePages++;
             } else {
@@ -7325,7 +7354,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
  * "COMBINED" season packs while the real per-episode files live elsewhere
  * in the Telegram database).
  */
-function fd_fetch_series_episode_files(int $postId): array
+function fd_fetch_series_episode_files(int $postId, ?array $preloadedPost = null): array
 {
     $all = fd_fetch_post_files_paged($postId, [
         'page_size' => 200,
@@ -7380,8 +7409,8 @@ function fd_fetch_series_episode_files(int $postId): array
 
     // Either no explicit episodes (combined packs) or missing episode gaps in the post's files:
     // search for individual episode files by title keyword to backfill missing episodes.
-    $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
-    $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+    $post = $preloadedPost ?: fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+    $post = !empty($post) && is_array($post) ? ($post[0] ?? $post) : [];
     $keyword = fd_stream_keyword_from_post_title((string) ($post['title'] ?? ''));
     if ($keyword === '') {
         return $all;
@@ -12360,6 +12389,12 @@ if ($isNuvioRoute) {
                     }
                     $metas[] = $metaItem;
 
+                    // Pre-cache post data for instant metadata resolution
+                    $postDataFile = fd_cache_path('post_data_' . $pId . '.json');
+                    if (!is_file($postDataFile)) {
+                        @file_put_contents($postDataFile, json_encode($post, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+                    }
+
                     // Pre-seed meta cache for movie posts (instant 0ms click in Stremio/Nuvio)
                     if ($itemType === 'movie') {
                         $postMetaCacheFile = fd_cache_path('meta_cache_' . md5('post_' . $pId) . '.json');
@@ -12532,15 +12567,23 @@ if ($isNuvioRoute) {
             $hasAmp = function_exists('Amp\\async') && function_exists('Amp\\Future\\await');
             $isDirectSeriesType = ($itemType === 'series' || str_contains(strtolower($itemType), 'series'));
 
+            $postDataCacheFile = fd_cache_path('post_data_' . $postId . '.json');
+            $cachedPostData = (is_file($postDataCacheFile) && (time() - (int)filemtime($postDataCacheFile)) < 3600)
+                ? json_decode((string)@file_get_contents($postDataCacheFile), true)
+                : null;
+
             // If series is directly known from the route, fan out get_post and episode files concurrently
             if ($isDirectSeriesType && $hasAmp) {
-                $postFuture = \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
-                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId));
+                $postFuture = $cachedPostData ? \Amp\async(static fn(): array => $cachedPostData) : \Amp\async(static fn(): array => fd_fetch_stream_ajax('get_post', ['post_id' => $postId]));
+                $filesFuture = \Amp\async(static fn(): array => fd_fetch_series_episode_files($postId, $cachedPostData));
                 [$postData, $files] = \Amp\Future\await([$postFuture, $filesFuture]);
                 $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
             } else {
-                $postData = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                $postData = $cachedPostData ?: fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
                 $post = !empty($postData) && is_array($postData) ? ($postData[0] ?? $postData) : [];
+            }
+            if (!empty($post) && !is_file($postDataCacheFile)) {
+                @file_put_contents($postDataCacheFile, json_encode($post, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
             }
 
             $title = $post['title'] ?? 'PencariMovie Media';
