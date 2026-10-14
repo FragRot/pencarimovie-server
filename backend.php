@@ -2923,12 +2923,33 @@ function fd_resolve_external_media_metadata(string $itemId, string $itemType = '
 }
 
 
-function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
+function fd_resolve_cache_store(?string $key = null, ?array $value = null, bool $delete = false): ?array
 {
     static $memoryCache = [];
+    if ($delete) {
+        if ($key !== null) {
+            unset($memoryCache[$key]);
+        } else {
+            $memoryCache = [];
+        }
+        return null;
+    }
+    if ($key === null) {
+        return null;
+    }
+    if ($value !== null) {
+        $memoryCache[$key] = $value;
+        return $value;
+    }
+    return $memoryCache[$key] ?? null;
+}
+
+function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
+{
     $cacheKey = $shortCode . ':' . $botId;
-    if (isset($memoryCache[$cacheKey])) {
-        return $memoryCache[$cacheKey];
+    $mem = fd_resolve_cache_store($cacheKey);
+    if ($mem !== null) {
+        return $mem;
     }
 
     $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
@@ -2940,7 +2961,7 @@ function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
             if ($cachedRaw) {
                 $cachedJson = json_decode($cachedRaw, true);
                 if (is_array($cachedJson) && (!empty($cachedJson['file_id_mt']) || !empty($cachedJson['file_id']))) {
-                    $memoryCache[$cacheKey] = $cachedJson;
+                    fd_resolve_cache_store($cacheKey, $cachedJson);
                     return $cachedJson;
                 }
             }
@@ -2954,8 +2975,19 @@ function fd_resolve_shortcode_cached(string $shortCode, string $botId): ?array
 function fd_save_resolve_cache(string $shortCode, string $botId, array $data): void
 {
     $cacheKey = $shortCode . ':' . $botId;
+    fd_resolve_cache_store($cacheKey, $data);
     $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
     @file_put_contents($diskCacheFile, json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
+}
+
+function fd_invalidate_resolve_cache(string $shortCode, string $botId): void
+{
+    $cacheKey = $shortCode . ':' . $botId;
+    fd_resolve_cache_store($cacheKey, null, true);
+    $diskCacheFile = fd_cache_path('resolve_cache_' . md5($cacheKey) . '.json');
+    @unlink($diskCacheFile);
+    $freshMemoFile = fd_cache_path('resolve_cache_fresh_' . md5($cacheKey) . '.json');
+    @unlink($freshMemoFile);
 }
 
 /**
@@ -3071,16 +3103,13 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
     }
     @touch($inflightFile);
 
-    // Nothing cached for this code on any candidate bot: nothing plain resolution can give us is
-    // worth having. The id a plain resolve returns is bound to whichever account the resolver used,
-    // and this box's session cannot read that file_reference - measured while stress-testing fresh
-    // short_codes on 127.0.0.1:8088, every one of them failed its first downloadToBrowser
-    // ("FILE_REFERENCE_EXPIRED" / "Could not refresh file reference for any of the 1 locations") and
-    // only streamed after the force=1&nocache=1 refresh. Asking for the session-bound id up front
-    // costs the same resolve round trip and skips a download attempt that always fails - which is
-    // the native server's shape too (NativeHttpServer.primeFirstChunk budgets ONE short round
-    // before refreshing, "every fresh shortcode needed that refresh").
-    $forceMint = true;
+    // Attempt #1 stays UNFORCED on purpose (matching NativeHttpServer.kt:5527):
+    // a plain resolve id for a known short_code resolves in ~200-500ms without waking up
+    // the Telegram bot relay. If that reference is expired or bound to another account,
+    // MadelineProto's download path catches FILE_REFERENCE_EXPIRED and triggers
+    // fd_resolve_shortcode_fresh() once with the 10s memo collapser. Retries in the poll ladder
+    // stay forced so relay minting still triggers when the file is truly unpopulated.
+    $forceMint = false;
 
     // Single bot fast path
     if (count($candidateBots) === 1) {
@@ -3273,12 +3302,11 @@ function fd_resolve_shortcode_concurrent(string $shortCode, array $candidateBots
             usleep($sleepUs);
 
             // Re-race candidate bots (Amp preferred, curl_multi fallback).
+            // Retries force nocache to mint fresh references via Telegram relay ladder.
             $retryUrls = [];
             foreach ($candidateBots as $bId) {
                 $retryUrls[$bId] = FD_WP_API_BASE . '/resolve-file?' . http_build_query(
-                    $forceMint
-                        ? ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
-                        : ['short_code' => $shortCode, 'bot_id' => $bId]
+                    ['short_code' => $shortCode, 'bot_id' => $bId, 'force' => 1, 'nocache' => 1]
                 );
             }
 
@@ -3416,12 +3444,17 @@ function fd_resolve_shortcode(string $shortCode, string $botId = '', bool $bypas
     }
 
     // If 404, Telegram background relay was just triggered; poll up to 3 times (1.2s, 1.5s, 1.5s)
+    // Retries force nocache to wake up relay minting (matching NativeHttpServer ladder)
     $delays = [1200000, 1500000, 1500000];
+    $retryParams = array_merge($params, ['force' => 1, 'nocache' => 1]);
     foreach ($delays as $delayUs) {
         usleep($delayUs);
-        $res = fd_http_json($url, $params, 'GET', 6);
+        $res = fd_http_json($url, $retryParams, 'GET', 6);
         if (!empty($res['file_id_mt']) || !empty($res['file_id'])) {
             fd_save_resolve_cache($shortCode, $botId, $res);
+            return $res;
+        }
+        if (stripos((string) ($res['message'] ?? ''), 'not found for this request') !== false) {
             return $res;
         }
     }
@@ -6239,6 +6272,11 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     if ($searchedYear !== '') {
         $cleanTarget = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanTarget);
     }
+    $noAposTarget = preg_replace("/['’`]/u", '', $cleanTarget);
+    $noAposTarget = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $noAposTarget);
+    $noAposTarget = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $noAposTarget));
+    $noAposLower = strtolower(trim(preg_replace('/\s+/', ' ', $noAposTarget)));
+
     $cleanTarget = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanTarget));
     $cleanTarget = trim(preg_replace('/\s+/', ' ', $cleanTarget));
     $targetLower = strtolower($cleanTarget);
@@ -6250,6 +6288,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     // Prepare AKA target if provided
     $akaLower = '';
     $akaNoThe = '';
+    $noAposAkaLower = '';
     if ($searchedAka !== '') {
         $cleanAka = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($searchedAka));
         $cleanAka = preg_replace('/\s*&\s*/', ' and ', $cleanAka);
@@ -6257,6 +6296,11 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         if ($searchedYear !== '') {
             $cleanAka = preg_replace('/\b' . preg_quote($searchedYear, '/') . '\b/', ' ', $cleanAka);
         }
+        $noAposAka = preg_replace("/['’`]/u", '', $cleanAka);
+        $noAposAka = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $noAposAka);
+        $noAposAka = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $noAposAka));
+        $noAposAkaLower = strtolower(trim(preg_replace('/\s+/', ' ', $noAposAka)));
+
         $cleanAka = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanAka));
         $cleanAka = trim(preg_replace('/\s+/', ' ', $cleanAka));
         $akaLower = strtolower($cleanAka);
@@ -6279,7 +6323,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             }
             $baseCap = preg_replace('/\b(?:extended(?:\s*cut)?|directors?\s*cut|unrated|imax|special\s*edition|remastered|criterion|sub\s*malay|malay\s*sub|eng\s*sub|sub\s*eng|indosub|sub\s*indo|subtitle|dubbed|multi\s*audio|clean\s*audio|hc|hardsub)\b.*/i', '', $baseCap);
             $baseCap = trim(preg_replace('/\s+/', ' ', $baseCap));
-            if ($baseCap !== '' && ($baseCap === $targetLower || ($akaLower !== '' && $baseCap === $akaLower))) {
+            if ($baseCap !== '' && ($baseCap === $targetLower || ($noAposLower !== '' && $baseCap === $noAposLower) || ($akaLower !== '' && $baseCap === $akaLower) || ($noAposAkaLower !== '' && $baseCap === $noAposAkaLower))) {
                 if ($searchedYear !== '' && preg_match('/\b(19\d\d|20\d\d)\b/', $firstLine, $cym)) {
                     if (abs((int)$cym[1] - (int)$searchedYear) <= 1) {
                         return true;
@@ -6295,6 +6339,10 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
     $fClean = fd_clean_media_title($fileTitle);
     // Strip leading @channel tags or [group] tags
     $fClean = preg_replace('/^(?:@\w+[._\s]+|\[[^\]]+\][._\s]*|\([^\)]+\)[._\s]*)/i', '', $fClean);
+    // Strip leading resolution prefix (e.g. "1080.", "720.")
+    $fClean = preg_replace('/^(?:(?:\d{3,4}p?)[._\s]+)+/i', '', $fClean);
+    // Strip leading website domains (e.g. "PUSATFILM.ID.", "LK21.ORG.")
+    $fClean = preg_replace('/^(?:(?:www\.)?[a-z0-9-]+\.(?:id|com|org|net|me|tv|cc|vip|site|xyz|buzz|top|link|club|online|co|fun|pro)[._\s]+)/i', '', $fClean);
     // Strip leading release channels/groups/tags/domains
     $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|anime\s*time\s*studio\s*ghibli\s*movie\s*\d*|mcu|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|sklink(?:\s*office)?|movie\s*king|movie\s*world|film\s*world|tamilblasters|1tamilmv|tamilmv|tamilrockers|tamilyogi|tamilgun|isaidub|kuttymovies|moviesda|bolly4u|desiremovies|worldfree4u|katmoviehd|skymovieshd|filmywap|filmyzilla|extramovies|9xmovies|movieswood|jiorockers|todaypk|cinevood|hdhub4u|dotmovies|topmovies|modmobile|uhdmovies|allmovieshub|moviesverse|luxmovie|cinemalover|flixhub|movies4u|plexmovies|moviesrocker|mkvking|psa|yts)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
@@ -6336,17 +6384,19 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
 
     // 7. Direct comparison between base filename title and target (strict: "The Runner" != "Runner")
     if ($baseF !== '') {
-        if ($baseF === $targetLower) {
+        if ($baseF === $targetLower || ($noAposLower !== '' && $baseF === $noAposLower)) {
             return true;
         }
-        if ($akaLower !== '' && $baseF === $akaLower) {
+        if ($akaLower !== '' && ($baseF === $akaLower || ($noAposAkaLower !== '' && $baseF === $noAposAkaLower))) {
             return true;
         }
 
         // Check if baseF ends with targetLower preceded by known uploader/channel/site words
         // e.g. "sklink office baththa" ends with "baththa", prefix is "sklink office"
         $targetsToCheck = [$targetLower];
+        if ($noAposLower !== '' && $noAposLower !== $targetLower) $targetsToCheck[] = $noAposLower;
         if ($akaLower !== '') $targetsToCheck[] = $akaLower;
+        if ($noAposAkaLower !== '' && $noAposAkaLower !== $akaLower) $targetsToCheck[] = $noAposAkaLower;
         foreach ($targetsToCheck as $tgt) {
             if (str_ends_with($baseF, ' ' . $tgt)) {
                 $prefix = trim(substr($baseF, 0, -strlen($tgt)));
@@ -6369,6 +6419,24 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         str_replace(' dan ', ' ', $targetLower),
         rtrim($targetLower, 's'),
     ];
+    $collapsedSTarget = preg_replace('/\b(\w+)\s+s\b/iu', '$1s', $targetLower);
+    $expandedSTarget  = preg_replace('/\b(\w+)s\b/iu', '$1 s', $targetLower);
+    if ($collapsedSTarget !== '' && $collapsedSTarget !== $targetLower) {
+        $targetVariants[] = $collapsedSTarget;
+        $targetVariants[] = rtrim($collapsedSTarget, 's');
+    }
+    if ($expandedSTarget !== '' && $expandedSTarget !== $targetLower) {
+        $targetVariants[] = $expandedSTarget;
+    }
+
+    if ($noAposLower !== '' && $noAposLower !== $targetLower) {
+        $targetVariants[] = $noAposLower;
+        $targetVariants[] = str_replace(' and ', ' dan ', $noAposLower);
+        $targetVariants[] = str_replace(' dan ', ' and ', $noAposLower);
+        $targetVariants[] = str_replace(' and ', ' ', $noAposLower);
+        $targetVariants[] = str_replace(' dan ', ' ', $noAposLower);
+        $targetVariants[] = rtrim($noAposLower, 's');
+    }
     if (in_array($baseF, $targetVariants, true)) {
         return true;
     }
@@ -6392,6 +6460,15 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
             if ($fWords === $targetWords) {
                 return true;
+            }
+        }
+        if ($noAposLower !== '') {
+            $noAposWords = array_values(array_filter(explode(' ', $noAposLower), fn($w) => strlen($w) > 1));
+            if (count($noAposWords) >= 2) {
+                $fWords = array_values(array_filter(explode(' ', $baseF), fn($w) => strlen($w) > 1));
+                if ($fWords === $noAposWords) {
+                    return true;
+                }
             }
         }
     }
@@ -6785,7 +6862,8 @@ function fd_stream_keyword_from_post_title(string $title): string
     $keyword = trim((string) preg_replace('/\s*\(\d{4}\)\s*$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\s+\d{4}\s*$/u', '', $keyword));
     $keyword = trim((string) preg_replace('/\b(?:tvseries|tv\s*series|movie)\b/iu', '', $keyword));
-    return trim((string) preg_replace('/\s+/', ' ', $keyword));
+    $keyword = trim((string) preg_replace('/\s+/', ' ', $keyword));
+    return trim($keyword, " \t\n\r\0\x0B.!?:;,-");
 }
 
 /**
@@ -13083,6 +13161,29 @@ if ($isNuvioRoute) {
                         }
                     }
 
+                    // If primary title returned 0 files and contains an apostrophe, probe the no-apostrophe variant via fast path
+                    if (empty($filesToStream) && preg_match("/['’`]/u", $cleanMovieTitle)) {
+                        $noAposMovieTitle = trim(preg_replace("/['’`]/u", '', $cleanMovieTitle));
+                        if ($noAposMovieTitle !== '') {
+                            $apiBase = FD_WP_API_BASE;
+                            $mUrl = "{$apiBase}/stream-files?type=movie&limit=150"
+                                . "&title=" . urlencode($noAposMovieTitle)
+                                . ($searchedYear !== '' ? "&year=" . urlencode($searchedYear) : '')
+                                . ($itemId !== '' ? "&id=" . urlencode($itemId) : '');
+                            $res = fd_http_json($mUrl, [], 'GET', 15);
+                            if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
+                                $movieFastPathDone = true;
+                                foreach ($res['items'] as $f) {
+                                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fCaption = (string) ($f['caption'] ?? '');
+                                    if (fd_movie_file_matches_title($fTitle, $primaryMovieTitle, $searchedYear, $searchedAka, $fCaption)) {
+                                        $filesToStream[] = $f;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // If primary title returned 0 files and an AKA title exists, probe the AKA title via fast path
                     if (empty($filesToStream) && $searchedAka !== '' && strcasecmp($searchedAka, $cleanMovieTitle) !== 0) {
                         $cleanAkaTitle = fd_stream_keyword_from_post_title($searchedAka);
@@ -15649,12 +15750,14 @@ if (str_starts_with($path, '/api/')) {
                 // At most once per request - see $refRefreshed above.
                 $isRefExpired = (stripos($errStr, 'FILE_REFERENCE_EXPIRED') !== false || stripos($errStr, 'refresh file reference') !== false);
                 if ($isRefExpired && $shortCode !== '' && $downloadAttempt < $maxDownloadAttempts) {
+                    // Invalidate stale resolve cache in worker memory and on disk before re-resolving
+                    fd_invalidate_resolve_cache($shortCode, $botId);
                     fd_log('file reference expired, re-resolving short_code with nocache', ['short_code' => $shortCode, 'attempt' => $downloadAttempt]);
                     // Re-resolve bypassing local cache, memoised for 10 s so the other range requests
                     // the player already has in flight reuse this one refresh instead of repeating it.
                     $reResolved = fd_resolve_shortcode_fresh($shortCode, $botId);
                     $newFileId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
-                    if ($newFileId !== '' && $newFileId !== $fileId) {
+                    if ($newFileId !== '') {
                         $fileId = $newFileId;
                         $fileSize = (int) ($reResolved['file_size'] ?? $fileSize);
                         if (!empty($reResolved['bot_id']) && (string) $reResolved['bot_id'] !== $botId) {
@@ -15666,10 +15769,12 @@ if (str_starts_with($path, '/api/')) {
                                 $abortCallback = $isIpcClient ? null : $abortCallback;
                             }
                         }
+                        // Even if same fileId was returned, the Telegram reference was refreshed upstream.
+                        // Retry download with this bot (matching NativeHttpServer.primeFirstChunk).
                         continue;
                     }
 
-                    // If same bot returned identical or empty file_id, try candidate bots in pool
+                    // If same bot returned empty file_id, try candidate bots in pool
                     $pool = fd_get_bot_pool();
                     foreach ($pool as $pBot) {
                         $altBotId = (string) ($pBot['bot_id'] ?? '');
