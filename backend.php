@@ -6508,17 +6508,7 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         return true;
     }
 
-    // 2. Strict Year check if year is specified on the series and present on the file
-    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
-    if ($seriesYear !== '' && $hasFileYear) {
-        $fileYear = (int) $fym[1];
-        $targetYear = (int) $seriesYear;
-        if (abs($fileYear - $targetYear) > 1) {
-            return false;
-        }
-    }
-
-    // 3. Normalize series title
+    // 2. Normalize series title
     $cleanSeries = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($seriesTitle));
     $cleanSeries = preg_replace('/\b(?:tvseries|series|season|musim|drama|episode|bahagian)\b.*/i', '', $cleanSeries);
     if ($seriesYear !== '') {
@@ -6532,10 +6522,24 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     }
     $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
 
+    $stopWords = ['the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'dan'];
+    $contentWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => !in_array($w, $stopWords, true)));
+    $isSingleWord = count($contentWords) <= 1;
+
+    // 3. Strict Year check if year is specified on the series and present on the file
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    if ($seriesYear !== '' && $hasFileYear) {
+        $fileYear = (int) $fym[1];
+        $targetYear = (int) $seriesYear;
+        if ($isSingleWord ? ($fileYear !== $targetYear) : (abs($fileYear - $targetYear) > 1)) {
+            return false;
+        }
+    }
+
     // 4. Extract series title portion from filename
     $fClean = preg_replace('/\.(mp4|mkv|avi|mov|ts|flv|webm)$/i', '', $fileTitle);
     $fClean = fd_clean_media_title($fClean);
-    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor|layarasia|old|oppa\.biz|drakor\s*id)\s+/i', '', $fClean);
+    $fClean = preg_replace('/^(?:prakytv|ngefilm\s*store|runningmovieshd|kannadachallengers|mkvcinemas|vegamovies|moviesmod|pahe|galaxy|wetv|studioghibli|animerg|pms|pahe\.li|layarkaca\d*|cinemaindo|indoxxi|kdg|fanszz|dramaost|mkvdrama|dusklight|primefix|nodrakorid|nodrakor|layarasia|old|oppa\.biz|drakor\s*id|nunadrama|queendramainfo|adrama(?:\s*lovers)?)\s+/i', '', $fClean);
     $fCleanNorm = strtolower(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $fClean));
     $fCleanNorm = trim(preg_replace('/\s+/', ' ', $fCleanNorm));
 
@@ -6562,16 +6566,39 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     $afterEpNoThe = trim(preg_replace('/^the\s+/i', '', $afterEp));
 
     // 5. Check leading "The " compatibility
+    // "The Glory" is NOT the same show as "Glory" — distinct shows on WordPress and TV networks.
     $hasLeadingThe = str_starts_with($targetLower, 'the ');
     $fileHasLeadingThe = str_starts_with($baseF, 'the ') || str_starts_with($afterEp, 'the ');
-    if (!$hasLeadingThe && $fileHasLeadingThe) {
-        if ($seriesYear !== '' && preg_match('/\b(2022|2023|2024|korean|korea|k\.o|netflix|\bnf\b|rarbg)\b/i', $fileTitle)) {
+    if ($hasLeadingThe !== $fileHasLeadingThe) {
+        return false;
+    }
+
+    // For single-word titles with known year (e.g. "Glory 2025"), reject un-yeared files that have foreign platform/region indicators
+    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord) {
+        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg|hindi)\b/i', $fileTitle . ' ' . $fileCaption)) {
             return false;
         }
     }
 
     // 6. Compare extracted title candidates with target series title
-    $candidates = array_filter([$baseF, $baseFNoThe, $afterEp, $afterEpNoThe], fn($c) => $c !== '');
+    $candidates = array_filter([$baseF, $afterEp], fn($c) => $c !== '');
+    foreach ([$targetLower, $targetNoThe] as $tgt) {
+        if ($tgt === '') continue;
+        if (str_ends_with($baseF, ' ' . $tgt)) {
+            $prefix = trim(substr($baseF, 0, -strlen($tgt)));
+            if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd|nunadrama|drakor|drama|adrama|lovers|queendramainfo)\b\s*)+$/i', $prefix)) {
+                $candidates[] = $tgt;
+            }
+        }
+        if ($afterEp !== '' && str_ends_with($afterEp, ' ' . $tgt)) {
+            $prefix = trim(substr($afterEp, 0, -strlen($tgt)));
+            if ($prefix !== '' && preg_match('/^(?:(?:sklink|office|movie|movies|king|film|films|cinema|cinemas|media|channel|tv|tele|tg|hub|world|zone|group|team|club|gang|bot|vip|official|download|downloads|upload|uploads|site|store|station|blasters|rockers|wap|villa|dub|yogi|verse|flix|pahe|galaxy|pms|mkv|link|links|hd|nunadrama|drakor|drama|adrama|lovers|queendramainfo)\b\s*)+$/i', $prefix)) {
+                $candidates[] = $tgt;
+            }
+        }
+    }
+    $candidates = array_values(array_unique($candidates));
+
     $targetVariants = [
         $targetLower,
         $targetNoThe,
@@ -6586,8 +6613,11 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         if (in_array($c, $targetVariants, true)) {
             return true;
         }
-        if (str_starts_with($c, $targetLower . ' ') || ($targetNoThe !== '' && str_starts_with($c, $targetNoThe . ' '))) {
-            return true;
+        if (!$isSingleWord && (str_starts_with($c, $targetLower . ' ') || ($targetNoThe !== '' && str_starts_with($c, $targetNoThe . ' ')))) {
+            $suffix = trim(substr($c, strlen($targetLower)));
+            if (preg_match('/^(?:part|vol|volume|chapter|season|musim|bahagian)\s*\d+$/i', $suffix)) {
+                return true;
+            }
         }
     }
 
