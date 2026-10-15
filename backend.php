@@ -4402,9 +4402,13 @@ function fd_ipc_worker_ready(string $sessionDir): bool
  * Diffie-Hellman handshake, so during the boot window it is unheld.
  *
  * @param string $sessionDir Absolute session directory (e.g. .../session.madeline)
+ * @param bool $waitForReady When false, spawn the worker detached and return
+ *        immediately instead of waiting up to ~30s for it to publish its
+ *        endpoint. Used by fd_prewarm_ipc_worker() so a web request can start
+ *        the worker without holding a PHP thread for the boot.
  * @return bool True if a worker is running (or was just started).
  */
-function fd_ensure_ipc_worker(string $sessionDir): bool
+function fd_ensure_ipc_worker(string $sessionDir, bool $waitForReady = true): bool
 {
     if (fd_ipc_worker_ready($sessionDir)) {
         return true;
@@ -4422,6 +4426,11 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
             if (fd_ipc_worker_ready($sessionDir)) {
                 @fclose($spawnFp);
                 return true;
+            }
+            if (!$waitForReady) {
+                // A spawn is already in flight; the pre-warm is a no-op.
+                @fclose($spawnFp);
+                return false;
             }
             if ((microtime(true) - $spawnWaitStart) > 30) {
                 // Holder died without publishing; take over the spawn ourselves.
@@ -4492,6 +4501,16 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
     }
 
+    if (!$waitForReady) {
+        // Fire-and-forget pre-warm. The worker publishes its own endpoint when
+        // it is ready, so the caller must not hold a web request open for it.
+        if ($spawnFp) {
+            @flock($spawnFp, LOCK_UN);
+            @fclose($spawnFp);
+        }
+        return true;
+    }
+
     // Wait up to ~30s for the worker to become READY (ipc connectable AND
     // ipcState.php written). Waiting only for `ipc` lets a peer connect to a
     // half-booted worker, which makes MadelineProto's tryConnect() burn its
@@ -4515,6 +4534,56 @@ function fd_ensure_ipc_worker(string $sessionDir): bool
         @fclose($spawnFp);
     }
     return $running;
+}
+
+/**
+ * Start the shared IPC worker in the background, without blocking the request.
+ *
+ * Why: the FIRST playback of a container lifetime used to pay the whole
+ * MadelineProto boot while holding a worker thread - measured on Heroku as
+ * `madeline construction {"ms":14657}` - and with a small thread pool that one
+ * stall is a large slice of the request-timeout budget. Once the worker is warm,
+ * fd_boot_madeline() connects to the published endpoint as an IPC client in
+ * tens of milliseconds instead.
+ *
+ * Call it from the cheap requests a client makes BEFORE it plays anything
+ * (/manifest.json, /stream/*, /api/session); the stream LIST is served from its
+ * own cache, so the worker boots while the user is still looking at the list.
+ *
+ * Safety:
+ *   - only runs when a session exists on disk (never during login/provisioning),
+ *   - a no-op when the worker is already ready,
+ *   - throttled to one spawn attempt per 60s per session, so a request burst or
+ *     a worker that keeps dying cannot turn into a spawn storm,
+ *   - the spawn itself is detached (nohup / `start "" /b`) and therefore
+ *     outlives this request, exactly like fd_ensure_ipc_worker().
+ */
+function fd_prewarm_ipc_worker(): bool
+{
+    // The ACTIVE bot's session, not fd_get_bot_session_path() with no argument:
+    // that returns the legacy single-session FD_SESSION_PATH, which does not
+    // exist in a multi-bot install, so the pre-warm silently never fired.
+    $botId = fd_get_bot_id();
+    if ($botId === '') {
+        return false;
+    }
+    $sessionPath = fd_get_bot_session_path($botId);
+    if (!is_dir($sessionPath) && !is_file($sessionPath)) {
+        return false;
+    }
+    if (fd_ipc_worker_ready($sessionPath)) {
+        return false;
+    }
+    $stamp = fd_cache_path('ipc_prewarm_' . md5($sessionPath) . '.stamp');
+    if (is_file($stamp) && (time() - (int) @filemtime($stamp)) < 60) {
+        return false;
+    }
+    @file_put_contents($stamp, (string) time(), LOCK_EX);
+    $spawned = fd_ensure_ipc_worker($sessionPath, false);
+    if ($spawned) {
+        fd_log('ipc worker pre-warmed in the background', ['session' => basename($sessionPath)]);
+    }
+    return $spawned;
 }
 
 /**
@@ -6643,7 +6712,44 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     return false;
 }
 
-function fd_fetch_stream_ajax(string $action, array $params = []): array
+/**
+ * Fresh window (seconds) for a cached WordPress payload, per action.
+ * Anything older counts as *stale*: it is only ever used as a fallback, never
+ * as a reason to hold a worker thread.
+ */
+function fd_stream_ajax_ttl(string $action): int
+{
+    return match ($action) {
+        'search', 'search_files' => 300,
+        'posts', 'post_files', 'get_post', 'search_music' => 600,
+        'categories', 'trending' => 3600,
+        default => 300,
+    };
+}
+
+/**
+ * Remote WordPress fetch with a disk cache, single-flight and
+ * stale-while-revalidate.
+ *
+ * This is called 1-2x per catalog request and a cold client boot fans out ~33
+ * catalog requests, so an origin call that occupies a worker for its whole
+ * timeout starves the small FrankenPHP thread pool. Measured on a 4-6 thread
+ * pool with max_wait_time 15s: cold-origin searches hit p50 11s / p95 17s and
+ * returned HTTP 503, because every cold cache miss did its own 12s remote call
+ * (retried once when Amp cancelled it). Rules now:
+ *
+ *   1. fresh cache        -> serve it, no origin call at all;
+ *   2. stale + lock taken -> serve the stale copy immediately (no waiting);
+ *   3. stale + we hold it -> refresh with a SHORT timeout, keep stale on error;
+ *   4. nothing cached     -> wait briefly for the in-flight refresher, then
+ *                            return [] so the caller renders an empty catalog
+ *                            instead of pinning the thread for 12s+.
+ *
+ * Identical concurrent requests also collapse into one origin call, which is
+ * what removes the duplicate fan-out between the `top` catalogs and the
+ * dedicated `pm_search_*` catalogs (they issue byte-identical requests).
+ */
+function fd_fetch_stream_ajax(string $action, array $params = [], ?int $timeout = null): array
 {
     $route = str_replace('_', '-', $action);
     $apiBase = defined('FD_WP_API_BASE') ? FD_WP_API_BASE : 'https://pencarimovie.com/wp-json/pencarimovie-server/v1';
@@ -6666,29 +6772,78 @@ function fd_fetch_stream_ajax(string $action, array $params = []): array
     }
     $fullWpUrl = $wpUrl . '?' . http_build_query($queryParams);
 
-    // Direct fetch
+    $timeout = $timeout ?? (in_array($action, ['search', 'search_files'], true) ? 6 : 8);
+    $ttl = fd_stream_ajax_ttl($action);
+    $staleMax = 21600; // serve a stale copy for up to 6h rather than block
+
+    $cacheFile = fd_cache_path('wp_ajax_' . md5($action . '|' . $fullWpUrl) . '.json');
+    $readCache = static function (int $maxAge) use ($cacheFile): ?array {
+        if (!is_file($cacheFile)) {
+            return null;
+        }
+        if ((time() - (int) @filemtime($cacheFile)) > $maxAge) {
+            return null;
+        }
+        $decoded = json_decode((string) @file_get_contents($cacheFile), true);
+        return is_array($decoded) ? $decoded : null;
+    };
+
+    $fresh = $readCache($ttl);
+    if ($fresh !== null) {
+        return $fresh;
+    }
+    $stale = $readCache($staleMax);
+
+    // Single-flight: exactly one worker refreshes a given URL.
+    $lockFp = @fopen($cacheFile . '.lock', 'c');
+    $isRefresher = $lockFp ? @flock($lockFp, LOCK_EX | LOCK_NB) : false;
+
+    if (!$isRefresher) {
+        if ($stale !== null) {
+            return $stale;
+        }
+        // Nothing cached: give the in-flight refresher a brief chance.
+        $deadline = microtime(true) + min(3.0, (float) $timeout);
+        while (microtime(true) < $deadline) {
+            usleep(100000);
+            $fresh = $readCache($ttl);
+            if ($fresh !== null) {
+                return $fresh;
+            }
+        }
+        return [];
+    }
+
     try {
         $body = fd_http_get_contents($fullWpUrl, [
             'method' => 'GET',
             'headers' => ['Accept: application/json'],
-            'timeout' => 12,
+            'timeout' => $timeout,
         ]);
         if (is_string($body) && $body !== '') {
             $decoded = json_decode($body, true);
-            if (is_array($decoded) && isset($decoded['success']) && $decoded['success']) {
-                return (array) ($decoded['data'] ?? []);
-            }
-            if (is_array($decoded) && isset($decoded['ok']) && $decoded['ok']) {
-                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
-            }
             if (is_array($decoded)) {
-                return (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
+                $data = (isset($decoded['success']) && $decoded['success'])
+                    ? (array) ($decoded['data'] ?? [])
+                    : (array) ($decoded['data'] ?? $decoded['items'] ?? $decoded);
+                @file_put_contents(
+                    $cacheFile,
+                    json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+                    LOCK_EX
+                );
+                return $data;
             }
         }
-        return [];
+        fd_log('stremio wp rest fetch empty', ['action' => $action, 'had_stale' => $stale !== null]);
+        return $stale ?? [];
     } catch (\Throwable $e) {
-        fd_log('stremio wp rest fetch failed', ['action' => $action, 'error' => $e->getMessage()]);
-        return [];
+        fd_log('stremio wp rest fetch failed', ['action' => $action, 'error' => $e->getMessage(), 'had_stale' => $stale !== null]);
+        return $stale ?? [];
+    } finally {
+        if ($lockFp) {
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
+        }
     }
 }
 
@@ -8096,6 +8251,324 @@ function fd_build_stremio_stream_url(string $baseUrl, string $payloadB64, string
 function fd_is_public_download_path(string $path): bool
 {
     return $path === '/api/download' || str_starts_with($path, '/api/download/');
+}
+
+/**
+ * ── Playback spool ─────────────────────────────────────────────────────────
+ *
+ * /api/download streams with downloadToBrowser(), which occupies one PHP worker
+ * thread for the WHOLE playback. With a 4-16 thread pool a handful of viewers
+ * starves catalog traffic - reproduced on a 4/6 pool as p50 11s / p95 17s with
+ * HTTP 503. A spooled file is instead served by Caddy's own file_server
+ * (sendfile + HTTP ranges) with no PHP worker involved at all.
+ *
+ * Naming: "<short_code>-<hmac20>.<ext>", HMAC keyed by the per-install
+ * api_secret. Deterministic (one spool file per title, shared by every client)
+ * yet unguessable, so the public /spool/ URL is no easier to enumerate than the
+ * base64 download payload - and /api/download still demands the auth token
+ * before handing the redirect out.
+ *
+ * A fill writes "<name>.part" and renames it to "<name>" only when complete, so
+ * the presence of the final name is the completeness proof: fd_spool_find()
+ * never returns a partial file, which is what makes the redirect safe.
+ */
+function fd_spool_dir(): string
+{
+    $dir = fd_storage_path('storage/spool');
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    return $dir;
+}
+
+function fd_spool_enabled(): bool
+{
+    $flag = strtolower((string) fd_env('FD_SPOOL_ENABLED', '1'));
+    return !in_array($flag, ['0', 'false', 'no', 'off'], true);
+}
+
+function fd_spool_max_bytes(): int
+{
+    $gb = (float) fd_env('FD_SPOOL_MAX_GB', '20');
+    return $gb > 0 ? (int) ($gb * 1024 * 1024 * 1024) : 0;
+}
+
+function fd_spool_max_file_bytes(): int
+{
+    $mb = (float) fd_env('FD_SPOOL_MAX_FILE_MB', '12288');
+    return $mb > 0 ? (int) ($mb * 1024 * 1024) : 0;
+}
+
+function fd_spool_key(string $shortCode): string
+{
+    $secret = fd_get_api_secret();
+    if ($secret === '') {
+        $secret = fd_auth_token();
+    }
+    if ($secret === '') {
+        $secret = fd_get_device_id();
+    }
+    return substr(hash_hmac('sha256', $shortCode, $secret), 0, 20);
+}
+
+function fd_spool_lock_path(string $shortCode): string
+{
+    return fd_spool_dir() . '/.fill_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.lock';
+}
+
+function fd_spool_name(string $shortCode, string $fileName = '', string $mime = ''): string
+{
+    $ext = fd_mime_to_extension(fd_guess_video_mime($fileName, $mime), 'mp4');
+    return $shortCode . '-' . fd_spool_key($shortCode) . '.' . $ext;
+}
+
+function fd_spool_path(string $shortCode, string $fileName = '', string $mime = ''): string
+{
+    return fd_spool_dir() . '/' . fd_spool_name($shortCode, $fileName, $mime);
+}
+
+/**
+ * Path of the COMPLETE spooled file for a short code, or '' when there is none.
+ * Partials ("*.part") are ignored on purpose.
+ */
+function fd_spool_find(string $shortCode): string
+{
+    if ($shortCode === '') {
+        return '';
+    }
+    $pattern = fd_spool_dir() . '/' . $shortCode . '-' . fd_spool_key($shortCode) . '.*';
+    foreach (glob($pattern) ?: [] as $file) {
+        if (is_file($file) && !str_ends_with($file, '.part') && !str_ends_with($file, '.lock')) {
+            return $file;
+        }
+    }
+    return '';
+}
+
+function fd_spool_public_url(string $file): string
+{
+    return '/spool/' . rawurlencode(basename($file));
+}
+
+/**
+ * Keep the spool inside its disk budget: drop stale partials first, then the
+ * oldest completed files. Cheap enough to call on every fill start.
+ */
+function fd_spool_prune(): void
+{
+    $dir = fd_spool_dir();
+    $max = fd_spool_max_bytes();
+    $files = [];
+    $total = 0;
+    foreach (glob($dir . '/*') ?: [] as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+        $size = (int) @filesize($file);
+        $mtime = (int) @filemtime($file);
+        $files[] = ['path' => $file, 'mtime' => $mtime, 'size' => $size];
+        $total += $size;
+    }
+    $now = time();
+    foreach ($files as $entry) {
+        if (str_ends_with($entry['path'], '.part') && ($now - $entry['mtime']) > 7200) {
+            @unlink($entry['path']);
+            $total -= $entry['size'];
+        }
+    }
+    if ($max <= 0 || $total <= $max) {
+        return;
+    }
+    usort($files, static fn(array $a, array $b): int => $a['mtime'] <=> $b['mtime']);
+    foreach ($files as $entry) {
+        if ($total <= $max) {
+            break;
+        }
+        if (!is_file($entry['path'])) {
+            continue;
+        }
+        @unlink($entry['path']);
+        $total -= $entry['size'];
+    }
+}
+
+function fd_spool_should_fill(string $shortCode, int $fileSize): bool
+{
+    if (!fd_spool_enabled() || $shortCode === '') {
+        return false;
+    }
+    $maxFile = fd_spool_max_file_bytes();
+    if ($maxFile > 0 && $fileSize > 0 && $fileSize > $maxFile) {
+        return false;
+    }
+    return fd_spool_find($shortCode) === '';
+}
+
+/**
+ * Start the detached spool filler for a title, at most one per short code.
+ * Mirrors the Windows `start "" /b` / Unix `nohup ... &` detach used for the
+ * IPC worker, so the filler outlives the web request that triggered it.
+ */
+function fd_spawn_spool_worker(
+    string $shortCode,
+    string $botId,
+    string $fileId,
+    int $fileSize,
+    string $fileName,
+    string $mime
+): bool {
+    if (!fd_spool_should_fill($shortCode, $fileSize)) {
+        return false;
+    }
+    // A filler holds an exclusive lock for its whole life, so a busy lock means
+    // one is already running. The stamp closes the small race between two
+    // concurrent spawners.
+    $lock = fd_spool_lock_path($shortCode);
+    $busy = true;
+    $fp = @fopen($lock, 'c');
+    if ($fp) {
+        $busy = !@flock($fp, LOCK_EX | LOCK_NB);
+        if (!$busy) {
+            @flock($fp, LOCK_UN);
+        }
+        @fclose($fp);
+    }
+    if ($busy) {
+        return false;
+    }
+    $stamp = fd_spool_dir() . '/.spawn_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.stamp';
+    if (is_file($stamp) && (time() - (int) @filemtime($stamp)) < 30) {
+        return false;
+    }
+    @file_put_contents($stamp, (string) time());
+
+    $root = fd_get_app_root();
+    $phpBin = PHP_BINARY;
+    if (PHP_SAPI !== 'cli' && PHP_SAPI !== 'phpdbg') {
+        $prefix = (string) fd_env('PREFIX', '');
+        if ($prefix !== '' && is_file($prefix . '/bin/php')) {
+            $phpBin = $prefix . '/bin/php';
+        } else {
+            $candidate = $root . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . (fd_is_windows() ? 'php.exe' : 'php');
+            if (is_file($candidate)) {
+                $phpBin = $candidate;
+            }
+        }
+    }
+    $cmd = '"' . $phpBin . '"'
+        . ' -dhtml_errors=0 -ddisplay_errors=0 -dlog_errors=1'
+        . ' "' . $root . DIRECTORY_SEPARATOR . 'backend.php"'
+        . ' spool ' . escapeshellarg($shortCode)
+        . ' ' . escapeshellarg($botId)
+        . ' ' . escapeshellarg($fileId)
+        . ' ' . (int) $fileSize
+        . ' ' . escapeshellarg($fileName)
+        . ' ' . escapeshellarg($mime);
+    if (fd_is_windows()) {
+        @pclose(@popen('start "" /b ' . $cmd . ' > NUL 2>&1', 'r'));
+    } else {
+        @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
+    }
+    fd_log('spool filler spawned', ['short_code' => $shortCode, 'file_size' => $fileSize]);
+    return true;
+}
+
+/**
+ * Detached filler body (CLI: `backend.php spool <short_code> <bot_id> <file_id>
+ * <size> <name> <mime>`). Holds the per-short-code lock for its whole life so
+ * concurrent players cannot start competing downloads of the same title.
+ */
+function fd_spool_fill(
+    string $shortCode,
+    string $botId,
+    string $fileId,
+    int $fileSize,
+    string $fileName,
+    string $mime
+): void {
+    if ($shortCode === '' || !fd_spool_enabled()) {
+        return;
+    }
+    $lockFp = @fopen(fd_spool_lock_path($shortCode), 'c');
+    if (!$lockFp || !@flock($lockFp, LOCK_EX | LOCK_NB)) {
+        return; // another filler owns this title
+    }
+    $target = fd_spool_path($shortCode, $fileName, $mime);
+    if (is_file($target)) {
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+        return;
+    }
+    fd_spool_prune();
+
+    $boot = fd_boot_madeline(null, [], $botId);
+    $madeline = $boot[0] ?? null;
+    if (!$madeline) {
+        fd_log('spool fill: madeline boot failed', ['short_code' => $shortCode, 'error' => $boot[1] ?? 'unknown']);
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+        return;
+    }
+    if ($fileId === '') {
+        $resolved = fd_resolve_shortcode($shortCode, $botId);
+        $fileId = trim((string) ($resolved['file_id_mt'] ?? $resolved['file_id'] ?? ''));
+    }
+    if ($fileId === '') {
+        fd_log('spool fill: no file id', ['short_code' => $shortCode]);
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+        return;
+    }
+
+    $part = $target . '.part';
+    $fh = @fopen($part, 'wb');
+    if (!$fh) {
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+        return;
+    }
+    $written = 0;
+    $started = microtime(true);
+    try {
+        $madeline->downloadToCallable($fileId, static function ($chunk) use ($fh, &$written): int {
+            $len = strlen((string) $chunk);
+            if ($len > 0) {
+                fwrite($fh, (string) $chunk);
+                $written += $len;
+            }
+            return $len;
+        }, null, false);
+    } catch (\Throwable $e) {
+        fd_log('spool fill failed', [
+            'short_code' => $shortCode,
+            'error' => $e->getMessage(),
+            'written' => $written,
+        ]);
+    }
+    @fclose($fh);
+
+    $complete = $written > 0 && ($fileSize <= 0 || $written >= $fileSize);
+    if ($complete) {
+        @rename($part, $target);
+        // A filler may have started with a stale file id; a partial fill is
+        // discarded so the redirect never serves a truncated file.
+        fd_log('spool fill complete', [
+            'short_code' => $shortCode,
+            'bytes' => $written,
+            'seconds' => round(microtime(true) - $started, 2),
+            'file' => basename($target),
+        ]);
+    } else {
+        @unlink($part);
+    }
+    if (method_exists($madeline, 'disconnect')) {
+        try {
+            $madeline->disconnect();
+        } catch (\Throwable $_e) {
+        }
+    }
+    @flock($lockFp, LOCK_UN);
+    @fclose($lockFp);
 }
 
 function fd_extract_download_payload_from_path(string $path): string
@@ -11426,6 +11899,9 @@ if ($isNuvioRoute) {
 
     // ── Nuvio / Stremio Manifest ──
     if ($addonPath === '/manifest.json') {
+        // Stremio/Nuvio fetch the manifest on start and on every addon refresh,
+        // which is the earliest point we can start the IPC worker booting.
+        fd_prewarm_ipc_worker();
         $settingsFile = fd_storage_path('storage/catalog_settings.json');
         $trendingFile = fd_cache_path('trending_keywords.json');
         $mKeyParts = (string)($_SERVER['HTTP_HOST'] ?? '') . '_' .
@@ -12902,6 +13378,11 @@ if ($isNuvioRoute) {
         $streamStart = microtime(true);
         $itemType = urldecode($matches[1]);
         $itemId = urldecode(urldecode($matches[2])); // Handle double-encoded IDs from web clients
+
+        // The stream LIST (usually a cache hit) is handed to the player just
+        // before it starts pulling bytes, so this is the right moment to make
+        // sure the shared IPC worker is booting.
+        fd_prewarm_ipc_worker();
 
         fd_log('stremio stream request received', [
             'itemType' => $itemType,
@@ -14734,6 +15215,13 @@ if (str_starts_with($path, '/api/')) {
         $hasSession = fd_has_local_session() && $botId !== '';
         $pool = fd_get_bot_pool();
 
+        // Warm the shared IPC worker in the background (non-blocking, throttled)
+        // so the first playback does not pay a ~15s full-mode boot while holding
+        // a worker thread. See fd_prewarm_ipc_worker().
+        if ($hasSession) {
+            fd_prewarm_ipc_worker();
+        }
+
         // If meta username/name is empty, fill from bot pool
         $botUsername = (string) ($meta['bot_username'] ?? '');
         $botName = (string) ($meta['bot_name'] ?? '');
@@ -15583,6 +16071,30 @@ if (str_starts_with($path, '/api/')) {
             'ob_level' => ob_get_level(),
         ]);
 
+        // 1. A COMPLETE spool is handed to Caddy's file_server, which streams it
+        //    with HTTP ranges and no PHP worker at all. Checked before the
+        //    session gate on purpose: a spooled file plays with no bot connected.
+        if ($shortCode !== '') {
+            $spooledFile = fd_spool_find($shortCode);
+            if ($spooledFile !== '') {
+                fd_log('serving from spool', [
+                    'short_code' => $shortCode,
+                    'file' => basename($spooledFile),
+                    'bytes' => (int) @filesize($spooledFile),
+                ]);
+                header('Cache-Control: no-store');
+                header('Location: ' . fd_spool_public_url($spooledFile), true, 302);
+                exit;
+            }
+        }
+
+        // 2. Otherwise start a background filler so this title's later range
+        //    requests, seeks and re-watches are served by Caddy instead of
+        //    occupying a worker. Single-flight + throttled in the spawner.
+        if ($shortCode !== '' && $fileId !== '') {
+            fd_spawn_spool_worker($shortCode, $botId, $fileId, $fileSize, $fileName, $fileMime);
+        }
+
         // If Telegram Bot is not connected or session missing, attempt auto-provisioning
         $activeBotId = fd_get_bot_id();
         if (!fd_has_local_session()) {
@@ -16109,6 +16621,18 @@ if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
         $cliArgs = array_values(array_slice($cliArgs, 1));
     }
     $cliAction = $cliArgs[1] ?? '';
+    if ($cliAction === 'spool') {
+        // Detached playback-spool filler: backend.php spool <sc> <bot> <file_id> <size> <name> <mime>
+        fd_spool_fill(
+            (string) ($cliArgs[2] ?? ''),
+            (string) ($cliArgs[3] ?? ''),
+            (string) ($cliArgs[4] ?? ''),
+            (int) ($cliArgs[5] ?? 0),
+            (string) ($cliArgs[6] ?? ''),
+            (string) ($cliArgs[7] ?? '')
+        );
+        exit(0);
+    }
     if ($cliAction === 'warmup') {
         $rawCodes = $cliArgs[2] ?? '';
         $cliBotId = $cliArgs[3] ?? '';

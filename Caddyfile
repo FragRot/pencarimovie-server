@@ -71,6 +71,20 @@
 		file_server
 	}
 
+	# Native playback spool. A fully materialised media file is served here by
+	# Caddy's own file_server (sendfile + HTTP ranges) with NO PHP worker
+	# involved. /api/download redirects here when the file is complete, which is
+	# what stops one viewer from occupying a worker thread for a whole movie
+	# (measured: a 4/6 thread pool starved catalog traffic into p50 11s + 503).
+	# The file name embeds an HMAC over the short code keyed by the per-install
+	# secret, so the URL is unguessable, and /api/download still requires the
+	# auth token before it hands the redirect out.
+	handle /spool/* {
+		uri strip_prefix /spool
+		root * storage/spool
+		file_server
+	}
+
 	@empty_static path /favicon.ico /robots.txt
 	handle @empty_static {
 		respond "" 204
