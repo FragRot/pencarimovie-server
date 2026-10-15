@@ -1345,8 +1345,20 @@ class PencariMovieApp {
         addonNuvioInstructions.classList.remove('hidden');
       }
 
-      if (!isHttps) {
-        updateStremioSyncPreview();
+      // ── "Search on pencarimovie.com" (Settings overlay) ──
+      // Mirrors backend.php's no-streams fallback URL:
+      //   'https://pencarimovie.com/search/?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'))
+      // $baseUrl there is the origin the CLIENT used (fd_get_stremio_base_url()), so
+      // this is the page's own origin — localhost stays localhost, a LAN address
+      // stays LAN, and a page served through a tunnel sends the tunnel origin.
+      // Do NOT prefer the tunnel manifest here: opening the dashboard on
+      // http://localhost:8088 must not hand the site a tunnel domain.
+      const settingsSearchWebsiteBtn = this.$('#settingsSearchWebsiteBtn');
+      if (settingsSearchWebsiteBtn) {
+        const ddldomain = window.location.origin;
+        settingsSearchWebsiteBtn.href =
+          'https://pencarimovie.com/search/?ddldomain=' + encodeURIComponent(ddldomain);
+        settingsSearchWebsiteBtn.title = 'Download domain: ' + ddldomain;
       }
     };
 
