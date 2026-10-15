@@ -8410,6 +8410,59 @@ function fd_spool_prune(): void
     }
 }
 
+/**
+ * Append to storage/spool/log.txt: the filler's history, readable from outside
+ * the dyno via /api/spool-status. Needed because fd_log() writes to
+ * storage/debug.log, which the platform log stream never shows, and a Heroku
+ * web dyno has no shell - so a silently failing filler was unobservable.
+ */
+function fd_spool_note(string $message, array $context = []): void
+{
+    $line = date('c') . ' ' . $message
+        . ($context ? ' ' . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : '')
+        . PHP_EOL;
+    @file_put_contents(fd_spool_dir() . '/log.txt', $line, FILE_APPEND | LOCK_EX);
+}
+
+function fd_spool_status(): array
+{
+    $dir = fd_spool_dir();
+    $complete = 0;
+    $partials = 0;
+    $bytes = 0;
+    $newest = 0;
+    foreach (glob($dir . '/*') ?: [] as $file) {
+        if (!is_file($file) || basename($file) === 'log.txt') {
+            continue;
+        }
+        if (str_ends_with($file, '.part')) {
+            $partials++;
+        } else {
+            $complete++;
+            $bytes += (int) @filesize($file);
+        }
+        $newest = max($newest, (int) @filemtime($file));
+    }
+    $log = is_file($dir . '/log.txt')
+        ? (array) @file($dir . '/log.txt', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
+        : [];
+    return [
+        'enabled' => fd_spool_enabled(),
+        'complete_files' => $complete,
+        'partial_files' => $partials,
+        'complete_bytes' => $bytes,
+        'newest_age_s' => $newest > 0 ? time() - $newest : null,
+        'disk_free_bytes' => (int) @disk_free_space($dir),
+        'settings' => [
+            'seekable' => (string) fd_env('FD_SPOOL_SEEKABLE', '1'),
+            'chunks' => (string) fd_env('FD_SPOOL_PARALLEL_CHUNKS', '8'),
+            'max_file_mb' => (string) fd_env('FD_SPOOL_MAX_FILE_MB', '12288'),
+            'max_gb' => (string) fd_env('FD_SPOOL_MAX_GB', '20'),
+        ],
+        'log_tail' => array_slice($log, -10),
+    ];
+}
+
 function fd_spool_should_fill(string $shortCode, int $fileSize): bool
 {
     if (!fd_spool_enabled() || $shortCode === '') {
@@ -8544,12 +8597,18 @@ function fd_spool_fill(
     $lockFp = @fopen(fd_spool_lock_path($shortCode), 'c');
     if (!$lockFp || !@flock($lockFp, LOCK_EX | LOCK_NB)) {
         fd_log_stderr('spool fill skipped: another filler owns this title', ['short_code' => $shortCode]);
+        fd_spool_note('skip: another filler owns this title', ['short_code' => $shortCode]);
         return;
     }
     fd_log_stderr('spool fill start', [
         'short_code' => $shortCode,
         'size' => $fileSize,
         'mode' => ((string) fd_env('FD_SPOOL_SEEKABLE', '1')) . '/chunks=' . fd_env('FD_SPOOL_PARALLEL_CHUNKS', '8'),
+    ]);
+    fd_spool_note('start', [
+        'short_code' => $shortCode,
+        'size' => $fileSize,
+        'mime' => $mime,
     ]);
     $target = fd_spool_path($shortCode, $fileName, $mime);
     if (is_file($target)) {
@@ -8594,6 +8653,7 @@ function fd_spool_fill(
     if ($fileId === '') {
         fd_log('spool fill: no file id', ['short_code' => $shortCode]);
         fd_log_stderr('spool fill: no file id', ['short_code' => $shortCode]);
+        fd_spool_note('fail: no file id', ['short_code' => $shortCode]);
         @flock($lockFp, LOCK_UN);
         @fclose($lockFp);
         return;
@@ -8630,6 +8690,11 @@ function fd_spool_fill(
             'error' => $e->getMessage(),
             'written' => $written,
         ]);
+        fd_spool_note('fail', [
+            'short_code' => $shortCode,
+            'error' => substr($e->getMessage(), 0, 200),
+            'written' => $written,
+        ]);
     }
     @fclose($fh);
 
@@ -8642,6 +8707,12 @@ function fd_spool_fill(
             'short_code' => $shortCode,
             'bytes' => $written,
             'seconds' => round(microtime(true) - $started, 2),
+        ]);
+        fd_spool_note('complete', [
+            'short_code' => $shortCode,
+            'bytes' => $written,
+            'seconds' => round(microtime(true) - $started, 2),
+            'file' => basename($target),
         ]);
         fd_log('spool fill complete', [
             'short_code' => $shortCode,
@@ -14824,6 +14895,7 @@ if (str_starts_with($path, '/api/')) {
     $alwaysPublicApi = [
         '/api/download',
         '/api/version',
+        '/api/spool-status',
         '/api/clock-check',
         '/api/auth/status',
         '/api/auth/login',
@@ -15367,6 +15439,13 @@ if (str_starts_with($path, '/api/')) {
     // Lets the frontend warn the user BEFORE attempting a bot login, since a
     // skewed clock makes every MTProto handshake fail with a confusing
     // "message ID too new/old" error.
+    // Read-only spool diagnostics. A Heroku web dyno has no shell and the app's
+    // fd_log() never reaches the log stream, so this is how the filler's state
+    // (files, partials, bytes, last decisions) can be verified in production.
+    if ($path === '/api/spool-status' && $method === 'GET') {
+        fd_json(['ok' => 1] + fd_spool_status());
+    }
+
     if ($path === '/api/clock-check' && $method === 'GET') {
         $probe = fd_measure_clock_offset();
         $abs = abs((int) $probe['offset']);
