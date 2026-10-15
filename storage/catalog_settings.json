@@ -39,8 +39,10 @@
     "upstream_enabled": true,
     "upstream_manifests": [
         {
-            "url": "https:\/\/aiometadata.elfhosted.com\/stremio\/136f7ae5-2f15-471d-8f3f-79ee335bbd24\/manifest.json",
-            "name": "AIOMetadata"
+            "name": "AIOMetadata",
+            "url": "https://aiometadata.elfhosted.com/stremio/136f7ae5-2f15-471d-8f3f-79ee335bbd24/manifest.json",
+            "id": "",
+            "version": ""
         }
     ],
     "stream_config": {
@@ -76,7 +78,8 @@
         "max_size_gb": 0,
         "exclude_cam": false,
         "exclude_unplayable": true,
+        "exclude_part_title": true,
         "excluded_keywords": "",
-        "required_keywords": ""
+        "required_keywords": "hindi, hin"
     }
 }
