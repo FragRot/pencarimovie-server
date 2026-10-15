@@ -16269,7 +16269,14 @@ if (str_starts_with($path, '/api/')) {
         // 2. Otherwise start a background filler so this title's later range
         //    requests, seeks and re-watches are served by Caddy instead of
         //    occupying a worker. Single-flight + throttled in the spawner.
-        if ($shortCode !== '' && $fileId !== '') {
+        //
+        //    Do NOT require $fileId here: the stream-list payload carries only
+        //    short_code/bot_id/size/name/mime (the logs show
+        //    file_id_present:false), so gating on a file id silently disabled
+        //    the spool in EVERY environment - no `.part` was ever created and no
+        //    spawn/skip line was ever logged, on Heroku or locally.
+        //    fd_spool_fill() resolves the id from the short code when absent.
+        if ($shortCode !== '') {
             fd_spawn_spool_worker($shortCode, $botId, $fileId, $fileSize, $fileName, $fileMime);
         }
 
