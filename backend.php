@@ -371,6 +371,23 @@ function fd_json(array $data, int $status = 200): never
     exit;
 }
 
+/**
+ * Write a line to the SAPI's stderr so it shows up in the platform log stream
+ * (Heroku `heroku logs`, Docker, systemd).
+ *
+ * fd_log() writes to storage/debug.log (plus error_log()), and `php -i` on the
+ * deployed image reports an EMPTY error_log ini - so nothing from the app ever
+ * reaches `heroku logs`, which is why the spool could not be observed in
+ * production at all. Only low-volume, decision-level events belong here.
+ */
+function fd_log_stderr(string $message, array $context = []): void
+{
+    $suffix = $context
+        ? ' ' . json_encode($context, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        : '';
+    @file_put_contents('php://stderr', '[PencariMovie] ' . $message . $suffix . PHP_EOL, FILE_APPEND);
+}
+
 function fd_log(string $message, array $context = []): void
 {
     if (!fd_is_debug_enabled()) {
@@ -4582,6 +4599,7 @@ function fd_prewarm_ipc_worker(): bool
     $spawned = fd_ensure_ipc_worker($sessionPath, false);
     if ($spawned) {
         fd_log('ipc worker pre-warmed in the background', ['session' => basename($sessionPath)]);
+        fd_log_stderr('ipc worker pre-warmed in the background', ['session' => basename($sessionPath)]);
     }
     return $spawned;
 }
@@ -8417,7 +8435,34 @@ function fd_spawn_spool_worker(
     string $fileName,
     string $mime
 ): bool {
-    if (!fd_spool_should_fill($shortCode, $fileSize)) {
+    // Throttled decision logging to the platform log stream: fd_log() only
+    // reaches storage/debug.log, which is invisible in `heroku logs`, so a
+    // silently-skipped spool was impossible to diagnose.
+    $diagStamp = fd_spool_dir() . '/.diag_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.stamp';
+    $mayDiag = !(is_file($diagStamp) && (time() - (int) @filemtime($diagStamp)) < 60);
+    $diag = static function (string $reason, array $ctx = []) use ($diagStamp, $mayDiag, $shortCode): void {
+        if (!$mayDiag) {
+            return;
+        }
+        @file_put_contents($diagStamp, (string) time());
+        fd_log_stderr('spool skip: ' . $reason, ['short_code' => $shortCode] + $ctx);
+    };
+
+    if (!fd_spool_enabled()) {
+        $diag('disabled', ['flag' => (string) fd_env('FD_SPOOL_ENABLED', '')]);
+        return false;
+    }
+    if ($shortCode === '') {
+        $diag('no short_code');
+        return false;
+    }
+    $maxFile = fd_spool_max_file_bytes();
+    if ($maxFile > 0 && $fileSize > 0 && $fileSize > $maxFile) {
+        $diag('file larger than FD_SPOOL_MAX_FILE_MB', ['size' => $fileSize, 'max' => $maxFile]);
+        return false;
+    }
+    if (fd_spool_find($shortCode) !== '') {
+        $diag('already spooled');
         return false;
     }
     // A filler holds an exclusive lock for its whole life, so a busy lock means
@@ -8434,6 +8479,7 @@ function fd_spawn_spool_worker(
         @fclose($fp);
     }
     if ($busy) {
+        $diag('filler already running');
         return false;
     }
     $stamp = fd_spool_dir() . '/.spawn_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.stamp';
@@ -8470,6 +8516,12 @@ function fd_spawn_spool_worker(
         @shell_exec('nohup ' . $cmd . ' > /dev/null 2>&1 &');
     }
     fd_log('spool filler spawned', ['short_code' => $shortCode, 'file_size' => $fileSize]);
+    fd_log_stderr('spool filler spawned', [
+        'short_code' => $shortCode,
+        'size' => $fileSize,
+        'php' => $phpBin,
+        'cmd' => substr($cmd, 0, 220),
+    ]);
     return true;
 }
 
@@ -8491,8 +8543,14 @@ function fd_spool_fill(
     }
     $lockFp = @fopen(fd_spool_lock_path($shortCode), 'c');
     if (!$lockFp || !@flock($lockFp, LOCK_EX | LOCK_NB)) {
-        return; // another filler owns this title
+        fd_log_stderr('spool fill skipped: another filler owns this title', ['short_code' => $shortCode]);
+        return;
     }
+    fd_log_stderr('spool fill start', [
+        'short_code' => $shortCode,
+        'size' => $fileSize,
+        'mode' => ((string) fd_env('FD_SPOOL_SEEKABLE', '1')) . '/chunks=' . fd_env('FD_SPOOL_PARALLEL_CHUNKS', '8'),
+    ]);
     $target = fd_spool_path($shortCode, $fileName, $mime);
     if (is_file($target)) {
         @flock($lockFp, LOCK_UN);
@@ -8535,6 +8593,7 @@ function fd_spool_fill(
     }
     if ($fileId === '') {
         fd_log('spool fill: no file id', ['short_code' => $shortCode]);
+        fd_log_stderr('spool fill: no file id', ['short_code' => $shortCode]);
         @flock($lockFp, LOCK_UN);
         @fclose($lockFp);
         return;
@@ -8579,6 +8638,11 @@ function fd_spool_fill(
         @rename($part, $target);
         // A filler may have started with a stale file id; a partial fill is
         // discarded so the redirect never serves a truncated file.
+        fd_log_stderr('spool fill complete', [
+            'short_code' => $shortCode,
+            'bytes' => $written,
+            'seconds' => round(microtime(true) - $started, 2),
+        ]);
         fd_log('spool fill complete', [
             'short_code' => $shortCode,
             'bytes' => $written,
