@@ -8299,10 +8299,20 @@ function fd_spool_dir(): string
     return $dir;
 }
 
+/**
+ * OFF by default. Measured on a live local server: three fills running while the
+ * viewer streamed the same box each died with "The operation was cancelled" at
+ * 15:24-15:27 and the player reported "playback-stall / HTTP status: 0 /
+ * readyState: 2" in the same window - the filler and the stream are two
+ * MadelineProto clients on one session and they cancel each other. The yield
+ * logic (marker + defer wait) is in place, but until that is proven in a
+ * controlled run the feature must be explicitly enabled:
+ *     FD_SPOOL_ENABLED=1
+ */
 function fd_spool_enabled(): bool
 {
-    $flag = strtolower((string) fd_env('FD_SPOOL_ENABLED', '1'));
-    return !in_array($flag, ['0', 'false', 'no', 'off'], true);
+    $flag = strtolower((string) fd_env('FD_SPOOL_ENABLED', '0'));
+    return in_array($flag, ['1', 'true', 'yes', 'on'], true);
 }
 
 function fd_spool_max_bytes(): int
@@ -8463,6 +8473,52 @@ function fd_spool_status(): array
     ];
 }
 
+/**
+ * Marker touched while a title is being STREAMED by /api/download.
+ *
+ * The filler must not download the same file at the same time: both are
+ * MadelineProto clients on the same session, and the documented failure mode is
+ * exactly a stall (`downloadToCallable` never progresses while a competing client
+ * hammers the worker). Symptom seen locally: "Playback error ... Reason:
+ * playback-stall, HTTP status: 0, readyState: 2" the moment a fill started
+ * alongside the viewer's own stream. The marker is removed by a shutdown hook,
+ * so it also disappears when the viewer stops, aborts, or the request dies.
+ */
+function fd_spool_active_path(string $shortCode): string
+{
+    return fd_spool_dir() . '/.active_' . preg_replace('/[^A-Za-z0-9_-]/', '', $shortCode) . '.marker';
+}
+
+function fd_spool_mark_streaming(string $shortCode): void
+{
+    if ($shortCode === '') {
+        return;
+    }
+    @file_put_contents(fd_spool_active_path($shortCode), (string) time(), LOCK_EX);
+    static $registered = false;
+    if (!$registered) {
+        $registered = true;
+        register_shutdown_function(static function () use ($shortCode): void {
+            @unlink(fd_spool_active_path($shortCode));
+        });
+    }
+}
+
+function fd_spool_is_streaming(string $shortCode, int $maxAge = 300): bool
+{
+    $path = fd_spool_active_path($shortCode);
+    return is_file($path) && (time() - (int) @filemtime($path)) < $maxAge;
+}
+
+/**
+ * One fill at a time per host: a second filler would just split the same uplink
+ * and the same session between two competing downloads.
+ */
+function fd_spool_global_lock_path(): string
+{
+    return fd_spool_dir() . '/.fill_global.lock';
+}
+
 function fd_spool_should_fill(string $shortCode, int $fileSize): bool
 {
     if (!fd_spool_enabled() || $shortCode === '') {
@@ -8497,8 +8553,11 @@ function fd_spawn_spool_worker(
         if (!$mayDiag) {
             return;
         }
-        @file_put_contents($diagStamp, (string) time());
+        // Keep the reason IN the stamp: it is the only durable record of why a
+        // fill was skipped (stderr is not retained on the Windows launcher).
+        @file_put_contents($diagStamp, $reason . ' @ ' . date('c'), LOCK_EX);
         fd_log_stderr('spool skip: ' . $reason, ['short_code' => $shortCode] + $ctx);
+        fd_spool_note('skip: ' . $reason, ['short_code' => $shortCode] + $ctx);
     };
 
     if (!fd_spool_enabled()) {
@@ -8616,6 +8675,38 @@ function fd_spool_fill(
         @fclose($lockFp);
         return;
     }
+    // One filler per host: a second one would only split the same uplink and the
+    // same Telegram session between two competing downloads.
+    $globalFp = @fopen(fd_spool_global_lock_path(), 'c');
+    if ($globalFp && !@flock($globalFp, LOCK_EX | LOCK_NB)) {
+        fd_spool_note('skip: another filler is active', ['short_code' => $shortCode]);
+        @fclose($globalFp);
+        @flock($lockFp, LOCK_UN);
+        @fclose($lockFp);
+        return;
+    }
+
+    // Yield to a live stream of the SAME title: the viewer is already pulling
+    // those bytes, and two MadelineProto clients sharing one session stall each
+    // other. This process holds no worker thread, so waiting is free; the wait is
+    // bounded so a title that is binge-watched still gets filled on a later
+    // trigger.
+    $deferWait = (int) fd_env('FD_SPOOL_DEFER_WAIT', '900');
+    $waited = 0;
+    while (fd_spool_is_streaming($shortCode) && $waited < $deferWait) {
+        if ($waited === 0) {
+            fd_spool_note('defer: title is streaming, waiting', ['short_code' => $shortCode]);
+        }
+        sleep(10);
+        $waited += 10;
+        if (is_file($target)) {
+            fd_spool_note('defer: filled while waiting', ['short_code' => $shortCode]);
+            @flock($lockFp, LOCK_UN);
+            @fclose($lockFp);
+            return;
+        }
+    }
+
     fd_spool_prune();
 
     // Parallel chunk fetches. downloadToCallable(seekable: true) lets
@@ -16304,6 +16395,13 @@ if (str_starts_with($path, '/api/')) {
         //    spawn/skip line was ever logged, on Heroku or locally.
         //    fd_spool_fill() resolves the id from the short code when absent.
         if ($shortCode !== '') {
+            // Mark BEFORE spawning: the filler must see "this title is being
+            // streamed right now" and wait, otherwise it competes with the very
+            // playback it is meant to help - two MadelineProto clients on one
+            // session stall each other, which the player reported as
+            // "playback-stall", HTTP status 0, readyState 2. The marker is
+            // removed by fd_spool_mark_streaming()'s shutdown hook.
+            fd_spool_mark_streaming($shortCode);
             fd_spawn_spool_worker($shortCode, $botId, $fileId, $fileSize, $fileName, $fileMime);
         }
 
