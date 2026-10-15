@@ -8913,7 +8913,15 @@ function fd_get_trending_keywords_map(): array
 
     if (!$isRefresher) {
         if ($lockFp) {
+            // A closed resource is still truthy, so clear the variable too:
+            // the finally block below would otherwise call flock() on a closed
+            // handle. In PHP 8 that throws a TypeError that `@` cannot
+            // suppress, i.e. a fatal 500 on /manifest.json whenever the cache is
+            // cold and this request lost the single-flight race (observed as
+            // `Uncaught TypeError: flock(): Argument #1 ($stream) must be an
+            // open stream resource` right after a dyno restart).
             @fclose($lockFp);
+            $lockFp = null;
         }
         $stale = $readCache();
         if (!empty($stale)) {
