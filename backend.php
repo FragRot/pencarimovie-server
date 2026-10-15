@@ -5956,7 +5956,16 @@ function fd_extract_split_part_info(string $filename, string $caption = ''): arr
         $matched = true;
         // Strip the part marker from base name
         $cleanBase = preg_replace('/[._\s-]part[._\s-]*0*\d{1,4}(?:[._\s\/-]+(?:of[._\s-]+)?0*\d{1,4})?/i', '', $f);
-    } elseif (preg_match('/[._\s-]0*(\d{1,3})\.(mp4|mkv|avi|webm)$/i', $f, $m) && !preg_match('/\b(2160p|1080p|720p|480p|360p)\b/i', $m[0])) {
+    } elseif (
+        preg_match('/[._\s-]0*(\d{1,3})\.(mp4|mkv|avi|webm)$/i', $f, $m)
+        && !preg_match('/\b(2160p|1080p|720p|480p|360p)\b/i', $m[0])
+        // CRITICAL: never read a codec suffix as a part index. "…AAC2.0.H.264.mkv" matches the
+        // pattern above ("." + "264" + ".mkv"), so EVERY H.264/H.265 release was flagged as
+        // "part 264"/"part 265". With exclude_part_title ON by default
+        // (fd_load_catalog_settings() → 'exclude_part_title' => true) that silently removed the
+        // most common encodes from every stream list. A real split of 263+ parts does not exist.
+        && !in_array((int) $m[1], [263, 264, 265], true)
+    ) {
         // e.g. Something.001.mp4 or Something-001.mkv
         $partNum = (int) $m[1];
         $matched = true;
@@ -6598,9 +6607,22 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     // 2. Normalize series title
     $cleanSeries = preg_replace('/\s*[•··]\s*.+$/u', '', fd_clean_html_entities($seriesTitle));
     $cleanSeries = preg_replace('/\b(?:tvseries|series|season|musim|drama|episode|bahagian)\b.*/i', '', $cleanSeries);
-    if ($seriesYear !== '') {
-        $cleanSeries = preg_replace('/\b' . preg_quote($seriesYear, '/') . '\b/', ' ', $cleanSeries);
-    }
+
+    // Strip only the TRAILING release year ("Glory 2025" -> "Glory").
+    //
+    // CRITICAL: do NOT go back to stripping the first occurrence of $seriesYear anywhere in the
+    // title. Some shows carry the franchise year in their NAME, e.g.
+    // "Kudrat 1968: High Council 2026" (post 9000016669). Removing that embedded "1968" left
+    // "kudrat high council 2026" — a phrase that appears in NO real file name — so all 9 of that
+    // series' S01E01 releases failed the title check and every episode answered "No Streams Found".
+    // Anchoring the strip to the end keeps "kudrat 1968 high council", which the multi-word phrase
+    // check below (step 7) matches against every naming convention these uploaders use:
+    //   Kudrat.1968.High.Council.2026.EP1.MalaySub.mp4
+    //   Kudrat.1968.High.Council.S01E01.1968.1080p.NF.WEB.DL.AAC2.0.H.264.mkv
+    //   FNP22.Kudrat.1968.High.Council.2026.EP01.Subs.Malay.mp4
+    // Regression test: test_kudrat_series.php
+    $cleanSeries = preg_replace('/\s*\b(?:19\d\d|20\d\d)\b\s*$/u', ' ', $cleanSeries);
+
     $cleanSeries = trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $cleanSeries));
     $cleanSeries = trim(preg_replace('/\s+/', ' ', $cleanSeries));
     $targetLower = strtolower($cleanSeries);
@@ -6618,7 +6640,19 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     if ($seriesYear !== '' && $hasFileYear) {
         $fileYear = (int) $fym[1];
         $targetYear = (int) $seriesYear;
-        if ($isSingleWord ? ($fileYear !== $targetYear) : (abs($fileYear - $targetYear) > 1)) {
+        // $fym[1] is the FIRST 4-digit number in the FILE name. When the show name itself embeds
+        // a year ("Kudrat.1968.High.Council.2026.EP1.mp4") that first number is the NAME year
+        // (1968), not a release year — and the series title holds BOTH years, so whichever one
+        // $seriesYear happens to be, a plain compare rejects the whole series. Accept a file year
+        // that genuinely appears anywhere in the series title, so an embedded name year is never
+        // mistaken for a year mismatch. Unrelated years are still rejected: "Glory 2025" keeps
+        // refusing The Glory's 2022 files because 2022 is not a year of "Glory 2025".
+        $seriesTitleYears = [];
+        if (preg_match_all('/\b(19\d\d|20\d\d)\b/', $seriesTitle, $ymAll)) {
+            $seriesTitleYears = array_map('intval', $ymAll[1]);
+        }
+        $yearOk = $isSingleWord ? ($fileYear === $targetYear) : (abs($fileYear - $targetYear) <= 1);
+        if (!$yearOk && !in_array($fileYear, $seriesTitleYears, true)) {
             return false;
         }
     }
@@ -6660,9 +6694,19 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         return false;
     }
 
-    // For single-word titles with known year (e.g. "Glory 2025"), reject un-yeared files that have foreign platform/region indicators
-    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord) {
-        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg|hindi)\b/i', $fileTitle . ' ' . $fileCaption)) {
+    // For single-word titles with a known year and NO leading "The" (e.g. "Glory 2025"), reject
+    // un-yeared files carrying foreign platform/region indicators — they belong to a DIFFERENT,
+    // same-named show. Two scope limits matter here, both learned the hard way:
+    //   1. A leading "The" is already the discriminator for this family (strict leading-"The"
+    //      check above), so the guard must NOT run for it. Running it dropped every year-less
+    //      release of "The Glory" (2022) — e.g. "The.Glory.S01E16.Hindi.English.Korean.480p
+    //      .WEB.DL.ESubs.BollyFlix.mkv" — because the show itself is Korean/NF.
+    //   2. "hindi" is deliberately NOT an indicator: Hindi (+Korean) dual-audio is the normal
+    //      naming for these shows, so it only produced false negatives.
+    // The "Glory 2025" protection still holds via the leading-"The" check and this guard.
+    // Regression test: test_kudrat_series.php (the "MUST NOT REGRESS" cases).
+    if (!$hasFileYear && $seriesYear !== '' && $isSingleWord && !$hasLeadingThe) {
+        if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg)\b/i', $fileTitle . ' ' . $fileCaption)) {
             return false;
         }
     }
@@ -13849,8 +13893,12 @@ if ($isNuvioRoute) {
             //    split release ("Movie.Part.1.mkv", "part001", "Movie.mkv.001"), which
             //    would play only a fragment of the movie. The flag is set by
             //    fd_group_split_parts() above, so this reuses the existing detector.
-            //    ponytail: title-based detection means a real movie with a number in
-            //    its name ("Dune Part 2") is also caught, hence opt-in (default off).
+            //    ponytail: title-based detection means a real movie with a number in its
+            //    name ("Dune Part 2") is also caught, hence the single toggle below.
+            //    NOTE this toggle is ON by default ('exclude_part_title' => true in
+            //    fd_load_catalog_settings()), so fd_extract_split_part_info() must never
+            //    flag a codec suffix as a part — see the H.263/H.264/H.265 guard there,
+            //    otherwise the most common encodes disappear from every stream list.
             if ($excludePartTitle && !empty($fItem['is_split_part'])) {
                 continue;
             }
