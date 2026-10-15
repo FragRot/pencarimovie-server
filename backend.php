@@ -8531,7 +8531,7 @@ function fd_get_default_catalog_options(): array
         'pm_movies_philippines' => ['type' => 'movie', 'group' => 'country', 'name' => 'Philippines (Movie)', 'default' => false],
         'pm_movies_english' => ['type' => 'movie', 'group' => 'country', 'name' => 'English (Movie)', 'default' => true],
         // Series country catalogs: Series > Country > Year with Genre
-        'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => false],
+        'pm_series_kdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'K-Drama (Series)', 'default' => true],
         'pm_series_anime' => ['type' => 'series', 'group' => 'country', 'name' => 'Anime (Series)', 'default' => true],
         'pm_series_japan' => ['type' => 'series', 'group' => 'country', 'name' => 'J-Drama (Series)', 'default' => false],
         'pm_series_malay' => ['type' => 'series', 'group' => 'country', 'name' => 'Malaysia (Series)', 'default' => true],
@@ -8709,6 +8709,7 @@ function fd_load_catalog_settings(): array
             'max_size_gb' => 0,
             'exclude_cam' => false,
             'exclude_unplayable' => true,
+            'exclude_part_title' => true,
             'excluded_keywords' => '',
             'required_keywords' => '',
         ],
@@ -8818,6 +8819,9 @@ function fd_load_catalog_settings(): array
                 }
                 if (isset($sc['exclude_unplayable'])) {
                     $defaults['stream_config']['exclude_unplayable'] = (bool) $sc['exclude_unplayable'];
+                }
+                if (isset($sc['exclude_part_title'])) {
+                    $defaults['stream_config']['exclude_part_title'] = (bool) $sc['exclude_part_title'];
                 }
                 if (isset($sc['excluded_keywords'])) {
                     $defaults['stream_config']['excluded_keywords'] = trim((string) $sc['excluded_keywords']);
@@ -13717,6 +13721,7 @@ if ($isNuvioRoute) {
         $visualFilter = $streamConfig['visual_tags'] ?? ['hdr' => true, 'dv' => true];
         $excludeCam = !empty($streamConfig['exclude_cam']);
         $excludeUnplayable = isset($streamConfig['exclude_unplayable']) ? !empty($streamConfig['exclude_unplayable']) : true;
+        $excludePartTitle = !empty($streamConfig['exclude_part_title']);
         $preferredRes = $streamConfig['preferred_resolution'] ?? 'auto';
         $maxPerRes = max(0, (int)($streamConfig['max_streams_per_resolution'] ?? 0));
         $maxTotal = max(0, (int)($streamConfig['max_streams_total'] ?? 0));
@@ -13838,6 +13843,16 @@ if ($isNuvioRoute) {
                     }
                 }
                 if (!$hasRequiredKw) continue;
+            }
+
+            // 8. Exclude Part Titles filter — drop streams that are one part of a
+            //    split release ("Movie.Part.1.mkv", "part001", "Movie.mkv.001"), which
+            //    would play only a fragment of the movie. The flag is set by
+            //    fd_group_split_parts() above, so this reuses the existing detector.
+            //    ponytail: title-based detection means a real movie with a number in
+            //    its name ("Dune Part 2") is also caught, hence opt-in (default off).
+            if ($excludePartTitle && !empty($fItem['is_split_part'])) {
+                continue;
             }
 
             $fItem['_resKey'] = $rKey;
@@ -14740,6 +14755,9 @@ if (str_starts_with($path, '/api/')) {
             }
             if (isset($inSc['exclude_unplayable'])) {
                 $current['stream_config']['exclude_unplayable'] = (bool) $inSc['exclude_unplayable'];
+            }
+            if (isset($inSc['exclude_part_title'])) {
+                $current['stream_config']['exclude_part_title'] = (bool) $inSc['exclude_part_title'];
             }
             if (isset($inSc['excluded_keywords'])) {
                 $current['stream_config']['excluded_keywords'] = trim((string) $inSc['excluded_keywords']);

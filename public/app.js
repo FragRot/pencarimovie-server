@@ -869,6 +869,7 @@ class PencariMovieApp {
           const qualCamEl = this.$('#streamQualCam');
           const excludeCamEl = this.$('#streamExcludeCam');
           const excludeUnplayableEl = this.$('#streamExcludeUnplayable');
+          const excludePartTitleEl = this.$('#streamExcludePartTitle');
 
           if (qualRemuxEl) qualRemuxEl.checked = qualConfig['remux'] !== false;
           if (qualBlurayEl) qualBlurayEl.checked = qualConfig['bluray'] !== false;
@@ -878,6 +879,7 @@ class PencariMovieApp {
           if (qualCamEl) qualCamEl.checked = qualConfig['cam'] !== false;
           if (excludeCamEl) excludeCamEl.checked = !!streamConfig.exclude_cam;
           if (excludeUnplayableEl) excludeUnplayableEl.checked = streamConfig.exclude_unplayable !== undefined ? !!streamConfig.exclude_unplayable : true;
+          if (excludePartTitleEl) excludePartTitleEl.checked = streamConfig.exclude_part_title !== undefined ? !!streamConfig.exclude_part_title : true;
 
           const encHevcEl = this.$('#streamEncHevc');
           const encAvcEl = this.$('#streamEncAvc');
@@ -1060,6 +1062,7 @@ class PencariMovieApp {
               },
               exclude_cam: this.$('#streamExcludeCam') ? this.$('#streamExcludeCam').checked : false,
               exclude_unplayable: this.$('#streamExcludeUnplayable') ? this.$('#streamExcludeUnplayable').checked : false,
+              exclude_part_title: this.$('#streamExcludePartTitle') ? this.$('#streamExcludePartTitle').checked : true,
               preferred_resolution: preferredResEl ? preferredResEl.value : 'auto',
               max_streams_per_resolution: maxPerResEl ? parseInt(maxPerResEl.value, 10) || 0 : 0,
               max_streams_total: this.$('#streamMaxTotal') ? parseInt(this.$('#streamMaxTotal').value, 10) || 0 : 0,
