@@ -8668,33 +8668,60 @@ function fd_spool_fill(
     }
     $written = 0;
     $started = microtime(true);
-    try {
-        // The chunk callable MUST accept ($payload, $offset): MadelineProto
-        // documents "The callable must accept two parameters: string $payload,
-        // int $offset" and calls it out of order when $seekable is true. A
-        // one-argument sink dies with an ArgumentCountError the moment
-        // seekable mode is enabled, so always seek to the given offset.
-        $madeline->downloadToCallable($fileId, static function ($chunk, $offset = 0) use ($fh, &$written): int {
-            $data = (string) $chunk;
-            $len = strlen($data);
-            if ($len > 0) {
-                @fseek($fh, (int) $offset);
-                @fwrite($fh, $data);
-                $written += $len;
+    // A cached file id can expire mid-fill (observed locally:
+    // `fail {"short_code":"1w9Xjd","error":"FILE_REFERENCE_EXPIRED","written":0}`),
+    // which would otherwise leave the title permanently un-spooled. Mirror the
+    // download handler: re-resolve the short code with the cache bypassed and
+    // retry ONCE from the beginning.
+    $refRefreshed = false;
+    for ($fillAttempt = 1; $fillAttempt <= 2; $fillAttempt++) {
+        try {
+            // The chunk callable MUST accept ($payload, $offset): MadelineProto
+            // documents "The callable must accept two parameters: string $payload,
+            // int $offset" and calls it out of order when $seekable is true. A
+            // one-argument sink dies with an ArgumentCountError the moment
+            // seekable mode is enabled, so always seek to the given offset.
+            $madeline->downloadToCallable($fileId, static function ($chunk, $offset = 0) use ($fh, &$written): int {
+                $data = (string) $chunk;
+                $len = strlen($data);
+                if ($len > 0) {
+                    @fseek($fh, (int) $offset);
+                    @fwrite($fh, $data);
+                    $written += $len;
+                }
+                return $len;
+            }, null, $seekable);
+            break;
+        } catch (\Throwable $e) {
+            $msg = $e->getMessage();
+            $isRefExpired = stripos($msg, 'FILE_REFERENCE_EXPIRED') !== false
+                || stripos($msg, 'refresh file reference') !== false;
+            if ($isRefExpired && !$refRefreshed && $shortCode !== '') {
+                $refRefreshed = true;
+                fd_invalidate_resolve_cache($shortCode, $botId);
+                $reResolved = fd_resolve_shortcode_fresh($shortCode, $botId);
+                $newId = trim((string) ($reResolved['file_id_mt'] ?? $reResolved['file_id'] ?? ''));
+                if ($newId !== '') {
+                    fd_log('spool fill: reference expired, re-resolved, retrying', ['short_code' => $shortCode]);
+                    fd_spool_note('retry after reference refresh', ['short_code' => $shortCode]);
+                    $fileId = $newId;
+                    @ftruncate($fh, 0);
+                    $written = 0;
+                    continue;
+                }
             }
-            return $len;
-        }, null, $seekable);
-    } catch (\Throwable $e) {
-        fd_log('spool fill failed', [
-            'short_code' => $shortCode,
-            'error' => $e->getMessage(),
-            'written' => $written,
-        ]);
-        fd_spool_note('fail', [
-            'short_code' => $shortCode,
-            'error' => substr($e->getMessage(), 0, 200),
-            'written' => $written,
-        ]);
+            fd_log('spool fill failed', [
+                'short_code' => $shortCode,
+                'error' => $msg,
+                'written' => $written,
+            ]);
+            fd_spool_note('fail', [
+                'short_code' => $shortCode,
+                'error' => substr($msg, 0, 200),
+                'written' => $written,
+            ]);
+            break;
+        }
     }
     @fclose($fh);
 
