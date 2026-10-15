@@ -8501,6 +8501,26 @@ function fd_spool_fill(
     }
     fd_spool_prune();
 
+    // Parallel chunk fetches. downloadToCallable(seekable: true) lets
+    // MadelineProto dispatch several 1MB parts at once; the in-order mode
+    // (seekable: false) issues one part per round trip, which is what made the
+    // filler slow. Parallelism comes from Files::getDownloadParallelChunks() -
+    // 20 by default, but the web boot deliberately lowers it
+    // (FD_DOWNLOAD_PARALLEL_CHUNKS = 2-4) to protect a shared box, so the
+    // background filler is allowed its own value.
+    // Measured on a VPS against a 3GB 2160p file (20s fills, real Telegram
+    // download): sequential 3.2MB/s, chunks=2 3.2MB/s, chunks=4 5.2MB/s,
+    // chunks=8 9.7MB/s, chunks=20 9.1MB/s. 8 is the sweet spot, so the filler
+    // defaults to it while the web boot keeps its conservative 2-4 (a live
+    // stream and the filler share the same uplink).
+    $seekable = !in_array(strtolower((string) fd_env('FD_SPOOL_SEEKABLE', '1')), ['0', 'false', 'no', 'off'], true);
+    $spoolChunks = (int) fd_env('FD_SPOOL_PARALLEL_CHUNKS', '8');
+    if ($spoolChunks > 0) {
+        @putenv('FD_DOWNLOAD_PARALLEL_CHUNKS=' . $spoolChunks);
+        $_ENV['FD_DOWNLOAD_PARALLEL_CHUNKS'] = (string) $spoolChunks;
+        $_SERVER['FD_DOWNLOAD_PARALLEL_CHUNKS'] = (string) $spoolChunks;
+    }
+
     $boot = fd_boot_madeline(null, [], $botId);
     $madeline = $boot[0] ?? null;
     if (!$madeline) {
@@ -8530,14 +8550,21 @@ function fd_spool_fill(
     $written = 0;
     $started = microtime(true);
     try {
-        $madeline->downloadToCallable($fileId, static function ($chunk) use ($fh, &$written): int {
-            $len = strlen((string) $chunk);
+        // The chunk callable MUST accept ($payload, $offset): MadelineProto
+        // documents "The callable must accept two parameters: string $payload,
+        // int $offset" and calls it out of order when $seekable is true. A
+        // one-argument sink dies with an ArgumentCountError the moment
+        // seekable mode is enabled, so always seek to the given offset.
+        $madeline->downloadToCallable($fileId, static function ($chunk, $offset = 0) use ($fh, &$written): int {
+            $data = (string) $chunk;
+            $len = strlen($data);
             if ($len > 0) {
-                fwrite($fh, (string) $chunk);
+                @fseek($fh, (int) $offset);
+                @fwrite($fh, $data);
                 $written += $len;
             }
             return $len;
-        }, null, false);
+        }, null, $seekable);
     } catch (\Throwable $e) {
         fd_log('spool fill failed', [
             'short_code' => $shortCode,
