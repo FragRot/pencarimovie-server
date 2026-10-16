@@ -8179,6 +8179,22 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
             return true;
         }
 
+        // The catalogue title can END with a type word that the ORIGIN's keyword cleaner
+        // strips, while the FILE keeps it. Measured: `pm:post:8591885201` is
+        // "The Super Mario Galaxy MOVIE" (2026) and `stream-files?id=post:…` answers
+        // `resolved_title = "The Super Mario Galaxy"` with 112 items — every file named
+        // `…Galaxy.Movie.2026…` failed the equality above, only the one file named
+        // `…Galaxy.2026.480p.tracemedia11.mkv` matched, and the route returned **1** stream
+        // instead of the 101 the same items produce for the tt id. The year guard (step 1) has
+        // already run, so a same-year file whose cleaned title is the target PLUS a type word
+        // is that film. The type word must be the ONLY extra word.
+        if (
+            str_starts_with($baseF, $targetLower . ' ')
+            && preg_match('/^(?:movie|film|the\s+movie|tv\s*series|series|show)$/', substr($baseF, strlen($targetLower) + 1))
+        ) {
+            return true;
+        }
+
         // AKA as a title PREFIX carrying a subtitle/descriptor that the upstream meta
         // does not have. Measured: tt1801064 is "Superstition" (2011, Malaysia), the
         // derived alternate title is "Khurafat", and EVERY catalogue file is named
@@ -8341,8 +8357,22 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     $contentWords = array_values(array_filter(explode(' ', $targetLower), fn($w) => !in_array($w, $stopWords, true)));
     $isSingleWord = count($contentWords) <= 1;
 
-    // 3. Strict Year check if year is specified on the series and present on the file
-    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fym);
+    // 3. Strict Year check if year is specified on the series and present on the file.
+    //
+    // The CAPTION frequently holds the full release name — and with it the year the file name
+    // omits: `One.Piece.2023.Season.1.S01.E01.E04.COMBINED.1080p.mkv` carries no year, while its
+    // caption reads "One Piece (2023) Season 1 S01 [E01-E04] COMBINED 1080p 10bit NF WEBRip …".
+    // Measured: that file was listed under the **1999** anime entry
+    // (`pm:post:8798795472:1:1`). Only used when the NAME has no year, so it can never override
+    // a real file year.
+    $yearSource = $fileTitle;
+    if ($fileCaption !== '' && !preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle)) {
+        $capFirstLine = trim((string) strtok($fileCaption, "\r\n"));
+        if ($capFirstLine !== '') {
+            $yearSource = $fileTitle . ' ' . $capFirstLine;
+        }
+    }
+    $hasFileYear = (bool) preg_match('/\b(19\d\d|20\d\d)\b/', $yearSource, $fym);
     if ($seriesYear !== '' && $hasFileYear) {
         $fileYear = (int) $fym[1];
         $targetYear = (int) $seriesYear;
@@ -8413,6 +8443,30 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
     // Regression test: test_kudrat_series.php (the "MUST NOT REGRESS" cases).
     if (!$hasFileYear && $seriesYear !== '' && $isSingleWord && !$hasLeadingThe) {
         if (preg_match('/\b(netflix|\bnf\b|k\.o|korean|korea|rarbg|kdg)\b/i', $fileTitle . ' ' . $fileCaption)) {
+            return false;
+        }
+    }
+
+    // 5c. A file that declares a DIFFERENT KIND of release than the entry is a different work.
+    //
+    // Opening `pm:post:8798795472:1:1` ("One Piece" 1999) listed **LEGO One Piece** (13 files),
+    // **One Piece MOVIE / OVA / TV-SP / LOG / Film** files (51) and the 2023 live-action's
+    // `IAC…One.Piece.Live.Action…` — none of them this show. The entry's own title is the
+    // discriminator: a marker the entry title does NOT carry means the file belongs to a sibling
+    // work, which is exactly right for the entries that ARE that work — "One Piece Log: Fish-Man
+    // Island Saga" carries `log`, "One Piece Film: Strong World" carries `film`, and any
+    // "ONE PIECE live-action" entry carries `live action`, so every one of them keeps its own
+    // files. A marker the entry title DOES carry is ignored, so the rule can never reject a file
+    // merely for being named like the entry.
+    $entryNorm = strtolower(trim(preg_replace('/\s+/', ' ', preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $seriesTitle))));
+    if ($entryNorm !== '' && ($fCleanNorm !== '' || $afterEp !== '')) {
+        $fileRegion = trim($fCleanNorm . ' ' . $afterEp);
+        foreach (['movie', 'film', 'ova', 'oav', 'oad', 'ona', 'special', 'recap', 'log', 'lego'] as $kindMarker) {
+            if (preg_match('/\b' . $kindMarker . '\b/', $fileRegion) && !preg_match('/\b' . $kindMarker . '\b/', $entryNorm)) {
+                return false;
+            }
+        }
+        if (preg_match('/\btv\s*sp\b|live[ ._-]?action/', $fileRegion) && !preg_match('/live[ ._-]?action/', $entryNorm)) {
             return false;
         }
     }
@@ -9059,6 +9113,15 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     if (preg_match('/\b(19\d\d|20\d\d)\b/', $fullTitle, $ym)) {
         $postYear = $ym[1];
     }
+    // The row's own `year` column is authoritative and is often the ONLY place the year lives.
+    // `fd_resolve_external_media_metadata('tt0388629')` answers title "One Piece" + year "1999" —
+    // and reading the TITLE alone left `$postYear` null, so the ±1-year guard in
+    // fd_series_file_matches_title() never ran and the One Piece ANIME's IMDb id listed **41**
+    // files of the 2023 live-action (`ONE.PIECE.2023.S01E01.ROMANCE.DAWN…`). The same id via
+    // `pm:post:` was already clean because that path derived the year from the post's own files.
+    if ($postYear === null && !empty($post['year']) && preg_match('/^(?:19\d\d|20\d\d)$/', (string) $post['year'])) {
+        $postYear = (string) $post['year'];
+    }
 
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
@@ -9115,6 +9178,38 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             'max_pages' => 3,
         ]);
         if (!empty($postFiles)) {
+            // Derive the ENTRY YEAR from the post's own file set when the title carries none.
+            //
+            // `lookup-id?prefix=post&id=8798795472` answers with the title "One Piece" and nothing
+            // else, yet all **600** of that post's own files are named `One.Piece.1999.<episode>`.
+            // Without a year the ±1-year guard in fd_series_file_matches_title() is inert, so the
+            // 2023 live-action's and the 2026 remake's Episode-1 files were accepted under the
+            // 1999 anime — the reported mixing. Only derived when the title has NO year at all
+            // (so a show whose NAME embeds one, like "Kudrat 1968", is never re-dated) and only
+            // from a clear majority of the post's own files.
+            if ($postYear === null) {
+                $yearCounts = [];
+                foreach ($postFiles as $pf) {
+                    if (preg_match('/\b(19\d\d|20\d\d)\b/', (string) ($pf['title'] ?? ''), $pym)) {
+                        $yearCounts[$pym[1]] = ($yearCounts[$pym[1]] ?? 0) + 1;
+                    }
+                }
+                if (!empty($yearCounts)) {
+                    arsort($yearCounts);
+                    $topYear = (string) array_key_first($yearCounts);
+                    $tagged = array_sum($yearCounts);
+                    if ((int) $topYear >= 1950 && $yearCounts[$topYear] >= 20 && $yearCounts[$topYear] >= 0.6 * $tagged) {
+                        $postYear = $topYear;
+                        fd_log('series year derived from post set', [
+                            'postId' => $postId,
+                            'year'   => $topYear,
+                            'tagged' => $tagged,
+                            'total'  => count($postFiles),
+                        ]);
+                    }
+                }
+            }
+
             $add($postFiles);
             fd_log('episode files from cached post set', [
                 'postId'        => $postId,
@@ -15294,221 +15389,97 @@ if ($isNuvioRoute) {
             // path derives and consumes it, and `empty($searchedAka)` on an undefined
             // variable would silently drop the alternate-title search.
             $searchedAka = '';
+            // Filled by the lazy fallback below (one media_ids_idx read). The external-id
+            // branch reads it when present.
+            $postIdentity = [];
+            // Empty for a series: its title/year are resolved inside the episode fetch.
+            $postTitle = '';
+            $postYear = '';
 
-            // LAZY media_ids_idx identity for this post id. It is a SERIAL WordPress call —
-            // measured 3.5 s for `lookup-id?prefix=post&id=16364` — and `stream-files`
-            // usually already carries `resolved_title`, so paying for it on every stream list
-            // was pure latency. It is now fetched only when the title is still unknown (the
-            // pseudo ids `9000000000 + imdb`, for which `stream-files?id=post:…` answers with
-            // no title) or when nothing was found and the AKA fallback needs the imdb id.
-            // A closure, so both the movie and the series paths can use it.
-            $postIdentity = null;
-            $postIdentityLoad = static function () use (&$postIdentity, $postId): array {
-                if ($postIdentity === null) {
-                    $postIdentity = $postId > 0 ? fd_lookup_catalog_post_identity($postId) : [];
-                }
-                return $postIdentity;
-            };
             $isSeries = ($itemType === 'series' || str_contains(strtolower($itemType), 'series') || ($targetSeason !== null && $targetEpisode !== null));
             // Fast Path 1: Series episode requested via post ID (e.g. pm:post:9000020144:1:1 or series root pm:post:9000020144)
             if ($isSeries) {
                 $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250);
             }
-            // Fast Path 2: Movie requested via post ID
+            // Fast Path 2: Movie requested via post ID — ONE origin call, then match. Everything
+            // else is the lazy fallback below, and that only runs when this matched nothing.
+            // Same shape as the Android app's pm:post branch (NativeHttpServer.kt).
             else {
-                $mUrl = FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150";
-                // 8 s here, NOT 15 s. `fd_http_get_contents()` retries a cancelled Amp attempt
-                // once, 150 ms later, and the origin answers that retry quickly once its own
-                // Manticore query / FastCGI cache is warm — measured on a phone: the 15 s
-                // attempt was cancelled and the retry answered 200 in 2.226 s, so 17.2 s of a
-                // 21 s stream list went into one call that was going to be retried anyway.
-                // 15 s was also the only bare-`fd_http_json()` call on this path; every other
-                // origin call here goes through the cache-first `fd_fetch_stream_ajax()`, whose
-                // default for this action is 8 s.
-                // Cache-first (fd_cached_wp_json) — same reason as the series fast path: this is
-                // the heaviest origin call per movie and it was uncached.
-                $res = fd_cached_wp_json($mUrl, 8);
+                // 8 s, NOT 15 s. `fd_http_get_contents()` retries a cancelled Amp attempt once,
+                // 150 ms later, and the origin answers that retry quickly once its own Manticore
+                // query / FastCGI cache is warm — measured on a phone: the 15 s attempt was
+                // cancelled and the retry answered 200 in 2.226 s, so 17.2 s of a 21 s stream
+                // list went into one call that was going to be retried anyway. 15 s was also the
+                // only bare-`fd_http_json()` call on this path.
+                // Cache-first (`fd_cached_wp_json`) — the heaviest origin call per movie, and it
+                // was uncached.
+                $res = fd_cached_wp_json(FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150", 8);
                 $postTitle = (string) ($res['resolved_title'] ?? '');
                 $postYear = (string) ($res['resolved_year'] ?? '');
-                // The identity is worth its 3.5 s ONLY when `stream-files` could not name the
-                // item (pseudo ids). Needing the YEAR is explicitly NOT a reason to fetch it:
-                // these posts carry the year in the title ("Less of a Stranger 2026 • Movie"),
-                // and asking for the identity just to learn it cost 3.48 s on every such
-                // stream list. The year guard below derives it from the title.
-                if ($postTitle === '') {
-                    $identityFill = $postIdentityLoad();
-                    if (!empty($identityFill['title'])) {
-                        $postTitle = (string) $identityFill['title'];
-                    }
-                    if ($postYear === '' && !empty($identityFill['year'])) {
-                        $postYear = (string) $identityFill['year'];
-                    }
-                } elseif ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $yearInTitle)) {
+                // The year is written into the title for most of these posts ("Less of a
+                // Stranger 2026 • Movie"); asking the identity for it cost 3.48 s per list.
+                if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $yearInTitle)) {
                     $postYear = $yearInTitle[1];
                 }
-                // Only what we already paid for: an aka is used when the identity was loaded.
-                $searchedAka = is_array($postIdentity) ? (string) ($postIdentity['aka'] ?? '') : '';
-                $searchedTitle = $postTitle;
-                $searchedYear = $postYear;
-                $moviePostFastPathDone = false;
-                if (isset($res['ok']) && !empty($res['items']) && is_array($res['items'])) {
-                    $moviePostFastPathDone = true;
-                    foreach ($res['items'] as $f) {
-                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                        $fCaption = (string) ($f['caption'] ?? '');
-                        // Strict title and year check to prevent unrelated files from leaking into movie streams
-                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCaption)) {
-                            $filesToStream[] = $f;
-                        }
+                foreach ((array) ($res['items'] ?? []) as $f) {
+                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                    $fCaption = (string) ($f['caption'] ?? '');
+                    // Strict title and year check to prevent unrelated files from leaking into movie streams
+                    if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, '', $fCaption)) {
+                        $filesToStream[] = $f;
                     }
                 }
             }
 
-            // Start the AKA derivation NOW, so it overlaps the post_files probe below.
-            //
-            // Measured on pm:post:9000031194 ("Siccîn 9 2026"): the post_files probe took 5.73 s
-            // and the /title/{id}/akas call 9.70 s, and they ran ONE AFTER THE OTHER, so the
-            // request spent 19.2 s producing the same 5 streams it can produce in ~11 s when the
-            // two overlap. They are genuinely independent — one reads the post's own Telegram
-            // files, the other asks an external API for the film's original-language title — and
-            // the future is consumed exactly where the synchronous call used to be. The imdb id is
-            // already in memory ($postIdentity), so no extra fetch is needed to start this.
-            // Only when the block below (the one that consumes it) will actually run: a post whose
-            // fast path answered with items but matched no file never reaches that block, and a
-            // future nobody awaits is reported as an unhandled error when it is destroyed.
-            // The AKA derivation needs an imdb id, and for a pseudo id such as
-            // `pm:post:9000031194` that id exists ONLY in the media_ids_idx identity, which costs a
-            // `lookup-id` round-trip (measured 2.436 s). That lookup used to happen inside the
-            // `$searchedAka === ''` fallback far below — i.e. AFTER the post_files probe — so the
-            // derivation could not start until both had finished one after the other.
-            //
-            // Load it HERE instead. Ordering is the whole point:
-            //     lookup (2.4 s)  ->  max( probe (5.73 s), AKA (9.70 s) )   == ~12 s
-            // instead of
-            //     probe (5.73 s)  ->  lookup (2.4 s)  ->  AKA (9.70 s)      == 19.2 s
-            // The probe's file matching uses the row TITLE (files are named after it), not the aka,
-            // so it does not need this result; only the `$searchedAka === ''` fallback below does,
-            // and it reads the same memoized array, so this is a cost already being paid — only
-            // moved earlier.
-            if (
-                !$moviePostFastPathDone && empty($filesToStream) && $searchedAka === ''
-                && $postId > 0 && $postIdentity === null
-            ) {
-                $identityPre = $postIdentityLoad();
-                if (!empty($identityPre['aka'])) {
-                    $searchedAka = (string) $identityPre['aka'];
-                }
-            }
-
-            $akaFuture = null;
-            if (
-                !$moviePostFastPathDone && empty($filesToStream) && $searchedAka === ''
-                && is_array($postIdentity) && !empty($postIdentity['imdb_id'])
-                && function_exists('Amp\\async') && function_exists('Amp\\Future\\await')
-            ) {
-                $akaImdbId = (string) $postIdentity['imdb_id'];
-                $akaHintTitle = (string) $postTitle;
-                $akaHintYear = (string) ($postYear ?? '');
-                $akaFuture = \Amp\async(static function () use ($akaImdbId, $akaHintTitle, $akaHintYear): string {
-                    try {
-                        return fd_aka_from_upstream($akaImdbId, 'movie', $akaHintTitle, $akaHintYear);
-                    } catch (\Throwable $e) {
-                        fd_log('aka future failed', ['imdb_id' => $akaImdbId, 'error' => $e->getMessage()]);
-                        return '';
-                    }
-                });
-                // Safety net: a future nobody awaits reports itself as an unhandled error when it is
-                // destroyed. Every path below consumes it, but a post with no usable title can reach
-                // neither consume site, so make "nobody awaited this" harmless.
-                \register_shutdown_function(static function () use ($akaFuture): void {
-                    if (method_exists($akaFuture, 'ignore')) {
-                        $akaFuture->ignore();
-                    }
-                });
-            }
-
-            // Fallback for Movie requested via post ID:
-            // If stream-files returned 0 items, probe post_files directly for this exact post ID
+            // LAZY FALLBACK. One media_ids_idx read serves all three needs — the title (a pseudo
+            // post id's `stream-files` row carries none, which is why the match above accepted its
+            // items unconditionally), the year and the aka. It is a SERIAL WordPress call (3.5 s
+            // measured for `lookup-id?prefix=post&id=16364`), so it is paid only on this path.
+            // Movie-only: the series path resolved its episodes above and must not pay for it.
             if (empty($filesToStream) && $postId > 0) {
+                if (!$isSeries) {
+                    $postIdentity = fd_lookup_catalog_post_identity($postId);
+                    if ($postTitle === '') $postTitle = (string) ($postIdentity['title'] ?? '');
+                    if ($postYear === '') $postYear = (string) ($postIdentity['year'] ?? '');
+                    $searchedAka = (string) ($postIdentity['aka'] ?? '');
+                }
+                // The post's OWN files. A real post id has them; a pseudo id has none and falls
+                // through to the title search below.
                 $pfRes = fd_fetch_stream_ajax('post_files', ['post_id' => $postId, 'limit' => 100]);
-                if (is_array($pfRes) && !empty($pfRes['files'])) {
-                    foreach ($pfRes['files'] as $f) {
-                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                        $fCaption = (string) ($f['caption'] ?? '');
-                        if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', $searchedAka, $fCaption)) {
-                            $filesToStream[] = $f;
-                        }
+                foreach ((array) ($pfRes['files'] ?? []) as $f) {
+                    $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                    $fCaption = (string) ($f['caption'] ?? '');
+                    if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCaption)) {
+                        $filesToStream[] = $f;
                     }
                 }
             }
-            if ($akaFuture !== null && !empty($filesToStream) && method_exists($akaFuture, 'ignore')) {
-                // The probe above answered: nobody will await this future, and an un-awaited Amp
-                // future reports itself as an unhandled error when it is destroyed.
-                $akaFuture->ignore();
-                $akaFuture = null;
-            }
 
-            // Nothing found: THIS is where the identity lookup and the AKA derivation belong
-            // (see the lazy-load note above). Filling the title here is what keeps the pseudo
-            // ids working without taxing every other post.
-            if ((!isset($moviePostFastPathDone) || !$moviePostFastPathDone) && empty($filesToStream) && $postTitle === '') {
-                $identityFill = $postIdentityLoad();
-                $postTitle = (string) ($identityFill['title'] ?? '');
-                if ($postYear === '') {
-                    $postYear = (string) ($identityFill['year'] ?? '');
-                }
-                $searchedTitle = $postTitle;
-                $searchedYear = $postYear;
-            }
-
-            if (!$moviePostFastPathDone && empty($filesToStream) && !empty($postTitle)) {
+            if (empty($filesToStream) && !empty($postTitle)) {
                 $seenCodes = [];
                 // Year from the title when it is written there, otherwise KEEP the year we
-                // already resolved (the row's). This used to be an unconditional
-                // `$postYear = null`, which silently disabled fd_movie_file_matches_title()'s
-                // year guard for every title without a year in its name.
-                $postYearFromTitle = null;
+                // already resolved (the row's, or the title's). This used to be an
+                // unconditional `$postYear = null`, which silently disabled
+                // fd_movie_file_matches_title()'s year guard for every title without a year in
+                // its name.
                 if (preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $ym)) {
-                    $postYearFromTitle = $ym[1];
+                    $postYear = $ym[1];
                 }
-                if ($postYearFromTitle !== null) {
-                    $postYear = $postYearFromTitle;
-                } elseif ($postYear === '') {
-                    $postYear = null;
-                }
-                $searchVariants = fd_build_search_query_variants($postTitle, $postYear ?? '');
+                $searchVariants = fd_build_search_query_variants($postTitle, $postYear);
                 // Files are very often named in the film's ORIGINAL-language title, which no
                 // upstream source carries verbatim (row title "Superstition" → derived aka
                 // "Khurafat.Perjanjian.Syaitan" → files "Khurafat.Perjanjian.Syaitan.2011…").
                 // Search both names; the row's aka is free, the derivation only costs when the
                 // row has none.
-                if ($searchedAka === '') {
-                    $identityAka = $postIdentityLoad();
-                    if (!empty($identityAka['aka'])) {
-                        $searchedAka = (string) $identityAka['aka'];
-                    }
-                    if ($searchedAka === '' && !empty($identityAka['imdb_id'])) {
-                        if ($akaFuture !== null) {
-                            // `$akaFuture->await()` — the INSTANCE method, for ONE future.
-                            // `\Amp\Future\await()` is the iterable helper (`await(iterable): array`)
-                            // and calling it with a bare Future raises a TypeError, which an
-                            // ordinary `catch (\Throwable)` silently turns into an empty title:
-                            // the streams then render as "No Streams Found". That mistake was made
-                            // here once already — the AKA is derived, then thrown away.
-                            try {
-                                $searchedAka = (string) $akaFuture->await();
-                            } catch (\Throwable $e) {
-                                fd_log('aka future await failed', ['error' => $e->getMessage()]);
-                                $searchedAka = '';
-                            }
-                            $akaFuture = null;
-                        } else {
-                            $searchedAka = fd_aka_from_upstream((string) $identityAka['imdb_id'], 'movie', $postTitle, (string) ($postYear ?? ''));
-                        }
-                    }
+                if ($searchedAka === '' && !empty($postIdentity['imdb_id'])) {
+                    // Synchronous and lazy, exactly like the Android app: this only runs when the
+                    // fast path AND the post_files probe both matched nothing, and with the aka
+                    // persisted into media_ids_idx on first resolution it usually is not reached
+                    // at all.
+                    $searchedAka = fd_aka_from_upstream((string) $postIdentity['imdb_id'], 'movie', $postTitle, $postYear);
                 }
                 if ($searchedAka !== '' && strcasecmp($searchedAka, $postTitle) !== 0) {
-                    foreach (fd_build_search_query_variants($searchedAka, $postYear ?? '') as $akaQuery) {
+                    foreach (fd_build_search_query_variants($searchedAka, $postYear) as $akaQuery) {
                         if (!in_array($akaQuery, $searchVariants, true)) {
                             $searchVariants[] = $akaQuery;
                         }
@@ -15520,17 +15491,13 @@ if ($isNuvioRoute) {
                 // [query => files], so the ordering below (best variant first) is preserved.
                 $variantFiles = fd_search_files_parallel($searchVariants);
                 foreach ($searchVariants as $sv) {
-                    $sf = ['files' => (array) ($variantFiles[$sv] ?? [])];
-                    if (is_array($sf) && !empty($sf['files'])) {
-                        foreach ($sf['files'] as $f) {
-                            if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
-                            $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
-                            $fCap = (string) ($f['caption'] ?? '');
-
-                            if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear ?? '', $searchedAka, $fCap)) {
-                                $seenCodes[$f['short_code']] = true;
-                                $filesToStream[] = $f;
-                            }
+                    foreach ((array) ($variantFiles[$sv] ?? []) as $f) {
+                        if (empty($f['short_code']) || isset($seenCodes[$f['short_code']])) continue;
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCap = (string) ($f['caption'] ?? '');
+                        if (fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCap)) {
+                            $seenCodes[$f['short_code']] = true;
+                            $filesToStream[] = $f;
                         }
                     }
                 }

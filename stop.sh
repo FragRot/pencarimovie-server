@@ -59,4 +59,23 @@ echo "$PIDS" | tr ' ' '\n' | while read -r PID; do
   kill "$PID" 2>/dev/null || true
 done
 
+# The MadelineProto IPC worker is a DETACHED `php entry.php madeline-ipc <sessionDir>`
+# process. Killing only the port listener left it holding the session lock and the `ipc`
+# endpoint, so the next start's worker could never boot: the log filled with
+#   Serialization: Still waiting for exclusive session lock...
+#   APIWrapper:   Saved session!
+#   Could not connect to MadelineProto ... in API.php:324   (from entry.php)
+# and the browser saw "The operation was cancelled". A restart did NOT clear it, which is
+# what made it look like "downloads are broken".
+if command -v pkill >/dev/null 2>&1; then
+  if pkill -f "madeline-ipc" 2>/dev/null; then
+    echo "Killing MadelineProto IPC worker(s)"
+  fi
+fi
+# Drop the endpoints so a stale socket can never be reused.
+if [ -d "$ROOT_DIR/storage/sessions" ]; then
+  find "$ROOT_DIR/storage/sessions" -maxdepth 2 -type f \
+    \( -name ipc -o -name callback.ipc -o -name ipcState.php \) -delete 2>/dev/null || true
+fi
+
 echo "Stop command completed."
