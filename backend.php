@@ -281,6 +281,7 @@ function fd_prune_cache_files(bool $force = false): void
         'post_identity_' => 604800, // 7d  (media_ids_idx post:<id> row)
         'file_title_'    => 604800, // 7d  (short_code -> file name, for subtitles)
         'tt_title_'      => 604800, // 7d  (title -> imdb, for subtitles)
+        'episode_names_' => 604800, // 7d (negative lookups expire at read-time after 1h)
     ];
 
     // 1. Move or purge legacy cache files scattered in storage/ root
@@ -8020,6 +8021,302 @@ function fd_is_series_file(string $title, string $caption = ''): bool
 }
 
 /**
+ * Normalize a trusted episode title (not a file name). Stremio metadata often
+ * prefixes it with an episode number; do not treat that prefix as part of the title.
+ */
+function fd_normalize_episode_name(string $name): string
+{
+    $name = strtolower(trim((string) preg_replace('/[^\p{L}\p{N}]+/u', ' ', fd_clean_html_entities($name))));
+    $name = (string) preg_replace('/^(?:(?:season\s*\d+\s*)?episode\s*\d+|s\d{1,2}\s*e\d{1,4}|ep\s*\d+|\d{1,3})\s+/i', '', $name);
+    return trim((string) preg_replace('/\s+/', ' ', $name));
+}
+
+/**
+ * Parse the descriptive portion AFTER an explicit episode marker and BEFORE
+ * technical release tags. An empty result means there is no episode subtitle to
+ * verify. Unknown markers are not treated as names unless real metadata exists.
+ */
+function fd_filename_episode_subtitle(string $fileTitle, string $seriesTitle = ''): string
+{
+    $text = strtolower((string) preg_replace('/[^\p{L}\p{N}]+/u', ' ', fd_clean_media_title($fileTitle)));
+    $text = trim((string) preg_replace('/\s+/', ' ', $text));
+    $titleNorm = fd_normalize_episode_name($seriesTitle);
+    $titleNorm = trim((string) preg_replace('/\s+(?:19|20)\d{2}$/', '', $titleNorm));
+
+    if (preg_match('/(?:^|\s)(?:s\d{1,2}\s*e(?:p|ps|pisode)?\s*\d{1,4}|\d{1,2}\s*x\s*\d{1,4}|e(?:p|ps|pisode)?\s*\d{1,4})(?=\s|$)/i', $text, $match, PREG_OFFSET_CAPTURE)) {
+        // Some Asian releases put the SHOW title after E01 (CDL.E01.Show.Name).
+        // Only interpret the tail as an episode subtitle when the show title is
+        // already present before the episode marker.
+        if ($titleNorm !== '') {
+            $prefix = trim(substr($text, 0, $match[0][1]));
+            if (!str_contains(' ' . $prefix . ' ', ' ' . $titleNorm . ' ')) {
+                return '';
+            }
+        }
+        $afterMarker = $match[0][1] + strlen($match[0][0]);
+    } else {
+        // Bare numeric episodes are valid: Show.01.Pilot.mkv or
+        // Show.2023.01.Pilot.mkv. Do NOT interpret arbitrary numbers as an episode
+        // marker: require an exact known SHOW title directly before the number,
+        // with only an optional four-digit release year between them. This
+        // prevents years, resolutions, and unrelated numeric title fragments from
+        // being mistaken for episode titles.
+        if ($titleNorm === '' || !preg_match(
+            '/(?:^|\s)' . preg_quote($titleNorm, '/') . '\s+(?:(?:19|20)\d{2}\s+)?0*[1-9]\d{0,2}(?=\s|$)/u',
+            $text,
+            $match,
+            PREG_OFFSET_CAPTURE
+        )) {
+            return '';
+        }
+        $afterMarker = $match[0][1] + strlen($match[0][0]);
+    }
+
+    $tail = trim(substr($text, $afterMarker));
+    // Combined episode pack: do not mistake E02/E03 or a year for a subtitle.
+    $tail = (string) preg_replace('/^(?:(?:e(?:p|ps|pisode)?\s*\d{1,4})|(?:19|20)\d{2})\s+/i', '', $tail);
+    $tail = (string) preg_split('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hdtv|web|webrip|bluray|bdrip|brrip|remux|dvdrip|h264|h265|hevc|x264|x265|xvid|avc|aac|dts|flac|ddp|atmos|hdr|dv|nf|amzn|dsnp|multi|dual|audio|dub|dubbed|sub|subs|subbed|engsub|indosub|malaysub|hindi|eng|english|indo|indonesian|malay|korean|japanese|spanish|french|arabic|thai|batch|complete|mkv|mp4|avi|mov|ts|flv)\b/i', $tail, 2)[0];
+    $tail = trim((string) preg_replace('/\s+/', ' ', $tail));
+    return fd_normalize_episode_name($tail);
+}
+
+/**
+ * A verified upstream series record is allowed to supply episode titles.
+ * Unknown/mismatched metadata is NOT evidence that a stream is wrong: callers
+ * fall back to the existing series title, year and episode checks instead.
+ */
+function fd_episode_meta_identity_matches(array $meta, string $mediaId, string $expectedTitle = '', string $expectedYear = ''): bool
+{
+    $actualId = trim((string) ($meta['id'] ?? ''));
+    if ($actualId === '' || strcasecmp($actualId, $mediaId) !== 0) {
+        return false;
+    }
+    if (strtolower(trim((string) ($meta['type'] ?? ''))) !== 'series') {
+        return false;
+    }
+    if ($expectedTitle !== '') {
+        $actualTitle = fd_norm_title_for_match((string) ($meta['name'] ?? ''));
+        $wantedTitle = fd_norm_title_for_match($expectedTitle);
+        if ($actualTitle === '' || $wantedTitle === '' || $actualTitle !== $wantedTitle) {
+            return false;
+        }
+    }
+    // Missing upstream year is inconclusive; a known wrong year invalidates the
+    // metadata. The catalog title may itself contain years, so use releaseInfo.
+    if ($expectedYear !== '' && preg_match('/^(?:19|20)\d{2}$/', $expectedYear)) {
+        $release = trim((string) ($meta['releaseInfo'] ?? ''));
+        if ($release === '') $release = trim((string) ($meta['year'] ?? ''));
+        if (preg_match('/\b(19\d{2}|20\d{2})\b/', $release, $ym)
+            && abs((int) $ym[1] - (int) $expectedYear) > 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** @return string[] Verified episode names from ONE series metadata record. */
+function fd_extract_episode_names(array $meta, int $season, int $episode): array
+{
+    $names = [];
+    foreach ((array) ($meta['videos'] ?? []) as $video) {
+        if (!is_array($video)) continue;
+        $hasSeason = isset($video['season']);
+        $hasEpisode = isset($video['episode']) || isset($video['number']);
+        $vSeason = (int) ($video['season'] ?? 0);
+        $vEpisode = (int) ($video['episode'] ?? ($video['number'] ?? 0));
+        $episodeIdMatches = (bool) preg_match('/:' . $season . ':' . $episode . '$/', (string) ($video['id'] ?? ''));
+        // Never let an ID suffix override contradictory explicit numbering.
+        if (($hasSeason && $vSeason !== $season) || ($hasEpisode && $vEpisode !== $episode)) {
+            continue;
+        }
+        if (!($hasSeason && $hasEpisode) && !$episodeIdMatches) {
+            continue;
+        }
+        // Use BOTH fields when available, so aliases supplied as a distinct
+        // title are not unnecessarily rejected. Do not interpret arbitrary
+        // unrelated metadata fields as episode-title aliases.
+        foreach (['name', 'title'] as $field) {
+            $name = fd_normalize_episode_name((string) ($video[$field] ?? ''));
+            if ($name !== '' && !preg_match('/^(?:episode|ep|season|s)\s*\d*$/i', $name)) {
+                $names[$name] = true;
+            }
+        }
+    }
+    return array_keys($names);
+}
+
+/**
+ * Fetch public Stremio episode metadata WITHOUT the WordPress API secret.
+ * Unlike fd_http_json()/fd_http_get_contents(), this path honors a short
+ * timeout and does not retry slow upstream metadata requests.
+ */
+function fd_public_episode_meta_json(string $url, int $timeoutSeconds = 2): array
+{
+    if (!preg_match('#^https?://#i', $url)) return [];
+    $timeoutSeconds = max(1, min(3, $timeoutSeconds));
+    $raw = false;
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        if ($ch === false) return [];
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT_MS => $timeoutSeconds * 1000,
+            CURLOPT_CONNECTTIMEOUT_MS => min(1000, $timeoutSeconds * 1000),
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_HTTPHEADER => ['Accept: application/json'],
+            CURLOPT_ENCODING => '',
+        ]);
+        $raw = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($status !== 200) return [];
+    } elseif ((bool) ini_get('allow_url_fopen')) {
+        $context = stream_context_create(['http' => [
+            'method' => 'GET', 'timeout' => $timeoutSeconds,
+            'follow_location' => 0, 'max_redirects' => 0,
+            'header' => "Accept: application/json\r\n",
+        ]]);
+        $raw = @file_get_contents($url, false, $context);
+    }
+    $data = is_string($raw) ? json_decode($raw, true) : null;
+    return is_array($data) ? $data : [];
+}
+
+/**
+ * Resolve episode names from verified Stremio metadata with a bounded network
+ * budget. Providers are ordered by configuration priority; use the first valid
+ * episode record, NEVER union potentially contradictory providers' names.
+ * Positive cache: 7d. Verified no-episode cache: 1h. Transport/invalid: 5m.
+ * Cache keys include identity and upstream configuration to avoid cross-title
+ * contamination and invalidate legacy v2 entries automatically.
+ *
+ * @return string[] Validated, normalized episode names, or [] (fail open).
+ */
+function fd_upstream_episode_names(
+    string $mediaId,
+    int $season,
+    int $episode,
+    string $expectedTitle = '',
+    string $expectedYear = ''
+): array {
+    $mediaId = (string) preg_replace('/:\d+:\d+$/', '', trim($mediaId));
+    if ($mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)
+        || $season < 0 || $episode < 1) {
+        return [];
+    }
+
+    $urls = [];
+    foreach (array_slice(fd_get_upstream_resolver_manifests(), 0, 3) as $i => $upstream) {
+        $manifest = trim((string) ($upstream['url'] ?? ''));
+        if ($manifest === '' || !preg_match('#^https?://#i', $manifest)) continue;
+        $base = (string) preg_replace('#/manifest\.json(?:\?.*)?$#i', '', $manifest);
+        $urls['up_' . $i] = rtrim($base, '/') . '/meta/series/' . rawurlencode($mediaId) . '.json';
+    }
+    if ($urls === []) return [];
+
+    $cacheKey = hash('sha256', json_encode([
+        'v3', strtolower($mediaId), $season, $episode,
+        fd_norm_title_for_match($expectedTitle), trim($expectedYear), array_values($urls),
+    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    $cacheFile = fd_cache_path('episode_names_' . $cacheKey . '.json');
+    if (is_file($cacheFile)) {
+        $cached = json_decode((string) @file_get_contents($cacheFile), true);
+        if (is_array($cached) && isset($cached['names']) && is_array($cached['names'])) {
+            $ttl = (int) ($cached['ttl'] ?? ($cached['names'] !== [] ? 604800 : 3600));
+            if ($ttl > 0 && (time() - (int) @filemtime($cacheFile)) < min($ttl, 604800)) {
+                return array_values(array_filter($cached['names'], 'is_string'));
+            }
+        }
+    }
+
+    // The Amp helper bounds each concurrent request to 2s. Without Amp,
+    // query only the preferred provider, not three sequential timeouts.
+    $responses = [];
+    $usedAmp = false;
+    if (function_exists('fd_http_get_many_amp')) {
+        $multi = fd_http_get_many_amp($urls, ['timeout' => 2]);
+        if (!empty($multi['ok'])) {
+            $usedAmp = true;
+            foreach ($urls as $key => $_url) {
+                $row = $multi['results'][$key] ?? null;
+                if (!is_array($row) || (int) ($row['http'] ?? 0) !== 200) continue;
+                $data = json_decode((string) ($row['body'] ?? ''), true);
+                if (is_array($data)) $responses[$key] = $data;
+            }
+        }
+    }
+    if (!$usedAmp) {
+        $firstKey = array_key_first($urls);
+        $data = fd_public_episode_meta_json($urls[$firstKey], 2);
+        if ($data !== []) $responses[$firstKey] = $data;
+    }
+
+    $verified = false;
+    $names = [];
+    $source = '';
+    foreach ($urls as $key => $_url) {
+        $meta = $responses[$key]['meta'] ?? null;
+        if (!is_array($meta) || !fd_episode_meta_identity_matches($meta, $mediaId, $expectedTitle, $expectedYear)) {
+            continue;
+        }
+        $verified = true;
+        $candidate = fd_extract_episode_names($meta, $season, $episode);
+        if ($candidate !== []) {
+            $names = $candidate;
+            $source = $key;
+            break;
+        }
+    }
+
+    $ttl = $names !== [] ? 604800 : ($verified ? 3600 : 300);
+    @file_put_contents($cacheFile, json_encode([
+        'names' => $names, 'ttl' => $ttl,
+    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
+    fd_log('episode metadata lookup', [
+        'media_id' => $mediaId, 'season' => $season, 'episode' => $episode,
+        'verified' => $verified, 'source' => $source, 'name_count' => count($names),
+    ]);
+    return $names;
+}
+
+/**
+ * Release group labels are not episode titles. Unknown additional tags should
+ * be treated as inconclusive instead of hiding otherwise plausible streams.
+ */
+function fd_is_release_annotation(string $subtitle): bool
+{
+    return (bool) preg_match(
+        '/^(?:proper|repack|rerip|extended|uncut|uncensored|remastered|restored|internal|limited|multi|dual|dubbed|subbed|complete|batch)(?:\s|$)/i',
+        $subtitle
+    );
+}
+
+/**
+ * Compare an identifiable filename subtitle against verified episode names.
+ * Unknown filename structure, missing metadata, and release annotations are
+ * inconclusive (fail open). A definite descriptive mismatch is rejected.
+ */
+function fd_episode_subtitle_matches(string $fileTitle, string $seriesTitle, array $episodeNames): bool
+{
+    if ($episodeNames === []) return true;
+    $subtitle = fd_filename_episode_subtitle($fileTitle, $seriesTitle);
+    if ($subtitle === '' || fd_is_release_annotation($subtitle)) return true;
+
+    foreach ($episodeNames as $expected) {
+        $expected = fd_normalize_episode_name((string) $expected);
+        if ($expected !== '' && ($subtitle === $expected || str_starts_with($subtitle, $expected . ' '))) {
+            return true;
+        }
+    }
+    fd_log('episode subtitle mismatch', [
+        'series' => $seriesTitle,
+        'subtitle' => substr($subtitle, 0, 120),
+        'expected' => array_slice($episodeNames, 0, 5),
+    ]);
+    return false;
+}
+
+/**
  * Strict Movie Title & Year Matcher:
  * Ensures only files matching the actual movie title and year are accepted,
  * preventing cross-matching unrelated movies (e.g. "Just You & Me with Charlie Laine"
@@ -8027,6 +8324,9 @@ function fd_is_series_file(string $title, string $caption = ''): bool
  */
 function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, string $searchedYear = '', string $searchedAka = '', string $fileCaption = ''): bool
 {
+    // Movie routes already enforce feature-film identity through strict title,
+    // year, and episodic-file rejection. Never apply episode-name checks to
+    // movies: their subtitles/sequel qualifiers belong to the movie title.
     if (fd_is_series_file($fileTitle, $fileCaption)) {
         return false;
     }
@@ -8038,7 +8338,13 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
 
     // 1. Strict Year check if year is known
     $searchedYear = trim($searchedYear);
-    $hasFileYear = (bool) preg_match_all('/\b(19\d\d|20\d\d)\b/', $fileTitle, $fymAll);
+    // If filename has no year, the first caption line can disambiguate remakes.
+    $movieYearSource = $fileTitle;
+    if ($fileCaption !== '' && !preg_match('/\b(19\d\d|20\d\d)\b/', $fileTitle)) {
+        $captionFirstLine = trim((string) strtok($fileCaption, "\r\n"));
+        if ($captionFirstLine !== '') $movieYearSource .= ' ' . $captionFirstLine;
+    }
+    $hasFileYear = (bool) preg_match_all('/\b(19\d\d|20\d\d)\b/', $movieYearSource, $fymAll);
     if ($searchedYear !== '' && $hasFileYear) {
         $targetYear = (int) $searchedYear;
         $matchedAnyYear = false;
@@ -8313,7 +8619,7 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
  * the post-episode title portion ($afterEp), or Asian drama files will be truncated to
  * just their release group prefix (e.g. "cdl") and discarded.
  */
-function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = ''): bool
+function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, int $season, int $episode, string $seriesYear = '', string $fileCaption = '', array $episodeNames = []): bool
 {
     // 1. Must match target season and episode
     $parsed = fd_classify_season_episode($fileTitle, $season, $episode, $fileCaption);
@@ -8469,6 +8775,13 @@ function fd_series_file_matches_title(string $fileTitle, string $seriesTitle, in
         if (preg_match('/\btv\s*sp\b|live[ ._-]?action/', $fileRegion) && !preg_match('/live[ ._-]?action/', $entryNorm)) {
             return false;
         }
+    }
+
+    // 5d. Generic episode-name guard (TV series, live action, anime, etc.).
+    // Never treat a subtitle after SxxExx as proof that it belongs to this show.
+    // Compare it against the selected episode's trusted metadata when known.
+    if (!fd_episode_subtitle_matches($fileTitle, $targetLower, $episodeNames)) {
+        return false;
     }
 
     // 6. Compare extracted title candidates with target series title
@@ -9098,6 +9411,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             $post = [
                 'title' => (string) ($localMeta['title'] ?? ''),
                 'year'  => (string) ($localMeta['year'] ?? ''),
+                'imdb_id' => (string) ($localMeta['imdb_id'] ?? ''),
             ];
             if (!empty($post['title'])) {
                 $postMemoryCache[$postId] = $post;
@@ -9123,10 +9437,29 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
         $postYear = (string) $post['year'];
     }
 
+    // Resolve official episode-name metadata once for ALL stream retrieval paths.
+    // For post IDs, only use identity already cached locally; do not add an extra
+    // synchronous WordPress lookup to the episode hot path.
+    $episodeMediaId = trim((string) ($post['imdb_id'] ?? ($preloadedPost['imdb_id'] ?? '')));
+    if ($episodeMediaId === '' && $postId > 0) {
+        $identityFile = fd_cache_path('post_identity_' . $postId . '.json');
+        if (is_file($identityFile)) {
+            $identity = json_decode((string) @file_get_contents($identityFile), true);
+            $episodeMediaId = trim((string) ($identity['imdb_id'] ?? ''));
+        }
+    }
+    if ($episodeMediaId === '') {
+        $episodeMediaId = (string) ($preloadedPost['id'] ?? '');
+    }
+    $episodeNames = (array) ($preloadedPost['episode_names'] ?? []);
+    if ($episodeNames === [] && $episodeMediaId !== '') {
+        $episodeNames = fd_upstream_episode_names($episodeMediaId, $season, $episode, $fullTitle, (string) ($postYear ?? ''));
+    }
+
     $filter = fd_episode_stream_filter($season, $episode);
     $all = [];
     $seen = [];
-    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode): void {
+    $add = static function (array $files) use (&$all, &$seen, $filter, $maxFiles, &$postYear, &$keyword, &$fullTitle, $season, $episode, $episodeNames): void {
         foreach ($files as $file) {
             if (count($all) >= $maxFiles) {
                 return;
@@ -9145,7 +9478,7 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
             // Ensure the file title accurately matches the target series name, season, and episode.
             $fCaption = (string) ($file['caption'] ?? '');
             $seriesTitleToMatch = $fullTitle !== '' ? $fullTitle : (string) $keyword;
-            if (!fd_series_file_matches_title($fTitle, $seriesTitleToMatch, $season, $episode, (string) ($postYear ?? ''), $fCaption)) {
+            if (!fd_series_file_matches_title($fTitle, $seriesTitleToMatch, $season, $episode, (string) ($postYear ?? ''), $fCaption, $episodeNames)) {
                 continue;
             }
 
@@ -14624,6 +14957,44 @@ if ($isNuvioRoute) {
             @file_put_contents($catCacheFile, json_encode(['metas' => $metas], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), LOCK_EX);
         }
 
+        // Warm the FILE SET of what is on screen, off the critical path — the same second pass the
+        // Android app makes (NativeHttpServer.prefetchMetaFor -> prefetchPostFiles). This route
+        // only ever wrote `cat_cache_` and `meta_cache_`, so a Play straight from a catalog row
+        // (without opening the info page) still paid a cold origin fetch for the post's files.
+        //
+        // `fd_prewarm_stream_list()` is the right primitive: it fires a loopback request to the
+        // REAL `/stream/...` route, so whatever it caches is by construction the key Play asks for
+        // (`/stream/*` response cache + the inner cache-first `post_files` read that Fast Path 2a
+        // now does). Movies only — a series root does not determine the episode, and guessing S01E01
+        // was measured harmful (see fd_prewarm_stream_list).
+        //
+        // It is bounded by that function's own throttles: one warm per item per 300 s, and ONE PER
+        // SECOND globally. The global cap means this loop fires a single warm per catalog response
+        // and breaks — deliberate, since 24 loopback requests at once would occupy 24 workers on a
+        // pool the docs warn is small; over a client boot (~33 catalog requests) the cap still
+        // covers the first rows of each. A per-item refusal is retried on a later request because
+        // the per-item mark is only touched once both checks pass.
+        //
+        // Fire-and-forget: it opens a loopback connection, closes it, and returns, so nothing here
+        // waits on the warm.
+        $prewarmBudget = 24;
+        foreach ($metas as $prewarmMeta) {
+            if ($prewarmBudget-- <= 0) {
+                break;
+            }
+            if (($prewarmMeta['type'] ?? '') !== 'movie') {
+                continue;
+            }
+            $prewarmId = (string) ($prewarmMeta['id'] ?? '');
+            if ($prewarmId === '' || (!str_starts_with($prewarmId, 'pm:post:') && !str_starts_with($prewarmId, 'pm_post_'))) {
+                continue;
+            }
+            // Stops as soon as the global throttle refuses, so the loop cost is ~1 iteration.
+            if (!fd_prewarm_stream_list('movie', $prewarmId)) {
+                break;
+            }
+        }
+
         fd_stremio_json(['metas' => $metas], 200, 'max-age=600, public');
     }
 
@@ -15401,10 +15772,95 @@ if ($isNuvioRoute) {
             if ($isSeries) {
                 $filesToStream = fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250);
             }
-            // Fast Path 2: Movie requested via post ID — ONE origin call, then match. Everything
-            // else is the lazy fallback below, and that only runs when this matched nothing.
+
+            // Fast Path 2a: Movie requested via post ID — THE POST'S OWN FILE SET FIRST.
+            //
+            // Same shape as the series path above (fd_fetch_episode_stream_files step 0) and as
+            // the Android app, which resolves the entry's title/year from its OWN meta cache
+            // (`getCachedMeta("…_pm:post:<id>")`) and then reads the post's files instead of
+            // paying an origin round-trip just to learn what the title is.
+            //
+            // Both inputs here are local and cheap:
+            //   * the title/year come from `meta_cache_<md5('post_<id>')>.json` (written when the
+            //     catalog listed the post and by the /meta route), falling back to the local
+            //     media_ids_idx row, which `fd_lookup_local_catalog_by_prefix()` serves from disk
+            //     with no network call at all;
+            //   * the file set comes from `fd_fetch_post_files_paged()`, i.e. the cache-first
+            //     `fd_fetch_stream_ajax()` layer, whose URL does not vary between requests.
+            //
+            // Measured on `pm:post:9000031194`, where `stream-files?id=post:…` answers `ok` with
+            // ZERO items and still costs 1.9-8 s: 6.5 s -> ~1.9 s cold, and the 300 s /stream
+            // response cache then makes it 0.003 s. A title is REQUIRED to take this path, so
+            // the strict `fd_movie_file_matches_title()` guard always runs — with no title the
+            // code below is exactly the previous behaviour.
+            $movieOwnFiles = [];
+            if (!$isSeries && empty($filesToStream)) {
+                $movieTitle = '';
+                $movieYear  = '';
+                $movieMetaFile = fd_cache_path('meta_cache_' . md5('post_' . $postId) . '.json');
+                if (is_file($movieMetaFile)) {
+                    $movieMetaCached = json_decode((string) @file_get_contents($movieMetaFile), true);
+                    $movieMetaRow = is_array($movieMetaCached) ? (array) ($movieMetaCached['meta'] ?? []) : [];
+                    $movieTitle = fd_clean_html_entities((string) ($movieMetaRow['name'] ?? ''));
+                    $movieYear  = (string) ($movieMetaRow['year'] ?? ($movieMetaRow['releaseInfo'] ?? ''));
+                    // The /meta route refuses to SERVE these placeholders, so they must not be
+                    // used as a match target either.
+                    if (in_array($movieTitle, ['PencariMovie Media', 'Untitled'], true)) {
+                        $movieTitle = '';
+                        $movieYear  = '';
+                    }
+                }
+                if ($movieTitle === '') {
+                    // Disk-only read of the media_ids_idx `post:<id>` / `pm:<id>` row.
+                    $movieRow = fd_lookup_local_catalog_by_prefix('post', (string) $postId);
+                    if (empty($movieRow['title'])) {
+                        $movieRow = fd_lookup_local_catalog_by_prefix('pm', (string) $postId);
+                    }
+                    $movieTitle = (string) ($movieRow['title'] ?? '');
+                    $movieYear  = (string) ($movieRow['year'] ?? '');
+                }
+                $movieYear = trim($movieYear);
+                if ($movieTitle !== '' && $movieYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $movieTitle, $movieYearInTitle)) {
+                    $movieYear = $movieYearInTitle[1];
+                }
+                if ($movieTitle !== '') {
+                    // Deliberately NOT written back into $postTitle/$postYear: the lazy fallback
+                    // below builds its SEARCH queries from that value, and a catalogue name like
+                    // "Siccîn 9 2026 • Movie" is not a search phrase — measured, it turned a
+                    // resolved 5-file title into 0. The fallback therefore keeps reading the
+                    // identity row's clean title itself, exactly as it always did.
+                    $movieOwnFiles = fd_fetch_post_files_paged($postId, [
+                        'page_size' => 200,
+                        'max_files' => 200,
+                        'max_pages' => 1,
+                    ]);
+                    foreach ($movieOwnFiles as $f) {
+                        $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                        $fCaption = (string) ($f['caption'] ?? '');
+                        if (fd_movie_file_matches_title($fTitle, $movieTitle, $movieYear, '', $fCaption)) {
+                            $filesToStream[] = $f;
+                        }
+                    }
+                    fd_log('movie files from cached post set', [
+                        'postId'    => $postId,
+                        'title'     => $movieTitle,
+                        'year'      => $movieYear,
+                        'postFiles' => count($movieOwnFiles),
+                        'matched'   => count($filesToStream),
+                    ]);
+                }
+            }
+
+            // Fast Path 2b: Movie requested via post ID — ONE origin call, then match.
+            //
+            // Runs only when 2a could not even READ the post's own files (no cached title, or the
+            // post has none attached). When 2a did read them and none matched, this call would
+            // fetch THE SAME post's file set from the origin again — measured on
+            // `pm:post:9000031194`: 7.1 s for an 83-byte `ok` body with zero items, on a title the
+            // identity/AKA fallback below resolves in 0.16 s. Titles like that pay the origin
+            // call for nothing, so it is skipped; everything else is unchanged.
             // Same shape as the Android app's pm:post branch (NativeHttpServer.kt).
-            else {
+            if (!$isSeries && empty($filesToStream) && empty($movieOwnFiles)) {
                 // 8 s, NOT 15 s. `fd_http_get_contents()` retries a cancelled Amp attempt once,
                 // 150 ms later, and the origin answers that retry quickly once its own Manticore
                 // query / FastCGI cache is warm — measured on a phone: the 15 s attempt was
@@ -15414,8 +15870,18 @@ if ($isNuvioRoute) {
                 // Cache-first (`fd_cached_wp_json`) — the heaviest origin call per movie, and it
                 // was uncached.
                 $res = fd_cached_wp_json(FD_WP_API_BASE . "/stream-files?id=" . urlencode("post:{$postId}") . "&type=movie&limit=150", 8);
-                $postTitle = (string) ($res['resolved_title'] ?? '');
-                $postYear = (string) ($res['resolved_year'] ?? '');
+                // Only OVERRIDE the locally cached title/year when the origin actually answers
+                // one. Assigning unconditionally threw away a perfectly good cached title and
+                // left the lazy fallback below matching against an empty string, which accepts
+                // every file of the post.
+                $resolvedTitle = (string) ($res['resolved_title'] ?? '');
+                $resolvedYear  = (string) ($res['resolved_year'] ?? '');
+                if ($resolvedTitle !== '') {
+                    $postTitle = $resolvedTitle;
+                }
+                if ($resolvedYear !== '') {
+                    $postYear = $resolvedYear;
+                }
                 // The year is written into the title for most of these posts ("Less of a
                 // Stranger 2026 • Movie"); asking the identity for it cost 3.48 s per list.
                 if ($postYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $postTitle, $yearInTitle)) {
@@ -15445,8 +15911,17 @@ if ($isNuvioRoute) {
                 }
                 // The post's OWN files. A real post id has them; a pseudo id has none and falls
                 // through to the title search below.
-                $pfRes = fd_fetch_stream_ajax('post_files', ['post_id' => $postId, 'limit' => 100]);
-                foreach ((array) ($pfRes['files'] ?? []) as $f) {
+                //
+                // Same parameters as Fast Path 2a on purpose: `fd_fetch_stream_ajax()` keys its
+                // disk cache on the FULL url, so a different `limit` here would fetch the same
+                // page from the origin a SECOND time in the same request — and hand back fewer
+                // files than 2a already saw.
+                $pfRes = fd_fetch_post_files_paged($postId, [
+                    'page_size' => 200,
+                    'max_files' => 200,
+                    'max_pages' => 1,
+                ]);
+                foreach ($pfRes as $f) {
                     $fTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
                     $fCaption = (string) ($f['caption'] ?? '');
                     if ($postTitle === '' || fd_movie_file_matches_title($fTitle, $postTitle, $postYear, $searchedAka, $fCaption)) {
@@ -15534,6 +16009,13 @@ if ($isNuvioRoute) {
             if ($searchQuery !== '') {
                 if ($targetSeason !== null && $targetEpisode !== null) {
                     $imdbEpisodeFilter = fd_episode_stream_filter($targetSeason, $targetEpisode);
+                    $episodeNames = fd_upstream_episode_names(
+                        $imdbId !== '' ? $imdbId : $itemId,
+                        (int) $targetSeason,
+                        (int) $targetEpisode,
+                        $searchedTitle,
+                        $searchedYear
+                    );
 
                     // 1. Fast Path: Resolve series episode files directly from Manticore in 1 round trip
                     if ($searchedTitle !== '' || $itemId !== '') {
@@ -15541,6 +16023,8 @@ if ($isNuvioRoute) {
                             'title' => $searchedTitle,
                             'year' => $searchedYear,
                             'id' => $itemId,
+                            'imdb_id' => $imdbId,
+                            'episode_names' => $episodeNames,
                         ]);
                     }
 
@@ -15604,7 +16088,7 @@ if ($isNuvioRoute) {
                         }
 
                         if ($matchedPostId !== null) {
-                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 250, $matchedPostData);
+                            $filesToStream = fd_fetch_episode_stream_files($matchedPostId, $targetSeason, $targetEpisode, 250, array_merge((array) $matchedPostData, ['episode_names' => $episodeNames, 'imdb_id' => $imdbId]));
                         }
 
                         // Fallback: If no post matched or post returned 0 files, probe search_files directly
@@ -15613,7 +16097,24 @@ if ($isNuvioRoute) {
                             $sf = fd_fetch_stream_ajax('search_files', ['search' => $epQuery, 'limit' => 30]);
                             if (is_array($sf) && !empty($sf['files'])) {
                                 foreach ($sf['files'] as $f) {
-                                    if ($imdbEpisodeFilter($f)) {
+                                    if (!$imdbEpisodeFilter($f)) {
+                                        continue;
+                                    }
+                                    $fallbackTitle = fd_clean_html_entities((string) ($f['title'] ?? ''));
+                                    $fallbackCaption = (string) ($f['caption'] ?? '');
+                                    if ($fallbackCaption !== '' && preg_match('/^(?:video(?:\.\d+)*|\d+|document|file)\.(?:mp4|mkv|avi|mov|ts|flv)$/i', trim($fallbackTitle))) {
+                                        $captionTitle = trim((string) strtok($fallbackCaption, "\r\n"));
+                                        if ($captionTitle !== '') $fallbackTitle = $captionTitle;
+                                    }
+                                    if (fd_series_file_matches_title(
+                                        $fallbackTitle,
+                                        $searchedTitle,
+                                        (int) $targetSeason,
+                                        (int) $targetEpisode,
+                                        $searchedYear,
+                                        $fallbackCaption,
+                                        $episodeNames
+                                    )) {
                                         $filesToStream[] = $f;
                                     }
                                 }
@@ -16565,21 +17066,21 @@ if ($isNuvioRoute) {
                 $fallbackUrl = 'https://pencarimovie.com/search/' . rawurlencode($searchKeyword)
                     . '?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'));
             }
-            $streams[] = [
-                'name' => $noStreamTitle,
-                'description' => $noStreamDesc,
-                'externalUrl' => $fallbackUrl,
-            ];
+            // $streams[] = [
+                // 'name' => $noStreamTitle,
+                // 'description' => $noStreamDesc,
+                // 'externalUrl' => $fallbackUrl,
+            // ];
         }
 
         // ALWAYS add the sponsored message on top if configured (regardless of whether streams were found or empty)
-        if ($adUrl !== '') {
-            array_unshift($streams, [
-                'name' => $adName !== '' ? $adName : 'PencariMovie',
-                'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
-                'externalUrl' => $adUrl,
-            ]);
-        }
+        // if ($adUrl !== '') {
+            // array_unshift($streams, [
+                // 'name' => $adName !== '' ? $adName : 'PencariMovie',
+                // 'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
+                // 'externalUrl' => $adUrl,
+            // ]);
+        // }
 
         // Save to stream cache. Real playable streams cached with 300s TTL; empty streams short-cached for 60s
         if (!empty($streamCacheFile)) {
