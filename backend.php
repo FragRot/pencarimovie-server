@@ -4842,17 +4842,221 @@ function fd_fold_latin_accents(string $s): string
     if ($s === '' || !preg_match('/[^\x20-\x7E]/', $s)) {
         return $s;
     }
-    // Bail out for scripts iconv cannot transliterate to Latin.
+    // Do NOT use iconv('ASCII//TRANSLIT') here. On this runtime it renders a diacritic
+    // as a PREFIX marker instead of dropping it — "Siccîn" becomes "Sicc^in" and "•"
+    // becomes "o" — so the comparison still failed. An explicit table is exact.
+    static $map = [
+        'à' => 'a',
+        'á' => 'a',
+        'â' => 'a',
+        'ã' => 'a',
+        'ä' => 'a',
+        'å' => 'a',
+        'ā' => 'a',
+        'ă' => 'a',
+        'ą' => 'a',
+        'À' => 'A',
+        'Á' => 'A',
+        'Â' => 'A',
+        'Ã' => 'A',
+        'Ä' => 'A',
+        'Å' => 'A',
+        'Ā' => 'A',
+        'Ă' => 'A',
+        'Ą' => 'A',
+        'ç' => 'c',
+        'ć' => 'c',
+        'č' => 'c',
+        'ĉ' => 'c',
+        'ċ' => 'c',
+        'Ç' => 'C',
+        'Ć' => 'C',
+        'Č' => 'C',
+        'Ĉ' => 'C',
+        'Ċ' => 'C',
+        'ď' => 'd',
+        'đ' => 'd',
+        'Ď' => 'D',
+        'Đ' => 'D',
+        'è' => 'e',
+        'é' => 'e',
+        'ê' => 'e',
+        'ë' => 'e',
+        'ē' => 'e',
+        'ĕ' => 'e',
+        'ė' => 'e',
+        'ę' => 'e',
+        'ě' => 'e',
+        'È' => 'E',
+        'É' => 'E',
+        'Ê' => 'E',
+        'Ë' => 'E',
+        'Ē' => 'E',
+        'Ĕ' => 'E',
+        'Ė' => 'E',
+        'Ę' => 'E',
+        'Ě' => 'E',
+        'ğ' => 'g',
+        'ĝ' => 'g',
+        'ġ' => 'g',
+        'ģ' => 'g',
+        'Ğ' => 'G',
+        'Ĝ' => 'G',
+        'Ġ' => 'G',
+        'Ģ' => 'G',
+        'ĥ' => 'h',
+        'ħ' => 'h',
+        'Ĥ' => 'H',
+        'Ħ' => 'H',
+        'ì' => 'i',
+        'í' => 'i',
+        'î' => 'i',
+        'ï' => 'i',
+        'ĩ' => 'i',
+        'ī' => 'i',
+        'ĭ' => 'i',
+        'į' => 'i',
+        'ı' => 'i',
+        'Ì' => 'I',
+        'Í' => 'I',
+        'Î' => 'I',
+        'Ï' => 'I',
+        'Ĩ' => 'I',
+        'Ī' => 'I',
+        'Ĭ' => 'I',
+        'Į' => 'I',
+        'İ' => 'I',
+        'ĵ' => 'j',
+        'Ĵ' => 'J',
+        'ķ' => 'k',
+        'Ķ' => 'K',
+        'ĺ' => 'l',
+        'ļ' => 'l',
+        'ľ' => 'l',
+        'ł' => 'l',
+        'Ĺ' => 'L',
+        'Ļ' => 'L',
+        'Ľ' => 'L',
+        'Ł' => 'L',
+        'ñ' => 'n',
+        'ń' => 'n',
+        'ņ' => 'n',
+        'ň' => 'n',
+        'Ñ' => 'N',
+        'Ń' => 'N',
+        'Ņ' => 'N',
+        'Ň' => 'N',
+        'ò' => 'o',
+        'ó' => 'o',
+        'ô' => 'o',
+        'õ' => 'o',
+        'ö' => 'o',
+        'ø' => 'o',
+        'ō' => 'o',
+        'ŏ' => 'o',
+        'ő' => 'o',
+        'Ò' => 'O',
+        'Ó' => 'O',
+        'Ô' => 'O',
+        'Õ' => 'O',
+        'Ö' => 'O',
+        'Ø' => 'O',
+        'Ō' => 'O',
+        'Ŏ' => 'O',
+        'Ő' => 'O',
+        'ŕ' => 'r',
+        'ř' => 'r',
+        'Ŕ' => 'R',
+        'Ř' => 'R',
+        'ś' => 's',
+        'š' => 's',
+        'ş' => 's',
+        'ș' => 's',
+        'ŝ' => 's',
+        'Ś' => 'S',
+        'Š' => 'S',
+        'Ş' => 'S',
+        'Ș' => 'S',
+        'Ŝ' => 'S',
+        'ţ' => 't',
+        'ť' => 't',
+        'ț' => 't',
+        'Ţ' => 'T',
+        'Ť' => 'T',
+        'Ț' => 'T',
+        'ù' => 'u',
+        'ú' => 'u',
+        'û' => 'u',
+        'ü' => 'u',
+        'ũ' => 'u',
+        'ū' => 'u',
+        'ŭ' => 'u',
+        'ů' => 'u',
+        'ű' => 'u',
+        'ų' => 'u',
+        'Ù' => 'U',
+        'Ú' => 'U',
+        'Û' => 'U',
+        'Ü' => 'U',
+        'Ũ' => 'U',
+        'Ū' => 'U',
+        'Ŭ' => 'U',
+        'Ů' => 'U',
+        'Ű' => 'U',
+        'Ų' => 'U',
+        'ŵ' => 'w',
+        'Ŵ' => 'W',
+        'ý' => 'y',
+        'ÿ' => 'y',
+        'ŷ' => 'y',
+        'Ý' => 'Y',
+        'Ÿ' => 'Y',
+        'Ŷ' => 'Y',
+        'ź' => 'z',
+        'ż' => 'z',
+        'ž' => 'z',
+        'Ź' => 'Z',
+        'Ż' => 'Z',
+        'Ž' => 'Z',
+        'æ' => 'ae',
+        'Æ' => 'AE',
+        'œ' => 'oe',
+        'Œ' => 'OE',
+        'ß' => 'ss',
+        'þ' => 'th',
+        'Þ' => 'TH',
+        'ð' => 'd',
+        'Ð' => 'D',
+        // Typographic separators/letters that must not become words or word breaks.
+        "\u{2022}" => ' ',
+        "\u{00B7}" => ' ',
+        "\u{2013}" => '-',
+        "\u{2014}" => '-',
+        "\u{2018}" => "'",
+        "\u{2019}" => "'",
+        "\u{201C}" => "'",
+        "\u{201D}" => "'",
+        "\u{2026}" => ' ',
+    ];
+    $s = strtr($s, $map);
+    // Drop any remaining combining marks, then let iconv clean up anything left.
+    $s = (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $s);
+    if (!preg_match('/[^\x20-\x7E]/', $s)) {
+        return $s;
+    }
+    // Bail out for scripts that cannot be transliterated to Latin at all.
     if (preg_match('/[\x{0400}-\x{04FF}\x{0590}-\x{05FF}\x{0600}-\x{06FF}\x{0900}-\x{0DFF}\x{0E00}-\x{0EFF}\x{1100}-\x{11FF}\x{2E80}-\x{9FFF}\x{AC00}-\x{D7AF}\x{F900}-\x{FAFF}\x{FF00}-\x{FFEF}]/u', $s)) {
         return $s;
     }
     if (function_exists('iconv')) {
         $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $s);
         if (is_string($t) && $t !== '') {
-            return (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $t);
+            // iconv marks the diacritic it removed ("Sicc^in"): strip the marker char.
+            $t = (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $t);
+            return str_replace(['^', '~', '`', '¨'], '', $t);
         }
     }
-    return (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $s);
+    return $s;
 }
 
 /**
@@ -8467,6 +8671,14 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         $targetLower = strtolower(trim(preg_replace('/[^\p{L}\p{N}\s]/u', ' ', $searchedTitle)));
     }
     $targetNoThe = trim(preg_replace('/^the\s+/i', '', $targetLower));
+    // Accent-insensitive comparison forms. The catalogue keeps the diacritics while the
+    // FILES drop them: post 9000031194 is "Siccîn 9 2026 • Movie" and every file is
+    // `Siccin.9.2026…`, so the strict equality below rejected all 5 and the entry showed
+    // "No Streams Found". These are ADDITIONAL accept paths only, built from the already
+    // cleaned/normalised forms — never by folding the RAW input, because iconv turns the
+    // catalogue's "•" into "*", the bullet-stripping regex stops matching, and a
+    // 100-stream title collapses to 0 (measured on The Super Mario Galaxy Movie).
+    $targetFoldLower = trim(preg_replace('/\s+/', ' ', fd_fold_latin_accents($targetLower)));
 
     // Prepare AKA target if provided
     $akaLower = '';
@@ -8565,6 +8777,8 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         return false;
     }
 
+    $baseFold = trim(preg_replace('/\s+/', ' ', fd_fold_latin_accents($baseF)));
+
     // 7. Direct comparison between base filename title and target (strict: "The Runner" != "Runner")
     if ($baseF !== '') {
         if ($baseF === $targetLower || ($noAposLower !== '' && $baseF === $noAposLower)) {
@@ -8652,6 +8866,23 @@ function fd_movie_file_matches_title(string $fileTitle, string $searchedTitle, s
         $targetVariants[] = rtrim($noAposLower, 's');
     }
     if (in_array($baseF, $targetVariants, true)) {
+        return true;
+    }
+    // Accent-insensitive pass: "Siccîn 9" (catalogue) vs "siccin 9" (files).
+    $targetFoldVariants = [];
+    foreach ($targetVariants as $tv) {
+        $targetFoldVariants[] = trim(preg_replace('/\s+/', ' ', fd_fold_latin_accents((string) $tv)));
+    }
+    if ($baseFold !== '' && in_array($baseFold, $targetFoldVariants, true)) {
+        return true;
+    }
+    // ...and the same whole-word PREFIX rule the strict pass uses for a "… Movie" suffix,
+    // so a type word the origin's keyword cleaner drops does not hide the release.
+    if (
+        $baseFold !== '' && $targetFoldLower !== ''
+        && str_starts_with($baseFold, $targetFoldLower . ' ')
+        && preg_match('/^(?:movie|film|the\s+movie|tv\s*series|series|show)$/', substr($baseFold, strlen($targetFoldLower) + 1))
+    ) {
         return true;
     }
 
@@ -15930,6 +16161,22 @@ if ($isNuvioRoute) {
                     $movieTitle = (string) ($movieRow['title'] ?? '');
                     $movieYear  = (string) ($movieRow['year'] ?? '');
                 }
+                // Neither the meta cache nor the identity row always has the CATALOGUE name —
+                // on a cold client the row can even be the OTHER film's ("Balan - The Boy" for
+                // post 9000031785). The WordPress post title is the authority for what this entry
+                // claims to be, and `get-post` is cache-first here. Without this the same-work
+                // guard below has nothing to compare and the wrong film is served.
+                if ($movieTitle === '') {
+                    $gp = fd_fetch_stream_ajax('get_post', ['post_id' => $postId]);
+                    $gpItem = is_array($gp) && $gp !== [] ? ($gp[0] ?? $gp) : [];
+                    $gpTitle = (string) ($gpItem['title'] ?? ($gpItem['post_title'] ?? ''));
+                    if ($gpTitle !== '') {
+                        $movieTitle = fd_strip_title_decorations($gpTitle);
+                        if ($movieYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $gpTitle, $gpym)) {
+                            $movieYear = $gpym[1];
+                        }
+                    }
+                }
                 $movieYear = trim($movieYear);
                 if ($movieTitle !== '' && $movieYear === '' && preg_match('/\b(19\d\d|20\d\d)\b/', $movieTitle, $movieYearInTitle)) {
                     $movieYear = $movieYearInTitle[1];
@@ -16514,13 +16761,19 @@ if ($isNuvioRoute) {
         if (
             $itemType === 'movie'
             && !empty($movieTitle)
-            && !empty($postTitle)
-            && !fd_title_words_prefix_match((string) $movieTitle, (string) $postTitle)
+            && (
+                (!empty($postTitle) && !fd_title_words_prefix_match((string) $movieTitle, (string) $postTitle))
+                // The AKA path is the other way in: the film's files match because the aka
+                // carries ANOTHER film's name ("The Boy" + aka "Balan: The Boy" → 100 Balan
+                // files). Only a same-work aka may widen the search.
+                || (!empty($searchedAka) && !fd_title_words_prefix_match((string) $movieTitle, (string) $searchedAka))
+            )
         ) {
             fd_log('movie identity mismatch — refusing another film\'s files', [
                 'itemId'         => $itemId,
                 'catalogueTitle' => (string) $movieTitle,
                 'resolvedTitle'  => (string) $postTitle,
+                'aka'            => (string) $searchedAka,
                 'files'          => count($filesToStream),
                 'first'          => (string) ($filesToStream[0]['title'] ?? ''),
             ]);
