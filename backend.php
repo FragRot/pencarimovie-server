@@ -9578,7 +9578,22 @@ function fd_fetch_episode_stream_files(int $postId, int $season, int $episode, i
     $fastPathDone = false;
     $idParam = trim((string) ($preloadedPost['id'] ?? ($preloadedPost['external_id'] ?? ($preloadedPost['imdb_id'] ?? ($postId > 0 ? "post:{$postId}" : '')))));
     $idParam = preg_replace('/:\d+:\d+$/', '', $idParam);
-    if (count($all) === 0 && ($keyword !== '' || $idParam !== '')) {
+    //
+    // CRITICAL: this must NOT be gated on `count($all) === 0`.
+    //
+    // Step 0 reads the post's OWN attached files (`post-files?post_id=…`), which is a SUBSET,
+    // not a superset, of what the index holds: "A Bona Fide Killer 2026" (post 9000012836)
+    // has 25 attached files, but the origin's index-wide search for E1 answers 38 files /
+    // 23 matching — the DramaClan, KCW, NF, SiN and EQRTZ releases were uploaded under OTHER
+    // posts of the same title. With the old `=== 0` gate, step 0 matching even ONE file
+    // short-circuited this search, so E1/E2/E4/E5/E7/E8/E9/E11 answered 1-5 streams while the
+    // index had 20+ ("show small list stream"). Episodes whose post set matched nothing
+    // (E10) were the only ones that looked right, because only they reached this branch.
+    //
+    // `$add()` dedups by short_code, so running both is a UNION, never a duplicate. The gate is
+    // now "has step 0 already filled the requested budget?", which keeps the fast path for a
+    // post that genuinely carries everything while restoring completeness for one that does not.
+    if (count($all) < $maxFiles && ($keyword !== '' || $idParam !== '')) {
         $apiBase = FD_WP_API_BASE;
         $url = "{$apiBase}/stream-files?type=series&season={$season}&episode={$episode}&limit={$maxFiles}"
             . ($keyword !== '' ? '&title=' . urlencode($keyword) : '')
