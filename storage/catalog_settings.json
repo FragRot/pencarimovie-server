@@ -33,6 +33,7 @@
         "pm_series_cdrama": true,
         "pm_series_thai": true,
         "pm_series_philippines": true,
+        "pm_series_india": true,
         "pm_series_english": true,
         "pm_series_indo": true
     },
@@ -45,8 +46,10 @@
             "version": ""
         },
         {
+            "name": "OpenSubtitles v3",
             "url": "https://opensubtitles-v3.strem.io/manifest.json",
-            "name": "OpenSubtitles v3"
+            "id": "",
+            "version": ""
         }
     ],
     "stream_config": {
@@ -85,6 +88,5 @@
         "exclude_part_title": true,
         "excluded_keywords": "",
         "required_keywords": ""
-    },
-    "subtitle_seed_v1": true
+    }
 }
