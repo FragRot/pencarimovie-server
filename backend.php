@@ -8075,7 +8075,13 @@ function fd_filename_episode_subtitle(string $fileTitle, string $seriesTitle = '
     $tail = trim(substr($text, $afterMarker));
     // Combined episode pack: do not mistake E02/E03 or a year for a subtitle.
     $tail = (string) preg_replace('/^(?:(?:e(?:p|ps|pisode)?\s*\d{1,4})|(?:19|20)\d{2})\s+/i', '', $tail);
-    $tail = (string) preg_split('/\b(?:2160p|1080p|720p|540p|480p|360p|4k|uhd|fhd|hdtv|web|webrip|bluray|bdrip|brrip|remux|dvdrip|h264|h265|hevc|x264|x265|xvid|avc|aac|dts|flac|ddp|atmos|hdr|dv|nf|amzn|dsnp|multi|dual|audio|dub|dubbed|sub|subs|subbed|engsub|indosub|malaysub|hindi|eng|english|indo|indonesian|malay|korean|japanese|spanish|french|arabic|thai|batch|complete|mkv|mp4|avi|mov|ts|flv)\b/i', $tail, 2)[0];
+    // Any resolution token ends the subtitle region, so this is matched GENERICALLY.
+    // The enumerated 2160p/1080p/720p/540p/480p/360p list missed the uploader-specific
+    // resolutions these shows actually ship with: `Wild.Romance.E01.450p.HANerl.re.encoded.to.MQ.avi`
+    // kept "450p hanerl re encoded to mq" as a "subtitle", PR #5's episode-name guard then
+    // compared it with the official name and rejected the whole release — the episode listed
+    // 1 stream instead of 2 (measured, post 9000030917).
+    $tail = (string) preg_split('/\b(?:\d{3,4}[pi]|4k|uhd|fhd|hdtv|web|webrip|bluray|bdrip|brrip|remux|dvdrip|h264|h265|hevc|x264|x265|xvid|avc|aac|dts|flac|ddp|atmos|hdr|dv|nf|amzn|dsnp|multi|dual|audio|dub|dubbed|sub|subs|subbed|engsub|indosub|malaysub|hindi|eng|english|indo|indonesian|malay|korean|japanese|spanish|french|arabic|thai|batch|complete|mkv|mp4|avi|mov|ts|flv)\b/i', $tail, 2)[0];
     $tail = trim((string) preg_replace('/\s+/', ' ', $tail));
     return fd_normalize_episode_name($tail);
 }
@@ -8317,6 +8323,13 @@ function fd_episode_subtitle_matches(string $fileTitle, string $seriesTitle, arr
     if ($episodeNames === []) return true;
     $subtitle = fd_filename_episode_subtitle($fileTitle, $seriesTitle);
     if ($subtitle === '' || fd_is_release_annotation($subtitle)) return true;
+    // A ONE-WORD tail is almost never an episode subtitle: it is the uploader / release
+    // group that sits between the episode marker and the quality tag ("HANrel", "KCW",
+    // "OPET", "mclub", "FNP22"), or a finale marker ("end"). Both are inconclusive, never
+    // evidence of a wrong stream, so they must not hide a plausible release — the same
+    // fail-open contract as an unknown tag. Only a MULTI-WORD phrase that disagrees is
+    // treated as another show's episode title (the cross-show case this guard exists for).
+    if (!str_contains($subtitle, ' ')) return true;
 
     foreach ($episodeNames as $expected) {
         $expected = fd_normalize_episode_name((string) $expected);
