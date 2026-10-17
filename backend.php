@@ -17066,21 +17066,21 @@ if ($isNuvioRoute) {
                 $fallbackUrl = 'https://pencarimovie.com/search/' . rawurlencode($searchKeyword)
                     . '?ddldomain=' . rawurlencode(rtrim($baseUrl, '/'));
             }
-            // $streams[] = [
-                // 'name' => $noStreamTitle,
-                // 'description' => $noStreamDesc,
-                // 'externalUrl' => $fallbackUrl,
-            // ];
+            $streams[] = [
+                'name' => $noStreamTitle,
+                'description' => $noStreamDesc,
+                'externalUrl' => $fallbackUrl,
+            ];
         }
 
         // ALWAYS add the sponsored message on top if configured (regardless of whether streams were found or empty)
-        // if ($adUrl !== '') {
-            // array_unshift($streams, [
-                // 'name' => $adName !== '' ? $adName : 'PencariMovie',
-                // 'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
-                // 'externalUrl' => $adUrl,
-            // ]);
-        // }
+        if ($adUrl !== '') {
+            array_unshift($streams, [
+                'name' => $adName !== '' ? $adName : 'PencariMovie',
+                'description' => $adDesc !== '' ? $adDesc : 'Join our Telegram channel for updates & requests',
+                'externalUrl' => $adUrl,
+            ]);
+        }
 
         // Save to stream cache. Real playable streams cached with 300s TTL; empty streams short-cached for 60s
         if (!empty($streamCacheFile)) {
