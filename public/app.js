@@ -4602,7 +4602,7 @@ class PencariMovieApp {
               'pm_movies_anime': { slug: 'anime', name: 'Anime Movies' },
               'pm_movies_chinese': { slug: 'china', name: 'Chinese Movies' },
               'pm_movies_thai': { slug: 'thai', name: 'Thai Movies' },
-              'pm_movies_bollywood': { slug: 'bollywood', name: 'Bollywood Movies' },
+              'pm_movies_bollywood': { slug: 'bollywood', name: 'India Movies' },
               'pm_movies_philippines': { slug: 'filipino', name: 'Filipino Movies' },
               'pm_movies_english': { slug: 'english', name: 'English Movies' },
               'pm_series_kdrama': { slug: 'korea', name: 'K-Drama' },
@@ -4612,6 +4612,7 @@ class PencariMovieApp {
               'pm_series_cdrama': { slug: 'china', name: 'C-Drama' },
               'pm_series_thai': { slug: 'thai', name: 'Thai Series' },
               'pm_series_philippines': { slug: 'filipino', name: 'Filipino Series' },
+              'pm_series_india': { slug: 'bollywood', name: 'India Series' },
               'pm_series_english': { slug: 'english', name: 'English Series' },
               'pm_series_indo': { slug: 'indonesian', name: 'Indonesian Series' }
             };

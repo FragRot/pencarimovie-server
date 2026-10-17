@@ -8106,8 +8106,10 @@ function fd_episode_meta_identity_matches(array $meta, string $mediaId, string $
     if ($expectedYear !== '' && preg_match('/^(?:19|20)\d{2}$/', $expectedYear)) {
         $release = trim((string) ($meta['releaseInfo'] ?? ''));
         if ($release === '') $release = trim((string) ($meta['year'] ?? ''));
-        if (preg_match('/\b(19\d{2}|20\d{2})\b/', $release, $ym)
-            && abs((int) $ym[1] - (int) $expectedYear) > 1) {
+        if (
+            preg_match('/\b(19\d{2}|20\d{2})\b/', $release, $ym)
+            && abs((int) $ym[1] - (int) $expectedYear) > 1
+        ) {
             return false;
         }
     }
@@ -8172,8 +8174,10 @@ function fd_public_episode_meta_json(string $url, int $timeoutSeconds = 2): arra
         if ($status !== 200) return [];
     } elseif ((bool) ini_get('allow_url_fopen')) {
         $context = stream_context_create(['http' => [
-            'method' => 'GET', 'timeout' => $timeoutSeconds,
-            'follow_location' => 0, 'max_redirects' => 0,
+            'method' => 'GET',
+            'timeout' => $timeoutSeconds,
+            'follow_location' => 0,
+            'max_redirects' => 0,
             'header' => "Accept: application/json\r\n",
         ]]);
         $raw = @file_get_contents($url, false, $context);
@@ -8200,8 +8204,10 @@ function fd_upstream_episode_names(
     string $expectedYear = ''
 ): array {
     $mediaId = (string) preg_replace('/:\d+:\d+$/', '', trim($mediaId));
-    if ($mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)
-        || $season < 0 || $episode < 1) {
+    if (
+        $mediaId === '' || !preg_match('/^(?:tt\d{6,10}|[a-z][a-z0-9_-]*:\d+)$/i', $mediaId)
+        || $season < 0 || $episode < 1
+    ) {
         return [];
     }
 
@@ -8215,8 +8221,13 @@ function fd_upstream_episode_names(
     if ($urls === []) return [];
 
     $cacheKey = hash('sha256', json_encode([
-        'v3', strtolower($mediaId), $season, $episode,
-        fd_norm_title_for_match($expectedTitle), trim($expectedYear), array_values($urls),
+        'v3',
+        strtolower($mediaId),
+        $season,
+        $episode,
+        fd_norm_title_for_match($expectedTitle),
+        trim($expectedYear),
+        array_values($urls),
     ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
     $cacheFile = fd_cache_path('episode_names_' . $cacheKey . '.json');
     if (is_file($cacheFile)) {
@@ -8270,11 +8281,16 @@ function fd_upstream_episode_names(
 
     $ttl = $names !== [] ? 604800 : ($verified ? 3600 : 300);
     @file_put_contents($cacheFile, json_encode([
-        'names' => $names, 'ttl' => $ttl,
+        'names' => $names,
+        'ttl' => $ttl,
     ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), LOCK_EX);
     fd_log('episode metadata lookup', [
-        'media_id' => $mediaId, 'season' => $season, 'episode' => $episode,
-        'verified' => $verified, 'source' => $source, 'name_count' => count($names),
+        'media_id' => $mediaId,
+        'season' => $season,
+        'episode' => $episode,
+        'verified' => $verified,
+        'source' => $source,
+        'name_count' => count($names),
     ]);
     return $names;
 }
@@ -10752,7 +10768,7 @@ function fd_get_default_catalog_options(): array
         'pm_movies_anime' => ['type' => 'movie', 'group' => 'country', 'name' => 'Anime (Movie)', 'default' => true],
         'pm_movies_chinese' => ['type' => 'movie', 'group' => 'country', 'name' => 'China / HK (Movie)', 'default' => true],
         'pm_movies_thai' => ['type' => 'movie', 'group' => 'country', 'name' => 'Thailand (Movie)', 'default' => false],
-        'pm_movies_bollywood' => ['type' => 'movie', 'group' => 'country', 'name' => 'Bollywood (Movie)', 'default' => true],
+        'pm_movies_bollywood' => ['type' => 'movie', 'group' => 'country', 'name' => 'India (Movie)', 'default' => true],
         'pm_movies_philippines' => ['type' => 'movie', 'group' => 'country', 'name' => 'Philippines (Movie)', 'default' => false],
         'pm_movies_english' => ['type' => 'movie', 'group' => 'country', 'name' => 'English (Movie)', 'default' => true],
         // Series country catalogs: Series > Country > Year with Genre
@@ -10763,6 +10779,7 @@ function fd_get_default_catalog_options(): array
         'pm_series_cdrama' => ['type' => 'series', 'group' => 'country', 'name' => 'C-Drama (Series)', 'default' => true],
         'pm_series_thai' => ['type' => 'series', 'group' => 'country', 'name' => 'Thailand (Series)', 'default' => false],
         'pm_series_philippines' => ['type' => 'series', 'group' => 'country', 'name' => 'Philippines (Series)', 'default' => false],
+        'pm_series_india' => ['type' => 'series', 'group' => 'country', 'name' => 'India (Series)', 'default' => true],
         'pm_series_english' => ['type' => 'series', 'group' => 'country', 'name' => 'English (Series)', 'default' => true],
         'pm_series_indo' => ['type' => 'series', 'group' => 'country', 'name' => 'Indonesia (Series)', 'default' => true],
     ];
@@ -14031,7 +14048,7 @@ if ($isNuvioRoute) {
             'pm_movies_anime' => 'Anime',
             'pm_movies_chinese' => 'China / HK',
             'pm_movies_thai' => 'Thailand',
-            'pm_movies_bollywood' => 'Bollywood',
+            'pm_movies_bollywood' => 'India',
             'pm_movies_philippines' => 'Philippines',
             'pm_movies_english' => 'English',
         ];
@@ -14044,6 +14061,8 @@ if ($isNuvioRoute) {
             'hk' => 'pm_movies_chinese',
             'th' => 'pm_movies_thai',
             'in' => 'pm_movies_bollywood',
+            // (India movies keep the legacy pm_movies_bollywood id so saved addon
+            // collections and cached catalogs do not break; only the display name changed.)
             'ph' => 'pm_movies_philippines',
         ];
         if (isset($cMapMovie[$userCountryCode], $movieCountryCatalogs[$cMapMovie[$userCountryCode]])) {
@@ -14061,6 +14080,7 @@ if ($isNuvioRoute) {
             'pm_series_cdrama' => 'C-Drama',
             'pm_series_thai' => 'Thailand',
             'pm_series_philippines' => 'Philippines',
+            'pm_series_india' => 'India',
             'pm_series_english' => 'English',
         ];
         $cMapSeries = [
@@ -14072,6 +14092,7 @@ if ($isNuvioRoute) {
             'hk' => 'pm_series_cdrama',
             'th' => 'pm_series_thai',
             'ph' => 'pm_series_philippines',
+            'in' => 'pm_series_india',
         ];
         if (isset($cMapSeries[$userCountryCode], $seriesCountryCatalogs[$cMapSeries[$userCountryCode]])) {
             $pKey = $cMapSeries[$userCountryCode];
@@ -14822,6 +14843,8 @@ if ($isNuvioRoute) {
                 'pm_movies_chinese' => 'china',
                 'pm_movies_thai' => 'thai',
                 'pm_movies_bollywood' => 'bollywood',
+                // The origin aliases bollywood|india|hindi|tamil to one India bucket.
+                'pm_series_india' => 'bollywood',
                 'pm_movies_philippines' => 'filipino',
                 'pm_movies_pinoy' => 'filipino',
                 'pm_movies_english' => 'english',
@@ -18357,6 +18380,11 @@ if (str_starts_with($path, '/api/')) {
             'post_id',
             'short_code',
             'type',
+            // The catalog rows send `media_type` (movie/series) and WordPress' ajax_stream_posts()
+            // reads `media_type`, NOT `type`. It was missing from this allow-list, so every
+            // country catalog row returned BOTH movies and series (e.g. the new India (Series)
+            // row listed movies). Forward it verbatim.
+            'media_type',
             'genre',
             'year',
             'sort',
