@@ -4829,6 +4829,66 @@ function fd_norm_title_for_match(string $title): string
 }
 
 /**
+ * Fold Latin accents to ASCII ("Siccîn" → "Siccin"), leaving other scripts alone.
+ *
+ * The catalogue often keeps the diacritics while the FILE names drop them:
+ * post 9000031194 is "Siccîn 9 2026 • Movie" and every file is `Siccin.9.2026…`, so a
+ * byte comparison rejected all 5 of them and the title showed "No Streams Found".
+ * Deliberately Latin-only: iconv('ASCII//TRANSLIT//IGNORE') would mangle CJK/Hangul/
+ * Arabic/Cyrillic titles into '?' and lose matches instead of gaining them.
+ */
+function fd_fold_latin_accents(string $s): string
+{
+    if ($s === '' || !preg_match('/[^\x20-\x7E]/', $s)) {
+        return $s;
+    }
+    // Bail out for scripts iconv cannot transliterate to Latin.
+    if (preg_match('/[\x{0400}-\x{04FF}\x{0590}-\x{05FF}\x{0600}-\x{06FF}\x{0900}-\x{0DFF}\x{0E00}-\x{0EFF}\x{1100}-\x{11FF}\x{2E80}-\x{9FFF}\x{AC00}-\x{D7AF}\x{F900}-\x{FAFF}\x{FF00}-\x{FFEF}]/u', $s)) {
+        return $s;
+    }
+    if (function_exists('iconv')) {
+        $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $s);
+        if (is_string($t) && $t !== '') {
+            return (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $t);
+        }
+    }
+    return (string) preg_replace('/[\x{0300}-\x{036F}]/u', '', $s);
+}
+
+/**
+ * Do two titles name the SAME work? Only a whole-word PREFIX extension is allowed.
+ *
+ * Used to refuse serving another film's files. MEASURED: catalogue post 9000031785 is
+ * titled "The Boy 2026 • Movie", while BOTH its identity row and the origin's
+ * `stream-files?id=post:…` answer `resolved_title = "Balan - The Boy"` and it carries
+ * 200 `Balan.The.Boy.2026…` files — a different 2026 film. The strict file matcher
+ * already rejects those 200 files, but the origin's `titles=` token search then hands
+ * them back unfiltered, so the post played the wrong movie.
+ *
+ * Allowed: equal ("the boy" / "The Boy"), or the shorter is a leading word run of the
+ * longer ("khurafat" vs "khurafat perjanjian syaitan" — a row carrying a subtitle the
+ * post omits, the case the aka path exists for).
+ * Rejected: the wanted title appears only at the END ("balan the boy" for "the boy").
+ * Accents are folded first, so "Siccîn 9" and "Siccin 9" are the same title.
+ */
+function fd_title_words_prefix_match(string $a, string $b): bool
+{
+    $an = fd_norm_title_for_match(fd_fold_latin_accents($a));
+    $bn = fd_norm_title_for_match(fd_fold_latin_accents($b));
+    if ($an === '' || $bn === '') {
+        return false;
+    }
+    if ($an === $bn) {
+        return true;
+    }
+    $aw = explode(' ', $an);
+    $bw = explode(' ', $bn);
+    $short = count($aw) <= count($bw) ? $aw : $bw;
+    $long  = count($aw) <= count($bw) ? $bw : $aw;
+    return array_slice($long, 0, count($short)) === $short;
+}
+
+/**
  * Write a resolved identity back into media_ids_idx.
  *
  * `$postId` is the row to repair: one of our catalog post ids (`pm:post:<id>`, the row a
@@ -16441,6 +16501,30 @@ if ($isNuvioRoute) {
                     }
                 }
             }
+        }
+
+        // Refuse to serve a DIFFERENT film. The catalogue name (everything above resolved
+        // it from the post's meta/row) and the name the origin/identity produced for this
+        // post must describe the same work; when they do not, every file in the list is
+        // the other film's. MEASURED: post 9000031785 is "The Boy 2026 • Movie", yet both
+        // the identity row and `stream-files?id=post:…` answer "Balan - The Boy" with 200
+        // `Balan.The.Boy.2026…` files, so the title played another 2026 movie. This only
+        // ever EMPTIES the list (a strictly narrower result), and any title whose names
+        // agree — including one carrying an extra subtitle — is untouched.
+        if (
+            $itemType === 'movie'
+            && !empty($movieTitle)
+            && !empty($postTitle)
+            && !fd_title_words_prefix_match((string) $movieTitle, (string) $postTitle)
+        ) {
+            fd_log('movie identity mismatch — refusing another film\'s files', [
+                'itemId'         => $itemId,
+                'catalogueTitle' => (string) $movieTitle,
+                'resolvedTitle'  => (string) $postTitle,
+                'files'          => count($filesToStream),
+                'first'          => (string) ($filesToStream[0]['title'] ?? ''),
+            ]);
+            $filesToStream = [];
         }
 
         // Ensure movie streams NEVER contain series files (skip for direct file IDs and 'other' catalog items)
