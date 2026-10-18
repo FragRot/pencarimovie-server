@@ -158,6 +158,11 @@ scripts/*
 !scripts/package-windows.bat
 !scripts/download-frankenphp.ps1
 !scripts/release-apk.bat
+# Tracked: the release workflow runs this checker after applying the vendor
+# patch. Without the negation `scripts/*` swallows it, CI fails with
+# "Could not open input file: scripts/verify-madeline-patch.php", and the
+# release ships an unverifiable vendor/.
+!scripts/verify-madeline-patch.php
 
 # Cloudflare infrastructure / internal deploy files
 cloudflare-worker*.js
