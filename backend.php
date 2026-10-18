@@ -7933,9 +7933,11 @@ function fd_extract_split_part_info(string $filename, string $caption = ''): arr
         $cleanBase = preg_replace('/\.0*' . $m[1] . '$/i', '', $f);
     }
 
-    // Check caption for part total e.g. "part.001/005"
+    // Check caption for part total e.g. "part.001/005" or "Part 1 of 2".
+    // `[\/|of]` is a CHARACTER CLASS (it matched a single 'o' or 'f'), so the literal
+    // "of" form never matched and a one-file part release could not prove it was a split.
     if ($matched && $totalParts === 0 && $cap !== '') {
-        if (preg_match('/part[._\s-]*0*' . $partNum . '\s*[\/|of]\s*0*(\d{1,4})/i', $cap, $cm)) {
+        if (preg_match('/part[._\s-]*0*' . $partNum . '\s*(?:\/|\||\bof\b)\s*0*(\d{1,4})/i', $cap, $cm)) {
             $totalParts = (int) $cm[1];
         }
     }
@@ -7975,14 +7977,40 @@ function fd_group_split_parts(array $files): array
         return 0;
     });
 
-    foreach ($files as &$f) {
+    // A "part" only exists relative to SIBLINGS. Flagging a name that merely CONTAINS
+    // "Part 1" hid complete single files: catalogue item `pm_file_ZMf0Rn`
+    // ("Detective.Conan.Episode.100.Malay.Dub.Special.Episode.Part.1...", 1.28 GB) is one
+    // whole episode whose TITLE has "Part 1", and with `exclude_part_title` on by default
+    // the MALAY DUB catalog answered "No Streams Found" for it (observed as the
+    // "Streams Filtered Out" card). So the flag is only set when there is real evidence of
+    // a split release: another file with the SAME base_key and a DIFFERENT part number, or
+    // a declared total ("part 1 of 2", "part.001/005") greater than one.
+    $infos = [];
+    $partsByBase = [];
+    foreach ($files as $idx => $f) {
         $info = fd_extract_split_part_info((string) ($f['title'] ?? ''), (string) ($f['caption'] ?? ''));
-        if ($info['is_part']) {
-            $f['is_split_part'] = true;
-            $f['part_num'] = $info['part_num'];
-            $f['total_parts'] = $info['total_parts'];
-            $f['clean_base'] = $info['clean_base'];
+        $infos[$idx] = $info;
+        if (!empty($info['is_part']) && (string) ($info['base_key'] ?? '') !== '') {
+            $partsByBase[$info['base_key']][(int) $info['part_num']] = true;
         }
+    }
+
+    foreach ($files as $idx => &$f) {
+        $info = $infos[$idx];
+        if (empty($info['is_part'])) {
+            continue;
+        }
+        $baseKey = (string) ($info['base_key'] ?? '');
+        $siblingParts = ($baseKey !== '' && isset($partsByBase[$baseKey])) ? count($partsByBase[$baseKey]) : 0;
+        $declaredTotal = (int) ($info['total_parts'] ?? 0);
+        $isRealSplit = $declaredTotal > 1 || $siblingParts > 1;
+        if (!$isRealSplit) {
+            continue;
+        }
+        $f['is_split_part'] = true;
+        $f['part_num'] = $info['part_num'];
+        $f['total_parts'] = $info['total_parts'];
+        $f['clean_base'] = $info['clean_base'];
     }
     unset($f);
 
@@ -16837,9 +16865,18 @@ if ($isNuvioRoute) {
             };
         };
 
-        // Apply comprehensive AIOStreams filters
+        // Apply comprehensive AIOStreams filters.
+        //
+        // A DIRECT Telegram file item (`pm_file_<short_code>` / `pm:file:<short_code>`) is ONE
+        // explicitly chosen file — there is no alternative source to fall back to, so filtering
+        // it can only ever turn a playable file into "Streams Filtered Out" / "No Streams
+        // Found". The AIOStreams filters exist to CHOOSE between many releases; they are
+        // skipped for a single-file item so a Telegram file always plays. Measured: the MALAY
+        // DUB catalog is entirely `pm_file_` items, and `pm_file_ZMf0Rn`
+        // ("Detective.Conan…Special.Episode.Part.1…") / `pm_file_9HJMjC`
+        // ("…Episode.133.Malay.Dub.Part.2.") both answered the filtered-out card.
         $filteredFiles = [];
-        foreach ($filesToStream as $fItem) {
+        foreach (($isDirectFile ? [] : $filesToStream) as $fItem) {
             $fTitle = $fItem['title'] ?? '';
             $fCaption = $fItem['caption'] ?? '';
             $fSize = (int) ($fItem['file_size'] ?? 0);
@@ -16961,6 +16998,11 @@ if ($isNuvioRoute) {
             );
             return $sB <=> $sA;
         });
+
+        if ($isDirectFile) {
+            // The filter loop above was skipped on purpose: pass the single file through.
+            $filteredFiles = $filesToStream;
+        }
 
         // Apply per-resolution max limits if configured (> 0)
         $resCounts = [];
