@@ -274,6 +274,18 @@ class PencariMovieApp {
     if (legacyEngine) {
       this._hideLoadingScreen();
       const overlayDeepLink = initialHash === '#settings' || initialHash === '#configure' || initialHash === '#addon';
+      if (initialHash === '#settings' || initialHash === '#configure') {
+        // #settings is the only screen on this engine, so it must open even when
+        // there is no session — that is exactly when the user needs it (bot token,
+        // diagnostics). Previously the deep link suppressed the gate and the page
+        // rendered blank.
+        this.showSettingsGate({ forceToken: !this.hasSession });
+        this._syncOverlayFreeze?.();
+        if (window.NuvioBootGuard && typeof window.NuvioBootGuard.ready === 'function') {
+          window.NuvioBootGuard.ready();
+        }
+        return;
+      }
       if (!overlayDeepLink) {
         if (this.hasSession) this.openAddonModal?.();
         else this.showSettingsGate({ forceToken: false });
@@ -378,6 +390,103 @@ class PencariMovieApp {
     }
   }
 
+  /**
+   * Diagnostics / crash reporting controls in #settings. The auto-send toggle
+   * persists server-side (`/api/diagnostics/settings` → storage/diagnostics.json
+   * on PHP, SharedPreferences on Android), so it survives a reload and applies
+   * to incidents that happen while the page is closed.
+   */
+  bindDiagnosticsSettings() {
+    const base = window.location.origin;
+    const toggle = this.$('#autoReportToggle');
+    const status = this.$('#diagStatus');
+    const setStatus = (text) => {
+      if (status) status.textContent = text;
+    };
+
+    fetch(base + '/api/diagnostics/settings')
+      .then((r) => r.json())
+      .then((j) => {
+        if (toggle && typeof j.auto_report !== 'undefined') {
+          toggle.checked = !!j.auto_report;
+        }
+      })
+      .catch(() => {
+        /* keep the markup default; the toggle still writes when clicked */
+      });
+
+    if (toggle) {
+      toggle.addEventListener('change', () => {
+        fetch(base + '/api/diagnostics/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ auto_report: !!toggle.checked }),
+        })
+          .then((r) => r.json())
+          .then((j) =>
+            setStatus(j.auto_report ? '✅ Auto-send enabled' : '⛔ Auto-send disabled')
+          )
+          .catch(() => setStatus('⚠️ Could not save the setting'));
+      });
+    }
+
+    // Plain `if` guards, not optional chaining: this file is also shipped to the
+    // Android WebView as assets/web/app.js, where `?.` is a syntax error.
+    const reportBtn = this.$('#diagReportBtn');
+    // No async/await either: Chrome 52 (the Android WebView) cannot parse it.
+    if (reportBtn) reportBtn.addEventListener('click', () => {
+      setStatus('Sending…');
+      fetch(base + '/api/reports')
+        .then((r) => r.json())
+        .then((list) => {
+          const pending = (list.reports || [])
+            .filter((r) => !r.sent)
+            .map((r) => r.file)
+            .filter(Boolean);
+          if (!pending.length) {
+            setStatus('Nothing to send — no unsent reports.');
+            return;
+          }
+          const sends = pending.map((f) =>
+            fetch(base + '/api/reports?send=' + encodeURIComponent(f))
+              .then((r) => r.json())
+              .then((j) => (j && j.ok ? 1 : 0))
+              .catch(() => 0)
+          );
+          Promise.all(sends).then((res) => {
+            const ok = res.reduce((a, b) => a + b, 0);
+            setStatus('📤 Sent ' + ok + ' of ' + pending.length + ' report(s).');
+          });
+        })
+        .catch((e) => setStatus('⚠️ Send failed: ' + e.message));
+    });
+
+    const selfTestBtn = this.$('#diagSelfTestBtn');
+    if (selfTestBtn) selfTestBtn.addEventListener('click', () => {
+      setStatus('Running…');
+      fetch(base + '/api/diagnostics')
+        .then((r) => r.json())
+        .then((res) => {
+          const d = res.info || {};
+          const counts = res.counts || {};
+          const reportLine = Object.keys(counts)
+            .map((k) => k + '=' + counts[k])
+            .join(' ');
+          setStatus(
+            [
+              'Device: ' + (d.device_id || '?') + ' · ' + (d.platform || '?') + ' ' + (d.app_version || ''),
+              'OS: ' + (d.os_version || '?'),
+              'Model: ' + (d.model || '?') + ' / ' + (d.brand || '?'),
+              'Disk free: ' + (d.disk_free_mb === undefined ? '?' : d.disk_free_mb) + ' MB',
+              'Reports: ' + (reportLine || 'none'),
+              'Auto-send: ' + (d.auto_report ? 'on' : 'off'),
+            ].join('\n')
+          );
+        })
+        .catch((e) => setStatus('⚠️ Self-test failed: ' + e.message));
+    });
+  }
+
   bindGlobalEvents() {
     // ── Auth gate ──
     const authBtn = this.$('#authConnectBtn');
@@ -418,6 +527,8 @@ class PencariMovieApp {
     this.$('#settingsBtn')?.addEventListener('click', () => {
       this.showSettingsGate();
     });
+
+    this.bindDiagnosticsSettings();
 
     // ── Multi-Bot Manager Listeners ──
     const toggleAddBotsBtn = this.$('#toggleAddBotsBtn');
@@ -2543,6 +2654,14 @@ class PencariMovieApp {
               `Device clock out of sync!\nYour clock is ${human} ${dir} Telegram's server time.\n\n` +
               `Enable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server.`;
             this._clearCachedSession();
+            // MUST open the gate: this branch used to `return` with the loading
+            // screen still up, so the user could not reach #settings at all and
+            // had no way to paste a token or read the error.
+            this.showSettingsGate({
+              forceToken: true,
+              message: this.provisionError,
+              messageType: 'error'
+            });
             return;
           }
         } catch (clockErr) {
@@ -4402,6 +4521,16 @@ class PencariMovieApp {
         const addonTokenInput = this.$('#addonTokenInput');
         if (addonTokenInput) addonTokenInput.value = data.token;
         await this.continueInit();
+        // Replay whatever was refused before this login (token rotate, tunnel, …).
+        const pending = this._privilegedRetry;
+        if (pending) {
+          this._privilegedRetry = null;
+          try {
+            await this.requestJson(pending.url, pending.options);
+            this._updateAddonModalUrls?.();
+            this.renderTunnelStatus?.();
+          } catch (_) { /* the retry failing again must not break the UI */ }
+        }
         return;
       }
       if (status) status.textContent = data?.message || 'Wrong password';
@@ -4445,6 +4574,12 @@ class PencariMovieApp {
         this.showUpdateRequired(data);
       }
       if (response.status === 401 && data?.auth_required) {
+        this.showAuthGate();
+      }
+      // An operator-only action refused for a LAN peer: ask for the password once
+      // (which returns the token + cookie), then replay the request.
+      if (response.status === 403 && data?.local_only) {
+        this._privilegedRetry = { url, options };
         this.showAuthGate();
       }
       throw new Error(data?.message || data?.code || `HTTP ${response.status}`);

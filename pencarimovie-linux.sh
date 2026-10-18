@@ -295,6 +295,26 @@ download_extract() {
       exit 1
     fi
   fi
+  # Integrity: GitHub publishes a .sha256 sidecar next to each artifact. Verify it
+  # when the release has one; a mismatch aborts. A release without a sidecar only
+  # warns, so old releases keep installing.
+  sha_seen=""
+  sha_matched=""
+  for sidecar_src in "$url" "$fallback_url"; do
+    [ -n "$sidecar_src" ] || continue
+    download_file "${sidecar_src}.sha256" "$tmp/pkg.sha256" 2>/dev/null || continue
+    want="$(grep -oE '[0-9a-fA-F]{64}' "$tmp/pkg.sha256" | head -n1 | tr 'A-F' 'a-f')"
+    [ -n "$want" ] || continue
+    sha_seen=1
+    got="$( { sha256sum "$tmp/pencarimovie.tar.gz" || shasum -a 256 "$tmp/pencarimovie.tar.gz" || openssl dgst -sha256 "$tmp/pencarimovie.tar.gz"; } 2>/dev/null | grep -oE '[0-9a-fA-F]{64}' | head -n1 | tr 'A-F' 'a-f')"
+    if [ "$want" = "$got" ]; then sha_matched=1; break; fi
+  done
+  if [ -n "$sha_seen" ] && [ -z "$sha_matched" ]; then
+    echo "Release archive failed integrity check; aborting."
+    rm -rf "$tmp"
+    exit 1
+  fi
+  [ -n "$sha_seen" ] || echo "No .sha256 sidecar published for this release; skipping integrity check."
   tar -xzf "$tmp/pencarimovie.tar.gz" -C "$tmp/extract"
   src="$(find_release_root "$tmp/extract")"
   copy_release_into_app "$src"

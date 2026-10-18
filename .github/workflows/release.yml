@@ -86,12 +86,33 @@ jobs:
           # fail the build if the patched form is not present.
           PATCH="$PWD/patches/madelineproto-windows-ipc.patch"
           if [ -f "$PATCH" ]; then
-            # Apply from the package root with -p1 so the a/src/... paths in the
-            # patch resolve against vendor/danog/madelineproto. Using an absolute
-            # patch path avoids the relative-path mistakes that made the earlier
-            # `cd vendor/danog/madelineproto && git apply ../../../../patches/...`
-            # fail with "can't open patch".
-            git -C vendor/danog/madelineproto apply --recount --whitespace=nowarn "$PATCH" || true
+            # DO NOT run `git apply` from inside this repo. vendor/ is gitignored,
+            # and `git apply` resolves paths against the repo INDEX, so it skips
+            # every path under vendor/ — printing "Skipped patch 'src/...'" for
+            # all 10 files and exiting 0. With the old `|| true` that meant the
+            # patch applied NOTHING and the release shipped an unpatched vendor/:
+            # no ProcessRunner bin/php lookup (so the IPC worker cannot be
+            # spawned under FrankenPHP), no entry.php argv fix (FrankenPHP 1.13+
+            # prepends os.Args[0], so MADELINE_WORKER_TYPE became "entry.php"),
+            # no ClientAbstract bounded reconnect, no MsgIdHandler clamp. Symptom
+            # on a fresh install: "Could not connect to MadelineProto" on every
+            # stream and one full-mode boot per request.
+            #
+            # Apply in a temp dir OUTSIDE the repo, where there is no index to
+            # skip against and git runs in plain-patch mode, then copy back.
+            TMPPKG="$(mktemp -d)"
+            cp -a vendor/danog/madelineproto "$TMPPKG/pkg"
+            if ! ( cd "$TMPPKG/pkg" && git apply --reject -p1 --recount --whitespace=nowarn "$PATCH" ); then
+              # --reject keeps the files it could patch and writes *.rej for the
+              # rest; a partially patched tree is worse than an unpatched one.
+              find "$TMPPKG/pkg" -name '*.rej' -exec sh -c 'echo "=== REJECTED: $1 ==="; cat "$1"' _ {} \;
+              rm -rf "$TMPPKG"
+              echo "::error::MadelineProto patch did not apply cleanly (hunks rejected) — refusing to build."
+              exit 1
+            fi
+            cp -a "$TMPPKG/pkg/." vendor/danog/madelineproto/
+            rm -rf "$TMPPKG"
+            echo "MadelineProto patch applied (temp-dir git apply)"
           fi
 
           # Use PHP for the in-place rewrite: it avoids all shell/sed escaping
@@ -113,6 +134,15 @@ jobs:
             }
             echo "Verified: $p has the patched getSlow()\n";
           '
+
+      # The rewrite above proves ONE hunk. The patch also carries ProcessRunner,
+      # entry.php and ClientAbstract changes without which Windows IPC silently fails
+      # ("Could not connect to MadelineProto"), and `git apply ... || true` would let a
+      # partially-patched vendor/ ship. This checker asserts all of it (25 checks).
+      - name: Verify full MadelineProto patch surface
+        run: |
+          set -euo pipefail
+          php scripts/verify-madeline-patch.php
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -186,6 +216,16 @@ jobs:
           rm -f dist/*.sh dist/*.bat dist/*.ps1 dist/*.apk
           cp public/logo.png dist/logo.png 2>/dev/null || true
 
+          # Sidecars for the tarballs. pencarimovie-{linux,termux,libwrt}.sh verify these
+          # before `tar -xzf`; without one they can only warn, which leaves the POSIX
+          # self-updaters with no integrity check while the Windows ZIP has one.
+          # Hash only (no filename), so the launcher's `grep -oE '[0-9a-fA-F]{64}'` works.
+          for f in dist/*.tar.gz; do
+            [ -f "$f" ] || continue
+            sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
+            echo "sidecar: $f.sha256"
+          done
+
           echo "Release archives in dist/:"
           ls -lh dist/
 
@@ -211,6 +251,7 @@ jobs:
           tag_name: ${{ env.TAG }}
           files: |
             dist/*.tar.gz
+            dist/*.tar.gz.sha256
             dist/*.zip
             dist/*.zip.sha256
             dist/logo.png

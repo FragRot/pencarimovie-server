@@ -1332,6 +1332,92 @@ function fd_require_local_request(): void
     }
 }
 
+/**
+ * Loopback only: the machine itself, not the LAN.
+ *
+ * fd_is_local_request() treats the whole of RFC1918 as local, so it cannot
+ * separate "the operator at this machine" from "anything else on the wifi".
+ * Security-state changes (password reset, token rotation, evidence deletion,
+ * tunnel control) and the credentials themselves use this instead.
+ */
+function fd_is_loopback_request(): bool
+{
+    $remoteAddr = (string) ($_SERVER['REMOTE_ADDR'] ?? '');
+    if ($remoteAddr === '') {
+        return false;
+    }
+    if (in_array($remoteAddr, ['127.0.0.1', '::1'], true) || str_starts_with($remoteAddr, '::ffff:127.0.0.1')) {
+        return true;
+    }
+    // A public tunnel or proxy hostname means the peer is not the operator.
+    if (fd_is_cloudflare_tunnel_request()) {
+        return false;
+    }
+    $serverAddr = (string) ($_SERVER['SERVER_ADDR'] ?? '');
+    return $serverAddr !== '' && $remoteAddr === $serverAddr && fd_is_local_request();
+}
+
+/**
+ * May this caller see or change security state?
+ *
+ * True for the machine itself, or for a caller that already presented a valid
+ * token (the dashboard sends X-Auth-Token on every request, so an installed
+ * client keeps working). A LAN peer that has not been given the token cannot
+ * read it here, which is what stops adjacency from becoming a remote credential.
+ */
+function fd_auth_privileged(): bool
+{
+    if (!fd_auth_enabled()) {
+        return fd_is_loopback_request();
+    }
+    if (fd_is_loopback_request()) {
+        return true;
+    }
+    $token = strtolower(fd_auth_token_from_request());
+    if ($token === '') {
+        return false;
+    }
+    foreach (fd_auth_valid_tokens() as $valid) {
+        if (hash_equals($valid, $token)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function fd_require_privileged(): void
+{
+    if (!fd_auth_privileged()) {
+        fd_json([
+            'ok'      => 0,
+            'message' => 'This action must be performed on the machine itself (or with a valid token).',
+            'local_only' => true,
+        ], 403);
+    }
+}
+
+/**
+ * True when a URL resolves only to public addresses, so the server can fetch it
+ * without being used as a relay into loopback, the LAN or cloud metadata.
+ */
+function fd_url_host_is_public(string $url): bool
+{
+    $host = strtolower((string) parse_url($url, PHP_URL_HOST));
+    if ($host === '' || $host === 'localhost' || str_ends_with($host, '.localhost')) {
+        return false;
+    }
+    $ips = filter_var($host, FILTER_VALIDATE_IP) ? [$host] : (gethostbynamel($host) ?: []);
+    if (!$ips) {
+        return false;
+    }
+    foreach ($ips as $ip) {
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ─── Server password auth ───────────────────────────────────────────────────
 // A single password (default 123456) gates the admin surface and the streams
 // list. Localhost / private-LAN requests bypass it so local installs are
@@ -10998,6 +11084,304 @@ function fd_get_device_id(): string
     return $id;
 }
 
+// ─── Diagnostics / crash reporting ──────────────────────────────────────────
+//
+// Mirrors android/pencarimovie-server/.../Diagnostics.kt. Every crash, stream
+// miss and playback failure is written to storage/reports/<type>_<ts>.json and
+// then (when auto-report is ON, the `#settings` toggle) POSTed to the WordPress
+// plugin, which stores it in the columnar Manticore table
+// `server_reports_idx` (`POST /report-diagnostic`).
+
+function fd_diagnostics_settings_path(): string
+{
+    return fd_storage_path('diagnostics.json');
+}
+
+function fd_diagnostics_settings(): array
+{
+    $defaults = ['auto_report' => true];
+    $path = fd_diagnostics_settings_path();
+    if (!is_file($path)) {
+        return $defaults;
+    }
+    $data = json_decode((string) @file_get_contents($path), true);
+    return is_array($data) ? array_merge($defaults, $data) : $defaults;
+}
+
+function fd_diagnostics_auto_report_enabled(): bool
+{
+    return !empty(fd_diagnostics_settings()['auto_report']);
+}
+
+function fd_diagnostics_set_auto_report(bool $enabled): bool
+{
+    $settings = fd_diagnostics_settings();
+    $settings['auto_report'] = $enabled;
+    return @file_put_contents(
+        fd_diagnostics_settings_path(),
+        (string) json_encode($settings, JSON_UNESCAPED_SLASHES),
+        LOCK_EX
+    ) !== false;
+}
+
+function fd_reports_dir(): string
+{
+    $dir = fd_storage_path('reports');
+    if (!is_dir($dir)) {
+        @mkdir($dir, 0775, true);
+    }
+    return $dir;
+}
+
+/**
+ * Device + runtime signature attached to every report. `device_id` is the SAME
+ * value the dashboard and the Android app show, so a report can be traced back
+ * to an install.
+ */
+function fd_device_info(): array
+{
+    $diskFree = @disk_free_space(fd_storage_path(''));
+    $pool = fd_get_bot_pool();
+    return [
+        'device_id'      => fd_get_device_id(),
+        'platform'       => 'php',
+        'app_version'    => defined('FD_APP_VERSION') ? (string) FD_APP_VERSION : '',
+        'os_version'     => trim(php_uname('s') . ' ' . php_uname('r')) . ' / PHP ' . PHP_VERSION . ' / ' . PHP_SAPI,
+        'model'          => php_uname('m'),
+        'brand'          => php_uname('n'),
+        'abi'            => PHP_INT_SIZE === 8 ? '64-bit' : '32-bit',
+        'memory_free_mb' => (int) round(memory_get_usage(true) / 1048576),
+        'memory_total_mb' => (int) round(memory_get_peak_usage(true) / 1048576),
+        'disk_free_mb'   => $diskFree === false ? 0 : (int) round($diskFree / 1048576),
+        'bot_id'         => fd_get_bot_id(),
+        'bots'           => count($pool['bots'] ?? []),
+        'auto_report'    => fd_diagnostics_auto_report_enabled(),
+    ];
+}
+
+/** Keep the newest $keep reports of one type (plus their .sent marks). */
+function fd_diag_prune(string $type, int $keep = 10): void
+{
+    $files = glob(fd_reports_dir() . DIRECTORY_SEPARATOR . $type . '_*.json') ?: [];
+    if (count($files) <= $keep) {
+        return;
+    }
+    rsort($files);
+    foreach (array_slice($files, $keep) as $old) {
+        @unlink($old);
+        @unlink($old . '.sent');
+    }
+}
+
+/**
+ * Record one incident and (when enabled) hand it to a detached CLI worker so
+ * the upload never costs the failing request any latency.
+ *
+ * @return string|null Local file name, or null when it could not be written.
+ */
+function fd_diag_record(
+    string $type,
+    string $title,
+    string $message = '',
+    string $stackTrace = '',
+    string $failureReason = '',
+    string $itemId = '',
+    string $shortCode = '',
+    int $durationMs = 0,
+    array $details = []
+): ?string {
+    $type = substr((string) (preg_replace('/[^a-z0-9_]/', '_', strtolower($type)) ?: 'incident'), 0, 32);
+    $file = $type . '_' . (int) round(microtime(true) * 1000) . '.json';
+    $payload = array_merge(fd_device_info(), [
+        'report_type'    => $type,
+        'created_at'     => time(),
+        'error_title'    => mb_substr($title, 0, 300),
+        'error_message'  => mb_substr($message, 0, 2000),
+        'stack_trace'    => mb_substr($stackTrace, 0, 8000),
+        'failure_reason' => mb_substr($failureReason, 0, 64),
+        'item_id'        => mb_substr($itemId, 0, 120),
+        'short_code'     => mb_substr($shortCode, 0, 48),
+        'duration_ms'    => max(0, min($durationMs, 86400000)),
+        'details'        => $details,
+    ]);
+    $path = fd_reports_dir() . DIRECTORY_SEPARATOR . $file;
+    if (@file_put_contents($path, (string) json_encode($payload, JSON_UNESCAPED_SLASHES)) === false) {
+        return null;
+    }
+    fd_diag_prune($type);
+    fd_log('diagnostic report recorded', ['file' => $file, 'reason' => $failureReason]);
+    if (fd_diagnostics_auto_report_enabled() && !fd_spawn_backend_cli(['diag-send', $file])) {
+        fd_diag_report_send($file);
+    }
+    return $file;
+}
+
+/** Upload one stored report. Marks it `.sent` on success. */
+function fd_diag_report_send(string $file): bool
+{
+    $path = fd_reports_dir() . DIRECTORY_SEPARATOR . basename($file);
+    if (!is_file($path)) {
+        return false;
+    }
+    if (is_file($path . '.sent')) {
+        return true;
+    }
+    $payload = json_decode((string) @file_get_contents($path), true);
+    if (!is_array($payload)) {
+        return false;
+    }
+    $res = fd_http_json(FD_WP_API_BASE . '/report-diagnostic', $payload, 'POST', 15);
+    if (!empty($res['ok'])) {
+        @file_put_contents($path . '.sent', '', LOCK_EX);
+        return true;
+    }
+    fd_log('diagnostic report send failed', [
+        'file'  => basename($path),
+        'error' => is_array($res) ? (string) ($res['error'] ?? ($res['message'] ?? 'no response')) : 'no response',
+    ]);
+    return false;
+}
+
+/** Retry every report that never made it out (offline, crash in flight, throttle). */
+function fd_diag_flush_pending(int $max = 20): int
+{
+    $sent = 0;
+    if (!fd_diagnostics_auto_report_enabled()) {
+        return 0;
+    }
+    foreach (glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*.json') ?: [] as $path) {
+        if ($sent >= $max) {
+            break;
+        }
+        if (is_file($path . '.sent')) {
+            continue;
+        }
+        if (!fd_diag_report_send(basename($path))) {
+            break;
+        }
+        $sent++;
+    }
+    return $sent;
+}
+
+function fd_diag_list(int $limit = 20): array
+{
+    $out = [];
+    $files = glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*.json') ?: [];
+    rsort($files);
+    foreach (array_slice($files, 0, max(1, min(100, $limit))) as $path) {
+        $row = json_decode((string) @file_get_contents($path), true);
+        if (!is_array($row)) {
+            continue;
+        }
+        $out[] = [
+            'file'           => basename($path),
+            'report_type'    => (string) ($row['report_type'] ?? ''),
+            'created_at'     => (int) ($row['created_at'] ?? 0),
+            'error_title'    => (string) ($row['error_title'] ?? ''),
+            'failure_reason' => (string) ($row['failure_reason'] ?? ''),
+            'item_id'        => (string) ($row['item_id'] ?? ''),
+            'sent'           => is_file($path . '.sent'),
+        ];
+    }
+    return $out;
+}
+
+function fd_diag_counts(): array
+{
+    $out = [];
+    foreach (glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*.json') ?: [] as $path) {
+        $type = explode('_', basename($path))[0];
+        $out[$type] = ($out[$type] ?? 0) + 1;
+    }
+    return $out;
+}
+
+function fd_diag_clear(): void
+{
+    foreach (glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*') ?: [] as $path) {
+        @unlink($path);
+    }
+}
+
+/**
+ * Fatal / uncaught-throwable capture. Registered from the entry points so a PHP
+ * OOM or a TypeError inside a Stremio route is reported instead of vanishing
+ * into the FrankenPHP error log.
+ */
+function fd_diag_install_fatal_handlers(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+
+    register_shutdown_function(function () {
+        $err = error_get_last();
+
+        // (a) A download that started and never cleared its in-flight marker.
+        // `downloadToBrowser()` can kill the worker outright (a SIGSEGV with a
+        // malformed file id leaves error_get_last() EMPTY), so the catch block in
+        // the /api/download handler never runs and the failure would be invisible.
+        $inflight = $GLOBALS['fd_diag_download'] ?? null;
+        if (is_array($inflight)) {
+            fd_diag_record(
+                'playback_incident',
+                'Download aborted the PHP worker: ' . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
+                'downloadToBrowser() never returned — the process died mid-request',
+                '',
+                is_array($err) && !empty($err['message']) ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED',
+                '',
+                (string) ($inflight['short_code'] ?? ''),
+                (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
+                [
+                    'file_id' => (string) ($inflight['file_id'] ?? ''),
+                    'error'   => (string) ($err['message'] ?? ''),
+                ]
+            );
+        }
+
+        // (b) A genuine PHP fatal.
+        if (!is_array($err)) {
+            return;
+        }
+        if (!in_array($err['type'] ?? 0, [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+            return;
+        }
+        $trace = sprintf("%s in %s:%d", (string) ($err['message'] ?? ''), (string) ($err['file'] ?? ''), (int) ($err['line'] ?? 0));
+        fd_diag_record(
+            'crash',
+            'PHP fatal: ' . substr((string) ($err['message'] ?? ''), 0, 300),
+            'The PHP process terminated with a fatal error',
+            $trace,
+            'PHP_FATAL',
+            '',
+            '',
+            0,
+            ['uri' => (string) ($_SERVER['REQUEST_URI'] ?? ''), 'method' => (string) ($_SERVER['REQUEST_METHOD'] ?? '')]
+        );
+    });
+
+    set_exception_handler(function ($e) {
+        try {
+            fd_diag_record(
+                'crash',
+                get_class($e) . ': ' . substr((string) $e->getMessage(), 0, 300),
+                'Uncaught throwable',
+                (string) $e->getTraceAsString(),
+                'UNCAUGHT_EXCEPTION',
+                '',
+                '',
+                0,
+                ['uri' => (string) ($_SERVER['REQUEST_URI'] ?? '')]
+            );
+        } catch (\Throwable $ignored) {
+        }
+        throw $e;
+    });
+}
+
 /**
  * Check if a topkeyword is valid for catalog display (rejecting filler and NSFW words like 'new', 'movie', 'sex', etc.).
  */
@@ -13418,6 +13802,36 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 // emits the ?token= query form, which survives the rewrite. Keep this strip for
 // non-Caddy runtimes (php -S via router.php) where REQUEST_URI is preserved.
 $path = fd_strip_token_prefix($path);
+
+// ─── Diagnostics: fatal capture + detached report uploader ───────────────────
+// Installed before any routing so an OOM / TypeError in a route is recorded.
+fd_diag_install_fatal_handlers();
+if (PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg') {
+    $diagCliArgs = $argv ?? ($_SERVER['argv'] ?? []);
+    if (isset($diagCliArgs[1]) && str_ends_with((string) $diagCliArgs[1], '.php')) {
+        $diagCliArgs = array_values(array_slice($diagCliArgs, 1));
+    }
+    if (($diagCliArgs[1] ?? '') === 'diag-send') {
+        // Single sender: a worker that cannot take the lock exits at once (a few
+        // ms), and the holder sweeps every pending report before it finishes — so
+        // a burst costs N cheap processes but never N concurrent uploads, and no
+        // report is left behind waiting for a "next" incident.
+        $diagLockPath = fd_reports_dir() . DIRECTORY_SEPARATOR . '.sender.lock';
+        $diagLock = @fopen($diagLockPath, 'c');
+        if ($diagLock && !flock($diagLock, LOCK_EX | LOCK_NB)) {
+            exit(0);
+        }
+        $diagCliFile = (string) ($diagCliArgs[2] ?? '');
+        $diagCliOk = $diagCliFile !== '' && fd_diag_report_send($diagCliFile);
+        $diagCliSwept = fd_diag_flush_pending();
+        fd_log('cli diag-send finished', [
+            'file'  => $diagCliFile,
+            'ok'    => $diagCliOk ? 1 : 0,
+            'swept' => $diagCliSwept,
+        ]);
+        exit($diagCliOk ? 0 : 1);
+    }
+}
 
 // Run non-blocking cache pruning (cleans expired files, throttled to once every 5 minutes)
 fd_prune_cache_files();
@@ -17472,6 +17886,29 @@ if ($isNuvioRoute) {
         $adDesc = trim((string) ($sponsorInfo['description'] ?? ''));
 
         if (!$hasPlayableStreams) {
+            // Diagnostics: "I pressed Play and got nothing" — the most reported
+            // user-visible failure, and the two causes need different fixes.
+            $diagFiltered = !empty($totalFilesBeforeFilter) && $totalFilesBeforeFilter > 0;
+            fd_diag_record(
+                'stream_incident',
+                'No playable streams: ' . (string) ($itemId ?? ''),
+                $diagFiltered
+                    ? "{$totalFilesBeforeFilter} file(s) matched but the active stream filters hid them"
+                    : 'No candidate file matched this title',
+                '',
+                $diagFiltered ? 'FILTERED_OUT' : 'NO_STREAMS',
+                (string) ($itemId ?? ''),
+                '',
+                0,
+                [
+                    'item_type'           => (string) ($itemType ?? ''),
+                    'title'               => (string) ($searchedTitle ?? ($cleanMovieTitle ?? '')),
+                    'year'                => (string) ($searchedYear ?? ''),
+                    'files_before_filter' => (int) ($totalFilesBeforeFilter ?? 0),
+                    'streams_built'       => count($streams),
+                ]
+            );
+
             // No playable streams found: check if files existed but were all hidden by user's stream filters
             if (!empty($totalFilesBeforeFilter) && $totalFilesBeforeFilter > 0) {
                 $noStreamTitle = '⚠️ Streams Filtered Out';
@@ -17594,6 +18031,12 @@ if (str_starts_with($path, '/api/')) {
             echo "URL is required";
             exit;
         }
+        // No relay into loopback, the LAN or cloud metadata.
+        if (!fd_url_host_is_public($subUrl)) {
+            http_response_code(400);
+            echo "URL is not permitted";
+            exit;
+        }
 
         $cacheKey = 'sub_vtt_' . md5($subUrl);
         $cacheFile = fd_storage_path('storage/' . $cacheKey . '.vtt');
@@ -17635,7 +18078,9 @@ if (str_starts_with($path, '/api/')) {
             'ok' => 1,
             'enabled' => fd_auth_enabled(),
             'authenticated' => $authed,
-            'token' => $authed ? fd_auth_token() : '',
+            // Only the machine itself, or a caller that already presented a
+            // valid token, may read the token back. LAN adjacency is not enough.
+            'token' => fd_auth_privileged() ? fd_auth_token() : '',
         ]);
     }
 
@@ -17707,11 +18152,14 @@ if (str_starts_with($path, '/api/')) {
     }
 
     if ($path === '/api/auth/token/rotate' && $method === 'POST') {
+        // Rotation invalidates every remote client, so it needs proof of
+        // possession, not just adjacency.
+        fd_require_privileged();
         fd_json(['ok' => 1, 'token' => fd_auth_rotate_token()]);
     }
 
     if ($path === '/api/auth/reset' && $method === 'POST') {
-        fd_require_local_request();
+        fd_require_privileged();
         fd_auth_set_password(FD_AUTH_DEFAULT_PASSWORD);
         @unlink(fd_storage_path('storage/cache/auth_lockout.json'));
         fd_json(['ok' => 1, 'token' => fd_auth_token()]);
@@ -17737,6 +18185,8 @@ if (str_starts_with($path, '/api/')) {
     }
 
     if ($path === '/api/tunnel/enable' && $method === 'POST') {
+        // Changing the machine's internet exposure is an operator action.
+        fd_require_privileged();
         $input = json_decode((string) file_get_contents('php://input'), true);
         $token = is_array($input) ? trim((string) ($input['tunnel_token'] ?? '')) : '';
         $result = fd_enable_tunnel($token);
@@ -17744,6 +18194,7 @@ if (str_starts_with($path, '/api/')) {
     }
 
     if ($path === '/api/tunnel/disable' && $method === 'POST') {
+        fd_require_privileged();
         fd_json(fd_disable_tunnel());
     }
 
@@ -18103,7 +18554,8 @@ if (str_starts_with($path, '/api/')) {
             'bot_id' => $hasSession ? $botId : '',
             'bot_username' => $hasSession ? $botUsername : '',
             'bot_name' => $hasSession ? $botName : '',
-            'api_secret' => $hasSession ? fd_get_api_secret() : '',
+            // Cross-system credential: only for the machine itself or a token holder.
+            'api_secret' => ($hasSession && fd_auth_privileged()) ? fd_get_api_secret() : '',
             'device_id' => fd_get_device_id(),
             'bot_count' => count($pool),
             'bot_pool' => $pool,
@@ -18393,6 +18845,66 @@ if (str_starts_with($path, '/api/')) {
             'minimum_version' => $minVersion,
             'update_url' => $updateUrl,
         ], 426);
+    }
+
+    // ── Diagnostics / crash-report endpoints ─────────────────────────────────
+    // GET  /api/diagnostics          -> device info, report counts, auto-send
+    // GET  /api/diagnostics/settings -> read the auto-report toggle
+    // POST /api/diagnostics/settings -> {"auto_report": true|false}
+    // GET  /api/reports[?file=|?send=|?flush=1|?clear=1]
+    if ($path === '/api/diagnostics' && $method === 'GET') {
+        fd_json([
+            'ok'       => 1,
+            'info'     => fd_device_info(),
+            'counts'   => fd_diag_counts(),
+            'reports'  => fd_diag_list(10),
+        ]);
+    }
+
+    if ($path === '/api/diagnostics/settings') {
+        if ($method === 'POST' || isset($_GET['enabled'])) {
+            fd_require_privileged();
+            $input = json_decode((string) file_get_contents('php://input'), true);
+            if (is_array($input) && array_key_exists('auto_report', $input)) {
+                fd_diagnostics_set_auto_report((bool) $input['auto_report']);
+            } elseif (isset($_GET['enabled'])) {
+                $v = trim((string) $_GET['enabled']);
+                fd_diagnostics_set_auto_report($v === '1' || strtolower($v) === 'true' || strtolower($v) === 'on');
+            }
+        }
+        fd_json(['ok' => 1, 'auto_report' => fd_diagnostics_auto_report_enabled()]);
+    }
+
+    if ($path === '/api/reports' && $method === 'GET') {
+        // Deleting or force-sending evidence is an operator action.
+        if (isset($_GET['clear']) || isset($_GET['send']) || isset($_GET['flush'])) {
+            fd_require_privileged();
+        }
+        if (isset($_GET['clear'])) {
+            fd_diag_clear();
+            fd_json(['ok' => 1, 'cleared' => true]);
+        }
+        if (!empty($_GET['send'])) {
+            $rf = basename((string) $_GET['send']);
+            fd_json(['ok' => fd_diag_report_send($rf) ? 1 : 0, 'file' => $rf]);
+        }
+        if (!empty($_GET['flush'])) {
+            fd_json(['ok' => 1, 'sent' => fd_diag_flush_pending()]);
+        }
+        if (!empty($_GET['file'])) {
+            $rf = fd_reports_dir() . DIRECTORY_SEPARATOR . basename((string) $_GET['file']);
+            $row = is_file($rf) ? json_decode((string) @file_get_contents($rf), true) : null;
+            if (!is_array($row)) {
+                fd_json(['ok' => 0, 'message' => 'Report not found'], 404);
+            }
+            fd_json(['ok' => 1, 'report' => $row]);
+        }
+        fd_json([
+            'ok'          => 1,
+            'auto_report' => fd_diagnostics_auto_report_enabled(),
+            'counts'      => fd_diag_counts(),
+            'reports'     => fd_diag_list((int) ($_GET['limit'] ?? 20)),
+        ]);
     }
 
     // ── GET / POST /api/debug-mode — Toggle debug logging ────────────────────
@@ -18913,6 +19425,21 @@ if (str_starts_with($path, '/api/')) {
         $fileMime = trim((string) ($decodedPayload['mime'] ?? ($_GET['mime'] ?? $_POST['mime'] ?? $_GET['mime_type'] ?? $_POST['mime_type'] ?? '')));
         $botId = trim((string) ($decodedPayload['bot_id'] ?? ($_GET['bot_id'] ?? $_POST['bot_id'] ?? '')));
 
+        // A download URL is minted ONCE, so the file_id baked into it goes stale within
+        // hours. Every Range request then re-sent that dead reference: a failed attempt,
+        // a ~3 s WordPress re-resolve, then a retry — measured 6/6 requests paying it.
+        // When an earlier request on this short_code proved an id works, prefer that one.
+        $effBotId = $botId !== '' ? $botId : fd_get_bot_id();
+        if ($shortCode !== '' && $fileId !== '' && $effBotId !== '') {
+            $verifiedEntry = fd_resolve_shortcode_cached($shortCode, $effBotId) ?: [];
+            if (
+                !empty($verifiedEntry['file_id_mt']) && !empty($verifiedEntry['verified_at'])
+                && (time() - (int) $verifiedEntry['verified_at']) < 21600
+            ) {
+                $fileId = (string) $verifiedEntry['file_id_mt'];
+            }
+        }
+
         ini_set('display_errors', '0');
         ini_set('log_errors', '1');
 
@@ -19022,6 +19549,19 @@ if (str_starts_with($path, '/api/')) {
                     'short_code' => $shortCode,
                     'message' => (string) $res['message'],
                 ]);
+                // The most common "I pressed Play and nothing happened": the
+                // origin does not know this short code at all.
+                fd_diag_record(
+                    'playback_incident',
+                    'Download unresolved: ' . ($shortCode !== '' ? $shortCode : 'no short_code'),
+                    (string) $res['message'],
+                    '',
+                    'SHORTCODE_NOT_FOUND',
+                    '',
+                    (string) $shortCode,
+                    0,
+                    ['bot_id' => (string) $botId, 'retried_bots' => count($candidateBots)]
+                );
                 fd_json([
                     'ok' => 0,
                     'message' => (string) $res['message'],
@@ -19119,6 +19659,23 @@ if (str_starts_with($path, '/api/')) {
 
                 header('Cache-Control: no-cache, no-store, must-revalidate');
                 header('Connection: close');
+                // A real user-facing "I pressed Play and it failed": no bot could
+                // resolve this short code. Recorded before the JSON error goes out.
+                fd_diag_record(
+                    'playback_incident',
+                    'Download unresolved: ' . ($shortCode !== '' ? $shortCode : 'no short_code'),
+                    $errMsg,
+                    '',
+                    $statusCode === 403 ? 'NOT_AUTHORIZED' : 'UNRESOLVED',
+                    '',
+                    (string) $shortCode,
+                    0,
+                    [
+                        'bot_id'       => (string) $botId,
+                        'retried_bots' => count($candidateBots),
+                        'status'       => $statusCode,
+                    ]
+                );
                 fd_json([
                     'ok' => 0,
                     'message' => $errMsg,
@@ -19132,6 +19689,15 @@ if (str_starts_with($path, '/api/')) {
         if ($fileId === '') {
             header('Cache-Control: no-cache, no-store, must-revalidate');
             header('Connection: close');
+            fd_diag_record(
+                'playback_incident',
+                'Download failed: no file id',
+                'Neither a Bot API file id nor a resolvable short_code reached the downloader',
+                '',
+                'MISSING_FILE_ID',
+                '',
+                (string) $shortCode
+            );
             fd_json([
                 'ok' => 0,
                 'message' => 'file_id or valid short_code is required for local browser download.',
@@ -19257,6 +19823,14 @@ if (str_starts_with($path, '/api/')) {
                     header('X-Accel-Buffering: no');
                     header('Incremental: ?1');
                 }
+                // In-flight marker: cleared on a successful return AND in the
+                // catch below, so the shutdown handler only sees it when the
+                // process died without either happening.
+                $GLOBALS['fd_diag_download'] = [
+                    'short_code' => $shortCode,
+                    'file_id'    => $fileId,
+                    'started'    => microtime(true),
+                ];
                 fd_log('starting downloadToBrowser', [
                     'file_id' => $fileId,
                     'file_size' => $fileSize,
@@ -19281,8 +19855,19 @@ if (str_starts_with($path, '/api/')) {
                     } catch (Throwable $_t) {
                     }
                 }
+                // Remember the id that actually worked so the next Range request on
+                // this short_code starts from a live reference instead of the stale one
+                // in the URL. Expired again later? The retry path below still handles it.
+                if ($shortCode !== '' && $fileId !== '' && $botId !== '') {
+                    fd_save_resolve_cache($shortCode, $botId, array_merge(
+                        fd_resolve_shortcode_cached($shortCode, $botId) ?: [],
+                        ['file_id_mt' => $fileId, 'file_size' => $fileSize, 'verified_at' => time()]
+                    ));
+                }
+                unset($GLOBALS['fd_diag_download']);
                 return true;
             } catch (Throwable $throwable) {
+                unset($GLOBALS['fd_diag_download']);
                 $errStr = $throwable->getMessage();
                 // Detach the IPC client on the error path too, so a failed
                 // download does not leave a reconnecting client that spawns a
@@ -19427,6 +20012,25 @@ if (str_starts_with($path, '/api/')) {
                         fd_log('download self-heal provision failed', ['error' => $healProv['error']]);
                     }
                 }
+
+                fd_diag_record(
+                    'playback_incident',
+                    'Download failed: ' . (string) ($shortCode ?? ''),
+                    'downloadToBrowser/MadelineProto could not stream this file',
+                    '',
+                    (stripos((string) $errStr, 'FILE_REFERENCE') !== false) ? 'FILE_REFERENCE_EXPIRED'
+                        : ((stripos((string) $errStr, 'session is busy') !== false || stripos((string) $errStr, 'endpoint does not exist') !== false) ? 'IPC_UNREACHABLE'
+                            : ((stripos((string) $errStr, 'FLOOD') !== false || stripos((string) $errStr, 'wait of') !== false) ? 'RATE_LIMITED'
+                                : 'DOWNLOAD_FAILED')),
+                    '',
+                    (string) ($shortCode ?? ''),
+                    0,
+                    [
+                        'bot_id'   => (string) ($botId ?? ''),
+                        'error'    => mb_substr((string) $errStr, 0, 500),
+                        'attempts' => (int) ($downloadAttempt ?? 0),
+                    ]
+                );
 
                 fd_json([
                     'ok' => 0,
