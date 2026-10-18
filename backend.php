@@ -6425,22 +6425,90 @@ function fd_ipc_worker_running(string $sessionDir): bool
  * "session resumed {"elapsed_ms":31024}" + "The endpoint does not exist!"
  * symptom under concurrent load.
  *
- * A worker is ready only when `ipc` is connectable AND `ipcState.php` exists
- * with a non-exception state (the exception state is ~1904 bytes; the success
- * state is ~220-261 bytes).
+ * A worker is ready only when `ipc` is connectable AND `ipcState.php` decodes to
+ * a non-exception state.
+ *
+ * NEVER use a file-size heuristic here. `IpcState` gained properties in
+ * MadelineProto 8.9.0, so the SUCCESS state grew from ~261 bytes to ~3010 bytes
+ * — larger than the ~1904-byte EXCEPTION state of 8.8.x. The old
+ * `filesize() < 1024` test therefore reported every healthy 8.9.0 worker as
+ * "died during boot": fd_ensure_ipc_worker() waited its full 30 s and then
+ * booted anyway, which added ~30 s to the first request of every bot
+ * (observed: `fd_boot_madeline entry` -> `madeline construction` = 30-31 s,
+ * repeatedly, while the session itself resumed in 88-95 ms).
  */
 function fd_ipc_worker_ready(string $sessionDir): bool
 {
     if (!fd_ipc_worker_running($sessionDir)) {
         return false;
     }
-    $stateFile = rtrim($sessionDir, '/\\') . DIRECTORY_SEPARATOR . 'ipcState.php';
+    $base = rtrim($sessionDir, '/\\');
+    $stateFile = $base . DIRECTORY_SEPARATOR . 'ipcState.php';
     if (!is_file($stateFile)) {
         return false;
     }
-    // The exception state is much larger than the success state. Treat a large
-    // state file as "worker died during boot" so the caller can respawn.
-    return filesize($stateFile) < 1024;
+
+    // fd_ipc_worker_ready() is polled (up to ~60 times in one 30s wait), so the
+    // verdict is memoized per (mtime, size): the state file is only rewritten
+    // when the worker changes state.
+    static $cache = [];
+    $sig = @filemtime($stateFile) . ':' . @filesize($stateFile);
+    if (isset($cache[$base]) && $cache[$base][0] === $sig) {
+        return $cache[$base][1];
+    }
+    if (\count($cache) > 32) {
+        $cache = [];
+    }
+
+    $ok = fd_ipc_state_is_success($stateFile);
+    $cache[$base] = [$sig, $ok];
+    return $ok;
+}
+
+/**
+ * Report whether an `ipcState.php` describes a HEALTHY worker, by reading the
+ * serialized `IpcState` payload — no byte-count heuristic, and no MadelineProto
+ * classes.
+ *
+ * `SessionPaths::getIpcState()` was the obvious choice but MUST NOT be used
+ * here: it takes a shared flock and logs "Waiting for shared lock of …" through
+ * `Logger::log()`, and this runs inside the HTTP request (from
+ * fd_ensure_ipc_worker()) before MadelineProto's logger is configured — the
+ * lines landed at the very start of the /api/download response body and
+ * corrupted the stream.
+ *
+ * The payload is `IpcState` with `startupTime`, `startupId` and `exception`
+ * (`?ExitFailure`): PHP serializes the private props as `\0Class\0prop`, so the
+ * exception state contains `exception";O:` while a healthy one contains
+ * `exception";N;`.
+ */
+function fd_ipc_state_is_success(string $stateFile): bool
+{
+    $raw = (string) @file_get_contents($stateFile);
+    // Empty or unrecognised payload = not a published state yet. This is NOT the
+    // same as "failed": the worker may still be booting, so the caller waits.
+    if ($raw === '' || !str_contains($raw, 'MadelineProto\\Ipc\\IpcState')) {
+        return false;
+    }
+    return !str_contains($raw, 'exception";O:');
+}
+
+/**
+ * Whether `ipcState.php` DEFINITIVELY records a failed boot (an `ExitFailure` in
+ * `IpcState::$exception`), as opposed to a worker that is merely still booting
+ * or a state file that cannot be parsed yet.
+ *
+ * Used by fd_ensure_ipc_worker() to stop waiting as soon as a worker has died:
+ * without it a failed boot costs the full 30 s window on every request that
+ * follows it (observed after the 8.9.0 upgrade).
+ */
+function fd_ipc_state_is_failed(string $stateFile): bool
+{
+    $raw = (string) @file_get_contents($stateFile);
+    if ($raw === '' || !str_contains($raw, 'MadelineProto\\Ipc\\IpcState')) {
+        return false;
+    }
+    return str_contains($raw, 'exception";O:');
 }
 
 /**
@@ -6575,10 +6643,20 @@ function fd_ensure_ipc_worker(string $sessionDir, bool $waitForReady = true): bo
     // half-booted worker, which makes MadelineProto's tryConnect() burn its
     // 25 x 1s retry loop (~25-31s) and then fail with "The endpoint does not
     // exist!". Cold Diffie-Hellman + DC handshake regularly exceeds 8s.
+    $stateFile = rtrim($sessionDir, '/\\') . DIRECTORY_SEPARATOR . 'ipcState.php';
     $running = false;
     for ($i = 0; $i < 150; $i++) {
         if (fd_ipc_worker_ready($sessionDir)) {
             $running = true;
+            break;
+        }
+        // A worker that DIED during boot has written the exception state: do not
+        // burn the rest of the window on it. Release the spawn lock and let the
+        // caller (or the next request) respawn immediately.
+        if (fd_ipc_state_is_failed($stateFile)) {
+            fd_log('ipc worker failed during boot (exception state) - not waiting', [
+                'session' => basename(rtrim($sessionDir, '/\\')),
+            ]);
             break;
         }
         usleep(200000); // 200ms
@@ -11326,18 +11404,37 @@ function fd_diag_install_fatal_handlers(): void
         // the /api/download handler never runs and the failure would be invisible.
         $inflight = $GLOBALS['fd_diag_download'] ?? null;
         if (is_array($inflight)) {
+            // Distinguish the two very different causes of "downloadToBrowser()
+            // never returned":
+            //  a) the CLIENT went away (player seek / tab closed / range done) —
+            //     PHP terminates the script on the next write, connection_aborted()
+            //     is true and error_get_last() is empty. This is normal for a media
+            //     player and must NOT be reported as a server crash.
+            //  b) the PHP process actually died (SIGSEGV / OOM) — error_get_last()
+            //     may be empty as well, but the connection was NOT aborted.
+            $clientAborted = connection_aborted() || connection_status() === CONNECTION_ABORTED;
+            $fatal = is_array($err) && !empty($err['message']);
+            $reason = $clientAborted ? 'CLIENT_ABORTED' : ($fatal ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED');
             fd_diag_record(
                 'playback_incident',
-                'Download aborted the PHP worker: ' . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
-                'downloadToBrowser() never returned — the process died mid-request',
+                ($clientAborted ? 'Client stopped the download: ' : 'Download aborted the PHP worker: ')
+                    . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
+                $clientAborted
+                    ? 'downloadToBrowser() was interrupted by the client (seek / closed player / range complete)'
+                    : 'downloadToBrowser() never returned — the process died mid-request',
                 '',
-                is_array($err) && !empty($err['message']) ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED',
+                $reason,
                 '',
                 (string) ($inflight['short_code'] ?? ''),
                 (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
                 [
                     'file_id' => (string) ($inflight['file_id'] ?? ''),
                     'error'   => (string) ($err['message'] ?? ''),
+                    'connection_aborted' => connection_aborted(),
+                    'connection_status'  => connection_status(),
+                    'ignore_user_abort'  => (int) ignore_user_abort(),
+                    'http_response_code' => http_response_code(),
+                    'ob_level'           => ob_get_level(),
                 ]
             );
         }

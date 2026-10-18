@@ -64,13 +64,23 @@ jobs:
       - name: Setup PHP & Composer
         uses: shivammathur/setup-php@v2
         with:
+          # MadelineProto 8.9.0: php-64bit >= 8.2 plus ext-dom/ext-xml/ext-zlib/
+          # ext-json/ext-filter/ext-hash are hard requirements in its composer.json.
+          # They are compiled into the shivammathur builds by default; listing them
+          # makes a silent "requires ext-dom *" failure impossible.
           php-version: "8.2"
-          extensions: mbstring, curl, openssl, fileinfo, zip
+          extensions: mbstring, curl, openssl, fileinfo, zip, dom, xml, zlib, json
           tools: composer
 
       - name: Install Composer dependencies (bundle vendor/)
         run: |
-          composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+          # --no-scripts: cweagans/composer-patches must not run here.
+          # `composer-exit-on-patch-failure: true` (composer.json) makes a patch
+          # failure a HARD error, so on a runner whose `patch` cannot apply this
+          # diff the install would abort the release even though the next step
+          # applies it deterministically anyway. One applier, one source of truth:
+          # install unpatched here, then apply + verify explicitly below.
+          composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-scripts
 
       - name: Apply MadelineProto IPC patch to vendor/ and verify
         run: |
@@ -100,19 +110,28 @@ jobs:
             #
             # Apply in a temp dir OUTSIDE the repo, where there is no index to
             # skip against and git runs in plain-patch mode, then copy back.
-            TMPPKG="$(mktemp -d)"
-            cp -a vendor/danog/madelineproto "$TMPPKG/pkg"
-            if ! ( cd "$TMPPKG/pkg" && git apply --reject -p1 --recount --whitespace=nowarn "$PATCH" ); then
-              # --reject keeps the files it could patch and writes *.rej for the
-              # rest; a partially patched tree is worse than an unpatched one.
-              find "$TMPPKG/pkg" -name '*.rej' -exec sh -c 'echo "=== REJECTED: $1 ==="; cat "$1"' _ {} \;
+            #
+            # IDEMPOTENT: `composer install` already runs cweagans/composer-patches
+            # with `composer-exit-on-patch-failure: true`, and on Linux (GNU patch,
+            # -p1) that SUCCEEDS. Applying a second time makes every hunk a reject
+            # and aborts the release, so check for the patched form first.
+            if grep -q "FD_FORCE_FULL_BOOT" vendor/danog/madelineproto/src/Settings/Ipc.php 2>/dev/null; then
+              echo "MadelineProto patch already applied by Composer - skipping the explicit apply"
+            else
+              TMPPKG="$(mktemp -d)"
+              cp -a vendor/danog/madelineproto "$TMPPKG/pkg"
+              if ! ( cd "$TMPPKG/pkg" && git apply --reject -p1 --recount --whitespace=nowarn "$PATCH" ); then
+                # --reject keeps the files it could patch and writes *.rej for the
+                # rest; a partially patched tree is worse than an unpatched one.
+                find "$TMPPKG/pkg" -name '*.rej' -exec sh -c 'echo "=== REJECTED: $1 ==="; cat "$1"' _ {} \;
+                rm -rf "$TMPPKG"
+                echo "::error::MadelineProto patch did not apply cleanly (hunks rejected) — refusing to build."
+                exit 1
+              fi
+              cp -a "$TMPPKG/pkg/." vendor/danog/madelineproto/
               rm -rf "$TMPPKG"
-              echo "::error::MadelineProto patch did not apply cleanly (hunks rejected) — refusing to build."
-              exit 1
+              echo "MadelineProto patch applied (temp-dir git apply)"
             fi
-            cp -a "$TMPPKG/pkg/." vendor/danog/madelineproto/
-            rm -rf "$TMPPKG"
-            echo "MadelineProto patch applied (temp-dir git apply)"
           fi
 
           # Use PHP for the in-place rewrite: it avoids all shell/sed escaping
