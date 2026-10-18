@@ -15,6 +15,13 @@ set CADDY_EXTRA_CONFIG=
 if not defined GOGC set GOGC=80
 if not defined FD_DOWNLOAD_PARALLEL_CHUNKS set FD_DOWNLOAD_PARALLEL_CHUNKS=4
 
+rem Thread pool (Caddyfile reads both). A client that browses N bridged-upstream
+rem catalogs at once needs N slots, and each cold upstream can hold one for up to
+rem 8s (Amp) + 10s (cURL fallback). At 8/16 every other route (even /api/version)
+rem queued ~1-7s behind them. Raise here, or override per machine.
+if not defined FRANKENPHP_NUM_THREADS set FRANKENPHP_NUM_THREADS=16
+if not defined FRANKENPHP_MAX_THREADS set FRANKENPHP_MAX_THREADS=64
+
 rem Detect LAN IP via default gateway route (avoids virtual adapter IPs)
 set "LAN_IP="
 for /f "tokens=4" %%i in ('route print -4 0.0.0.0 ^| findstr /R /C:" 0\.0\.0\.0[ ]*0\.0\.0\.0"') do (

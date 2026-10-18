@@ -262,6 +262,21 @@ function fd_prune_cache_files(bool $force = false): void
     if (!$force && ($now - $lastPrune) < 300) {
         return;
     }
+    // The static above only lives for ONE request: under FrankenPHP classic mode
+    // PHP statics are reset at request shutdown, so this throttle never fired and
+    // the function globbed every TTL prefix in storage/ and storage/cache on
+    // EVERY request. Measured here with 5,174 files in storage/cache: 528 ms per
+    // request, which is the real reason /api/version sat at ~0.55-0.75 s while the
+    // server was completely idle (Caddy serves a static file in 1.7 ms). Persist
+    // the timestamp so the throttle actually throttles.
+    if (!$force) {
+        $stampPath = fd_cache_path('.prune_stamp');
+        if (is_file($stampPath) && ($now - (int) @filemtime($stampPath)) < 300) {
+            $lastPrune = $now;
+            return;
+        }
+        @touch($stampPath);
+    }
     $lastPrune = $now;
 
     $cacheDir = FD_CACHE_DIR;
@@ -273,7 +288,15 @@ function fd_prune_cache_files(bool $force = false): void
         'stream_cache_'  => 300,    // 5m
         'cat_cache_'     => 600,    // 10m
         'meta_cache_'    => 3600,   // 1h
-        'up_cat_'        => 600,    // 10m
+        // MUST match the freshness window the /catalog/up_* route grants its own
+        // files (3600s in the bridge branch). It used to be 600 here while the
+        // route served a cached body for a full hour, so every 10 minutes the
+        // pruner silently deleted the ENTIRE bridged-upstream catalog cache and
+        // the next browse re-fetched all of them at once — 40-146 upstream
+        // requests, each up to 8s (Amp) + 10s (cURL fallback), against an
+        // 8-thread pool. That cold burst is what made every other route (even
+        // /api/version) queue for 1-1.5s while a client browsed.
+        'up_cat_'        => 3600,   // 1h
         'up_meta_'       => 3600,   // 1h
         'sub_cache_'     => 1800,   // 30m
         'cinemeta_'      => 86400,  // 24h
@@ -1466,7 +1489,19 @@ function fd_auth_load(): array
         // every load and bcrypt is ~230ms on a throttled container.
         $data['env_password'] = true;
     } elseif (empty($data['password_hash'])) {
-        $data['password_hash'] = password_hash(FD_AUTH_DEFAULT_PASSWORD, PASSWORD_DEFAULT);
+        // NEVER bcrypt on the load path. password_hash() measured 419.9 ms on this
+        // machine (and ~230 ms on a throttled container), while fd_auth_load() runs
+        // once per request through fd_auth_enabled() -> fd_is_authenticated(). A
+        // missing hash means "the default password has not been replaced yet", and
+        // fd_auth_verify_password() compares that directly.
+        //
+        // This branch is reachable in the field: a server that once ran with
+        // SERVER_PASSWORD set wrote a file carrying `env_password: true` and NO
+        // hash, and unsetting the env var then made every request pay a bcrypt
+        // that was never persisted — fd_auth_save() only runs when the file is
+        // absent, so the cost repeated forever (≈420 ms × every /api and /stream
+        // request, which reads exactly like "the addon is slow today").
+        $data['password_hash'] = '';
     }
     $envToken = trim((string) (fd_env('SERVER_TOKEN') ?: ''));
     if ($envToken !== '') {
@@ -1540,7 +1575,13 @@ function fd_auth_verify_password(string $pw): bool
         return hash_equals($envPw, $pw);
     }
     $hash = (string) (fd_auth_load()['password_hash'] ?? '');
-    return $hash !== '' && password_verify($pw, $hash);
+    if ($hash === '') {
+        // No stored hash yet: the password is still the default one. Compared
+        // WITHOUT hashing so this path stays bcrypt-free — see fd_auth_load(),
+        // which deliberately leaves the hash empty instead of deriving it.
+        return hash_equals(FD_AUTH_DEFAULT_PASSWORD, $pw);
+    }
+    return password_verify($pw, $hash);
 }
 
 function fd_auth_set_password(string $pw): void
