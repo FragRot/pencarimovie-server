@@ -74,12 +74,16 @@ jobs:
 
       - name: Install Composer dependencies (bundle vendor/)
         run: |
-          # --no-scripts: cweagans/composer-patches must not run here.
-          # `composer-exit-on-patch-failure: true` (composer.json) makes a patch
-          # failure a HARD error, so on a runner whose `patch` cannot apply this
-          # diff the install would abort the release even though the next step
-          # applies it deterministically anyway. One applier, one source of truth:
-          # install unpatched here, then apply + verify explicitly below.
+          # NOTE: --no-scripts does NOT stop cweagans/composer-patches — it hooks a
+          # Composer plugin event, not a script. Verified in run 39148856588: the
+          # patches were applied here ("Applying patches for danog/madelineproto"),
+          # and the explicit step below then correctly skipped itself.
+          #
+          # With `composer-exit-on-patch-failure: true` (composer.json) a patch
+          # failure is now a HARD error, so this install can abort the release on a
+          # runner whose `patch` cannot apply the diff. The idempotent step below is
+          # the safety net for that case; it is skipped when this install already
+          # patched the tree, so there is still exactly one effective applier.
           composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-scripts
 
       - name: Apply MadelineProto IPC patch to vendor/ and verify
