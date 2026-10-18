@@ -71,9 +71,20 @@ jobs:
           # Deploy the exact commit CI checked out.
           git push --force heroku "HEAD:refs/heads/main"
 
-          # Report which release was created so the run is self-verifying.
-          curl -sS -n "https://api.heroku.com/apps/${HEROKU_APP}/releases" \
-            -H "Accept: application/vnd.heroku+json; version=3" \
-            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
-            | head -c 400
-          echo
+          # Report the release that was just created, so the run is
+          # self-verifying. Write to a file first: piping curl straight into
+          # `head -c` closes the pipe early, curl then exits 23 (SIGPIPE write
+          # error) and `set -o pipefail` turns a successful deploy into a red
+          # run. Non-fatal anyway - the push above already printed
+          # "Verifying deploy... done."
+          if curl -sS --max-time 30 \
+               -H "Accept: application/vnd.heroku+json; version=3" \
+               -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+               "https://api.heroku.com/apps/${HEROKU_APP}/releases" \
+               -o /tmp/releases.json; then
+            # `head` still truncates, but it is no longer curl's stdout.
+            grep -o '"version":[0-9]*' /tmp/releases.json | head -n 1 || true
+          else
+            echo "Deploy succeeded; release lookup was skipped."
+          fi
+          echo "Deployed ${HEROKU_APP} at commit ${GITHUB_SHA}."
