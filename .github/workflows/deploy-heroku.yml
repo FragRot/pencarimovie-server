@@ -1,0 +1,79 @@
+name: Deploy to Heroku
+
+# Auto-deploy to Heroku on every push to main.
+#
+# Why this workflow instead of Heroku's own GitHub integration: this app is on
+# the **container** stack (`heroku.yml` -> `Dockerfile`), and the dashboard
+# "Automatic deploys" toggle is only offered for buildpack apps. Pushing the git
+# ref to Heroku is the supported path for container stacks, so CI does exactly
+# what a manual `git push heroku main` does.
+#
+# Required repository secret: HEROKU_API_KEY
+#   Get it with `heroku authorizations:create -d "github-actions pm-server"`
+#   or from https://dashboard.heroku.com/account/applications
+#   Add it with `gh secret set HEROKU_API_KEY` (or Settings -> Secrets -> Actions).
+
+on:
+  push:
+    branches: [main]
+  # Lets you re-deploy without an empty commit (Actions tab -> Run workflow).
+  workflow_dispatch:
+
+# Never run two deploys at once; a later push cancels an in-flight older one.
+concurrency:
+  group: heroku-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Push to Heroku (container stack)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Heroku needs a non-shallow clone to accept the push.
+          fetch-depth: 0
+
+      # Fail fast with a clear message instead of a confusing auth error.
+      - name: Check for HEROKU_API_KEY
+        run: |
+          if [ -z "${{ secrets.HEROKU_API_KEY }}" ]; then
+            echo "::error::Repository secret HEROKU_API_KEY is not set."
+            echo "Create one with: heroku authorizations:create -d \"github-actions\""
+            echo "Then add it:      gh secret set HEROKU_API_KEY"
+            exit 1
+          fi
+
+      # Same syntax gate the repo's own test workflow uses, so a broken build
+      # never reaches Heroku.
+      - name: Validate PHP syntax
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq php-cli
+          php -l backend.php
+          php -l router.php
+          php -l index.php
+
+      - name: Deploy
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_APP: pm-server
+        run: |
+          set -euo pipefail
+
+          # Heroku authenticates with the API key as the password and any
+          # non-empty username. Keeping it in an env var (never in the URL on
+          # disk) avoids leaking it into git config / process listings.
+          git remote add heroku "https://heroku:${HEROKU_API_KEY}@git.heroku.com/${HEROKU_APP}.git"
+
+          # Deploy the exact commit CI checked out.
+          git push --force heroku "HEAD:refs/heads/main"
+
+          # Report which release was created so the run is self-verifying.
+          curl -sS -n "https://api.heroku.com/apps/${HEROKU_APP}/releases" \
+            -H "Accept: application/vnd.heroku+json; version=3" \
+            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+            | head -c 400
+          echo
