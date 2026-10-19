@@ -18160,6 +18160,13 @@ if ($isNuvioRoute) {
             // Diagnostics: "I pressed Play and got nothing" — the most reported
             // user-visible failure, and the two causes need different fixes.
             $diagFiltered = !empty($totalFilesBeforeFilter) && $totalFilesBeforeFilter > 0;
+            // "3 file(s) matched but the active stream filters hid them" is not
+            // actionable without knowing WHICH filters were active — six live rows from
+            // one aarch64 device carried only item_type/title/year, so the cause could
+            // not be told apart from a user's own keyword list. Record the filter config.
+            $diagStreamCfg = (isset($catSettings['stream_config']) && is_array($catSettings['stream_config']))
+                ? $catSettings['stream_config']
+                : [];
             fd_diag_record(
                 'stream_incident',
                 'No playable streams: ' . (string) ($itemId ?? ''),
@@ -18177,6 +18184,22 @@ if ($isNuvioRoute) {
                     'year'                => (string) ($searchedYear ?? ''),
                     'files_before_filter' => (int) ($totalFilesBeforeFilter ?? 0),
                     'streams_built'       => count($streams),
+                    'filter_config'       => $diagFiltered ? [
+                        'resolutions'                => (array) ($diagStreamCfg['resolutions'] ?? []),
+                        'qualities'                  => (array) ($diagStreamCfg['qualities'] ?? []),
+                        'encodes'                    => (array) ($diagStreamCfg['encodes'] ?? []),
+                        'visual_tags'                => (array) ($diagStreamCfg['visual_tags'] ?? []),
+                        'preferred_resolution'       => (string) ($diagStreamCfg['preferred_resolution'] ?? ''),
+                        'max_streams_per_resolution' => (int) ($diagStreamCfg['max_streams_per_resolution'] ?? 0),
+                        'max_streams_total'          => (int) ($diagStreamCfg['max_streams_total'] ?? 0),
+                        'min_size_mb'                => (int) ($diagStreamCfg['min_size_mb'] ?? 0),
+                        'max_size_gb'                => (int) ($diagStreamCfg['max_size_gb'] ?? 0),
+                        'exclude_cam'                => !empty($diagStreamCfg['exclude_cam']),
+                        'exclude_unplayable'         => !empty($diagStreamCfg['exclude_unplayable']),
+                        'exclude_part_title'         => !empty($diagStreamCfg['exclude_part_title']),
+                        'excluded_keywords'          => (string) ($diagStreamCfg['excluded_keywords'] ?? ''),
+                        'required_keywords'          => (string) ($diagStreamCfg['required_keywords'] ?? ''),
+                    ] : null,
                 ]
             );
 
