@@ -11410,7 +11410,14 @@ function fd_diag_counts(): array
 {
     $out = [];
     foreach (glob(fd_reports_dir() . DIRECTORY_SEPARATOR . '*.json') ?: [] as $path) {
-        $type = explode('_', basename($path))[0];
+        // Report files are "<type>_<unix_ms>.json". Splitting on '_' and taking [0]
+        // reported "playback" / "stream" instead of "playback_incident" /
+        // "stream_incident", so the Diagnostics dialog never showed the four
+        // documented categories. Strip ONLY the trailing timestamp.
+        $type = preg_replace('/_\d+\.json$/', '', basename($path));
+        if ($type === null || $type === '') {
+            $type = basename($path);
+        }
         $out[$type] = ($out[$type] ?? 0) + 1;
     }
     return $out;
@@ -11455,29 +11462,72 @@ function fd_diag_install_fatal_handlers(): void
             //     may be empty as well, but the connection was NOT aborted.
             $clientAborted = connection_aborted() || connection_status() === CONNECTION_ABORTED;
             $fatal = is_array($err) && !empty($err['message']);
-            $reason = $clientAborted ? 'CLIENT_ABORTED' : ($fatal ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED');
-            fd_diag_record(
-                'playback_incident',
-                ($clientAborted ? 'Client stopped the download: ' : 'Download aborted the PHP worker: ')
-                    . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
-                $clientAborted
-                    ? 'downloadToBrowser() was interrupted by the client (seek / closed player / range complete)'
-                    : 'downloadToBrowser() never returned — the process died mid-request',
-                '',
-                $reason,
-                '',
-                (string) ($inflight['short_code'] ?? ''),
-                (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
-                [
-                    'file_id' => (string) ($inflight['file_id'] ?? ''),
-                    'error'   => (string) ($err['message'] ?? ''),
-                    'connection_aborted' => connection_aborted(),
-                    'connection_status'  => connection_status(),
-                    'ignore_user_abort'  => (int) ignore_user_abort(),
-                    'http_response_code' => http_response_code(),
-                    'ob_level'           => ob_get_level(),
-                ]
-            );
+
+            // A client going away is the NORMAL end of most requests: the player fills
+            // its buffer (or does a seek) and closes while the script is mid-write, so
+            // PHP kills it before downloadToBrowser() returns. Reporting each one made
+            // the table useless — one user watching four titles produced 24
+            // playback_incident rows in 15 minutes, which buried every real failure.
+            //
+            // What IS worth an incident is a RETRY LOOP: the same item aborting 3+ times
+            // inside a minute, the signature of a stream the player refuses outright
+            // (e.g. an MPEG-TS file advertised as .mp4 re-opens every ~2s forever).
+            // Count first, report from the third abort on.
+            $abortCount = 0;
+            $reportIt = !$clientAborted;
+            if ($clientAborted) {
+                $abortKey = md5((string) ($inflight['short_code'] ?? '') . '|' . (string) ($inflight['file_id'] ?? ''));
+                $abortFile = fd_cache_path('abort_' . $abortKey . '.json');
+                $recent = [];
+                if (is_file($abortFile)) {
+                    $decoded = json_decode((string) @file_get_contents($abortFile), true);
+                    if (is_array($decoded)) {
+                        $recent = $decoded;
+                    }
+                }
+                $cutoff = time() - 60;
+                $recent = array_values(array_filter(
+                    $recent,
+                    static fn($t): bool => (int) $t >= $cutoff
+                ));
+                $recent[] = time();
+                @file_put_contents($abortFile, json_encode($recent), LOCK_EX);
+                $abortCount = count($recent);
+                $reportIt = $abortCount >= 3;
+                if (!$reportIt) {
+                    fd_log('client abort (normal seek/close), not reported', [
+                        'short_code'      => (string) ($inflight['short_code'] ?? ''),
+                        'aborts_last_60s' => $abortCount,
+                    ]);
+                }
+            }
+
+            if ($reportIt) {
+                $reason = $clientAborted ? 'CLIENT_ABORTED' : ($fatal ? 'WORKER_CRASHED_FATAL' : 'WORKER_CRASHED');
+                fd_diag_record(
+                    'playback_incident',
+                    ($clientAborted ? 'Client stopped the download: ' : 'Download aborted the PHP worker: ')
+                        . (string) ($inflight['short_code'] ?? $inflight['file_id'] ?? ''),
+                    $clientAborted
+                        ? 'The player reopened this item ' . $abortCount . 'x in 60s without finishing'
+                        : 'downloadToBrowser() never returned — the process died mid-request',
+                    '',
+                    $reason,
+                    '',
+                    (string) ($inflight['short_code'] ?? ''),
+                    (int) round((microtime(true) - (float) ($inflight['started'] ?? microtime(true))) * 1000),
+                    [
+                        'file_id' => (string) ($inflight['file_id'] ?? ''),
+                        'error'   => (string) ($err['message'] ?? ''),
+                        'aborts_last_60s'    => $abortCount,
+                        'connection_aborted' => connection_aborted(),
+                        'connection_status'  => connection_status(),
+                        'ignore_user_abort'  => (int) ignore_user_abort(),
+                        'http_response_code' => http_response_code(),
+                        'ob_level'           => ob_get_level(),
+                    ]
+                );
+            }
         }
 
         // (b) A genuine PHP fatal.
