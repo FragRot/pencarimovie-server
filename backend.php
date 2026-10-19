@@ -19844,6 +19844,23 @@ if (str_starts_with($path, '/api/')) {
                 if (stripos($errMsg, 'not allowed') !== false || stripos($errMsg, 'unauthorized') !== false || stripos($errMsg, 'forbidden') !== false) {
                     $statusCode = 403;
                 }
+                // A rate limit is RETRYABLE and must not be reported as 404 / UNRESOLVED.
+                // Live rows from a Termux build (app 2.8.8, short_code r3dkc6) showed
+                // "Upstream Telegram rate limit, please retry shortly." recorded four
+                // times in 54s as status=404 reason=UNRESOLVED — so the client treats the
+                // file as gone, and the incident hides that the real cause was a flood
+                // wait. 429 + Retry-After is what a retryable failure looks like.
+                if ($statusCode === 404 && (
+                    stripos($errMsg, 'rate limit') !== false
+                    || stripos($errMsg, 'too many') !== false
+                    || stripos($errMsg, 'flood') !== false
+                    || stripos($errMsg, 'retry shortly') !== false
+                    || stripos($errMsg, 'try again in') !== false
+                    || stripos($errMsg, 'wait of') !== false
+                )) {
+                    $statusCode = 429;
+                    header('Retry-After: 15');
+                }
 
                 header('Cache-Control: no-cache, no-store, must-revalidate');
                 header('Connection: close');
@@ -19854,7 +19871,7 @@ if (str_starts_with($path, '/api/')) {
                     'Download unresolved: ' . ($shortCode !== '' ? $shortCode : 'no short_code'),
                     $errMsg,
                     '',
-                    $statusCode === 403 ? 'NOT_AUTHORIZED' : 'UNRESOLVED',
+                    $statusCode === 403 ? 'NOT_AUTHORIZED' : ($statusCode === 429 ? 'RATE_LIMITED' : 'UNRESOLVED'),
                     '',
                     (string) $shortCode,
                     0,
