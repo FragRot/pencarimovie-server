@@ -226,6 +226,30 @@ jobs:
           tar -C dist/.build-tmp -czf dist/pencarimovie-server.tar.gz pencarimovie-server
           rm -rf dist/.build-tmp
 
+          # Shared-hosting (cPanel / Apache) package. No bin/, patches/, scripts/ —
+          # those either need a process-capable host or are release tooling.
+          # install.php is the one-file installer (upload it alone, or unzip this
+          # package with File Manager); .htaccess is mandatory because without it
+          # storage/api_secret.key and the MadelineProto session are downloadable.
+          # SHARED-HOSTING.md is the end-user tutorial.
+          rm -rf dist/.hs-tmp
+          mkdir -p dist/.hs-tmp/storage/cache dist/.hs-tmp/storage/sessions dist/.hs-tmp/storage/reports dist/.hs-tmp/storage/bin
+          cp index.php backend.php composer.json .htaccess install.php SHARED-HOSTING.md dist/.hs-tmp/ 2>/dev/null || true
+          cp -r public vendor dist/.hs-tmp/
+          cp storage/.gitkeep dist/.hs-tmp/storage/.gitkeep 2>/dev/null || true
+          # The version stamp is what stops the WordPress gate answering
+          # "Update required" for every /stream request on a fresh upload.
+          if [ -f ".release-tag" ]; then cp .release-tag dist/.hs-tmp/; fi
+          ( cd dist/.hs-tmp && zip -qr ../pencarimovie-shared-hosting.zip . )
+          rm -rf dist/.hs-tmp
+          for must in vendor/autoload.php index.php install.php .htaccess .release-tag; do
+            if ! unzip -l dist/pencarimovie-shared-hosting.zip | grep -q "$must"; then
+              echo "::error::pencarimovie-shared-hosting.zip is missing $must"
+              exit 1
+            fi
+          done
+          echo "Verified: pencarimovie-shared-hosting.zip contains vendor/, the installer, .htaccess and .release-tag"
+
           # Verify Windows package integrity (must contain bin/php.ini with extension=fileinfo)
           if [ -f "dist/pencarimovie-downloader-windows-x86_64.zip" ]; then
             if ! unzip -l dist/pencarimovie-downloader-windows-x86_64.zip | grep -q "bin/php.ini"; then
@@ -248,6 +272,12 @@ jobs:
             sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
             echo "sidecar: $f.sha256"
           done
+          # Same sidecar shape for the shared-hosting package, so every zip/tar in
+          # the release has one alongside it.
+          if [ -f dist/pencarimovie-shared-hosting.zip ]; then
+            sha256sum dist/pencarimovie-shared-hosting.zip | cut -d' ' -f1 > dist/pencarimovie-shared-hosting.zip.sha256
+            echo "sidecar: dist/pencarimovie-shared-hosting.zip.sha256"
+          fi
 
           echo "Release archives in dist/:"
           ls -lh dist/
