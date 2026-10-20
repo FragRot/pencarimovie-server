@@ -450,7 +450,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build image
-        run: docker build -f Dockerfile.rust -t pencarimovie-server:native .
+        run: docker build -f Dockerfile -t pencarimovie-server:native .
 
       - name: Smoke test (version + dashboard)
         run: |

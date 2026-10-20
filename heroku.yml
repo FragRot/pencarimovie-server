@@ -6,6 +6,6 @@
 # marker and keeps state under PM_APP_ROOT (/data, set in the image).
 build:
   docker:
-    web: Dockerfile.rust
+    web: Dockerfile
 run:
   web: pencarimovie-server
