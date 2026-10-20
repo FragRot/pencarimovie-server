@@ -276,7 +276,7 @@ img {
 
 .stream-hero__backdrop {
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background-size: cover;
     background-position: center top;
     transition: opacity 0.8s ease;
@@ -292,7 +292,7 @@ img {
 
 .stream-hero__gradient {
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background: linear-gradient(
         180deg,
         rgba(20,20,20,0.3) 0%,
@@ -528,7 +528,7 @@ img {
 
 .stream-card__overlay {
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background: linear-gradient(0deg, rgba(0,0,0,0.85) 0%, transparent 50%);
     opacity: 0;
     transition: opacity var(--transition);
@@ -595,7 +595,7 @@ img {
 /* ── Search Overlay ───────────────────────────────────────── */
 .stream-search-overlay {
     position: fixed;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     z-index: 1500;
     background: var(--bg-primary);
     display: flex;
@@ -849,7 +849,7 @@ img {
 
 .stream-file-card__overlay {
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background: rgba(0, 0, 0, 0.4);
     display: flex;
     align-items: center;
@@ -953,7 +953,7 @@ img {
 /* ── Detail Modal ─────────────────────────────────────────── */
 .stream-modal {
     position: fixed;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     z-index: 1800;
     display: flex;
     align-items: center;
@@ -973,7 +973,7 @@ img {
 
 .stream-modal__backdrop {
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background: var(--overlay);
     backdrop-filter: blur(4px);
 }
@@ -1027,7 +1027,7 @@ img {
 .stream-modal__hero::after {
     content: '';
     position: absolute;
-    inset: 0;
+    top: 0; right: 0; bottom: 0; left: 0;
     background: linear-gradient(0deg, var(--bg-secondary) 0%, transparent 50%);
 }
 
