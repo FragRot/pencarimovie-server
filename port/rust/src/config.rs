@@ -22,7 +22,10 @@ pub fn wp_version_url() -> String {
     format!("{}/version", wp_api_base())
 }
 
-pub const WP_AJAX_URL: &str = "https://pencarimovie.com/wp-admin/admin-ajax.php";
+// There is deliberately NO `admin-ajax.php` URL here. The PHP runtime proxied
+// the dashboard's `stream_*` AJAX actions; this port reads the same data from
+// the plugin's REST namespace (`wp_api_base()`), which is what every route
+// already uses.
 
 pub const AUTH_DEFAULT_PASSWORD: &str = "123456";
 pub const AUTH_COOKIE: &str = "pm_auth";
@@ -64,6 +67,36 @@ pub fn app_version() -> String {
         }
     }
     build_id().to_string()
+}
+
+/// The version in `X.Y.Z` form, for the places that REQUIRE a plain version —
+/// the addon descriptor's `version`, which Stremio/Nuvio parse and display.
+///
+/// A `git describe` stamp (`2.8.8-6-ge36d439-dirty`) is not a descriptor
+/// version, and the manifest used to hardcode `1.0.0`, so every client showed
+/// the addon as the first release forever no matter which build was installed.
+pub fn semver() -> String {
+    let raw = app_version();
+    let head = raw.trim().trim_start_matches('v');
+    let head = head.split(['-', '+']).next().unwrap_or(head);
+    let mut parts: Vec<String> = head
+        .split('.')
+        .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
+        .collect();
+    // A bare commit sha (`--always` when no tag exists) carries no version.
+    if parts.len() < 2 || parts[0].is_empty() {
+        return env!("CARGO_PKG_VERSION").to_string();
+    }
+    for p in parts.iter_mut() {
+        if p.is_empty() {
+            p.push('0');
+        }
+    }
+    while parts.len() < 3 {
+        parts.push("0".to_string());
+    }
+    parts.truncate(3);
+    parts.join(".")
 }
 
 /// The port reports its own identity in the user agent; the PHP uses

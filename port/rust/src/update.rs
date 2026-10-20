@@ -84,6 +84,19 @@ async fn latest_release() -> Value {
 /// `GET /api/update/check` — never downloads anything.
 pub async fn check() -> Value {
     let current = config::app_version();
+    // On Android this binary is INSIDE the APK, so a newer server release is not
+    // something this process can install — offering it would show "Update
+    // available" on the dashboard forever, with an "Update now" that cannot work.
+    // The APK has its own updater (`UpdateChecker` in the app shell).
+    if cfg!(target_os = "android") {
+        return serde_json::json!({
+            "ok": false,
+            "app_managed": true,
+            "current": current,
+            "build": config::build_id(),
+            "error": "Updates are handled by the PencariMovie Server app on Android.",
+        });
+    }
     let release = latest_release().await;
     if release.is_null() {
         return serde_json::json!({

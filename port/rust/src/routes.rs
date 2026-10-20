@@ -32,7 +32,7 @@ use crate::auth::{
     auth_token, auth_verify_password, is_authenticated, is_https_request, parse_cookies,
     require_privileged, strip_token_prefix, url_host_is_public,
 };
-use crate::config::{AUTH_DEFAULT_PASSWORD, WP_AJAX_URL, app_version, wp_api_base, wp_version_url};
+use crate::config::{AUTH_DEFAULT_PASSWORD, app_version, wp_api_base, wp_version_url};
 use crate::credentials::{clear_api_secret, get_api_secret};
 use crate::diagnostics::{
     auto_report_enabled, clear as diag_clear, counts as diag_counts, device_info,
@@ -51,7 +51,7 @@ use crate::respond::{
     stremio_locked_stream, text_response,
 };
 use crate::session::{
-    add_pool_bot, auto_provision_guest, clear_session, get_bot_id, get_bot_pool,
+    add_pool_bot, auto_provision_guest, clear_session, clock_skew_message, get_bot_id, get_bot_pool,
     has_local_session, is_guest_provision_in_progress, load_session_meta, measure_clock_offset,
     remove_pool_bot, save_session_meta,
 };
@@ -1238,14 +1238,18 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             }
             qs.finish()
         };
+        // REST, not `admin-ajax.php`: the same mapping `wp_data::fetch_stream_ajax`
+        // uses (`posts` -> `/posts`, `post_files` -> `/post-files`). The AJAX bridge
+        // was the old PHP dashboard's transport, and keeping it here meant the port
+        // still depended on a PHP endpoint that no other route touches. This route
+        // exists only so the shell can read the origin without CORS.
         let url = format!(
-            "{}?action=stream_{}&{}",
-            WP_AJAX_URL,
-            urlencode_component(&action),
+            "{}/{}?{}",
+            wp_api_base().trim_end_matches('/'),
+            action.replace('_', "-"),
             query_string
         );
         let mut extra = HashMap::new();
-        extra.insert("X-Requested-With".to_string(), "XMLHttpRequest".to_string());
         extra.insert("Accept".to_string(), "application/json".to_string());
         let body = get_contents(&url, 15, extra).await;
         return match body {
@@ -1602,6 +1606,74 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             return stremio_json(200, &hit, "no-store");
         }
     }
+
+    // NO BOT SESSION -> a TAPPABLE CARD, never an empty list.
+    //
+    // backend.php answers a stream ITEM here because Stremio/Nuvio render a
+    // stream's `description` and never an HTTP error body; this port had no gate
+    // at all, so with no session every title fell through to the origin search
+    // and answered `{"streams":[]}` — indistinguishable from "this title has no
+    // sources", and it never told the user a guest bot was being provisioned.
+    //
+    // Only the clock probe runs inline (one unauthenticated request, ~150ms: a
+    // skewed clock breaks the MTProto handshake, so it must be diagnosed BEFORE
+    // provisioning). The provisioner itself is spawned, exactly like
+    // `fd_spawn_guest_provision()`, so this response is immediate.
+    if !has_local_session("") {
+        let base = ctx.base_url.trim_end_matches('/');
+        let clock = measure_clock_offset().await;
+        if clock.ok && clock.offset.abs() > 30 {
+            log(
+                "stream blocked: clock skew",
+                &serde_json::json!({"offset_seconds": clock.offset}),
+            );
+            return stremio_json(
+                200,
+                &serde_json::json!({
+                    "streams": [{
+                        "name": "PencariMovie",
+                        "description": format!(
+                            "{}\nTap to open PencariMovie and re-check the clock, then retry.",
+                            clock_skew_message(clock.offset)
+                        ),
+                        "externalUrl": format!("{}/#settings", base),
+                    }]
+                }),
+                "no-store",
+            );
+        }
+        let already = is_guest_provision_in_progress();
+        if !already {
+            let st = state.clone();
+            tokio::spawn(async move {
+                let _ = auto_provision_guest(&st.telegram).await;
+            });
+        }
+        log(
+            "stream blocked: provisioning guest bot",
+            &serde_json::json!({"already_running": already, "type": item_type, "id": item_id}),
+        );
+        return stremio_json(
+            200,
+            &serde_json::json!({
+                "streams": [{
+                    "name": "PencariMovie",
+                    "description": format!(
+                        "{}\n⏳ {} a guest Telegram bot — this takes a few seconds. Reopen this title in a moment.",
+                        if already {
+                            "Telegram bot not connected yet."
+                        } else {
+                            "Telegram bot not connected."
+                        },
+                        if already { "Still provisioning" } else { "Provisioning" }
+                    ),
+                    "externalUrl": format!("{}/#settings", base),
+                }]
+            }),
+            "no-store",
+        );
+    }
+
     let is_direct = item_id.starts_with("pm_file_") || item_id.starts_with("pm:file:");
     let code = item_id
         .strip_prefix("pm_file_")
@@ -4022,9 +4094,12 @@ async fn manifest(base_url: &str) -> Value {
 
     let doc = serde_json::json!({
         "id": format!("org.pencarimovie.addon.{}", mode),
-        "version": "1.0.0",
+        // The real build version, not "1.0.0": Stremio/Nuvio parse and DISPLAY
+        // this, and a fixed value made every install look like the first release
+        // (some clients also treat it as "already at that version").
+        "version": crate::config::semver(),
         "name": "PencariMovie",
-        "description": format!("PencariMovie Server — local downloader and streaming addon — {}", base_url),
+        "description": "Telegram movie, series and music catalogs with 4K streaming, subtitles and direct downloads.",
         "resources": resources,
         "types": types,
         // `tvdb:` / `anilist:` / `kitsu` are declared so a row bridged from an
@@ -4033,8 +4108,10 @@ async fn manifest(base_url: &str) -> Value {
         // leaving the client with no addon to ask.
         "idPrefixes": ["pm:", "pm_", "tt", "tmdb:", "kitsu:", "kitsu", "mal:", "anilist:", "tvdb:"],
         "catalogs": catalogs,
-        "logo": format!("{}/logo.png", rtrim(base_url)),
-        "background": format!("{}/logo.png", rtrim(base_url)),
+        // A path that EXISTS in the embedded `public/`: the old `/logo.png`
+        // 404s, so clients showed a broken logo (and an empty background).
+        "logo": format!("{}/assets/images/icon.png", rtrim(base_url)),
+        "background": format!("{}/assets/images/icon.png", rtrim(base_url)),
         "behaviorHints": {},
     });
     upstream::fit_descriptor(doc, local_count)
