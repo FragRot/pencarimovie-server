@@ -95,14 +95,12 @@ fn id_of(v: &Value) -> String {
 
 /// How many bytes the FIRST response writes before it starts streaming.
 ///
-/// It used to be a whole 1 MB window, which is what makes a SEEK feel like
-/// buffering: the player aborts, asks for a far offset, and the server pulls a
-/// full megabyte before writing byte one — 2.5 s at the ~400 KB/s a phone sees
-/// from the DC. 256 KB keeps the part legal (multiple of 4096, and a divisor of
-/// the 1 MB window) while cutting that wait ~4x; the rest of the window follows
-/// immediately so later windows stay exactly 1 MB-aligned and steady-state
-/// throughput is untouched.
-const PRIME_BYTES: u64 = 256 * 1024;
+/// A whole 1 MB window means the player waits for a megabyte before byte one
+/// (~2.5 s at the throughput a phone sees), which reads as buffering after a
+/// seek. 512 KB halves that wait and still costs exactly the SAME two parts for
+/// window 0 (512 KB prime + 512 KB remainder), so steady-state throughput is
+/// untouched — 256 KB was one part more per window 0 for no extra benefit.
+const PRIME_BYTES: u64 = 512 * 1024;
 
 /// How many 1 MB windows to keep in flight per stream.
 ///
@@ -1117,7 +1115,24 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         .buffered(pipeline);
 
         futures_util::pin_mut!(stream);
-        while let Some((index, result)) = stream.next().await {
+        loop {
+            // A seek or a closed tab drops the receiver. Waiting for the next
+            // WINDOW to notice means up to `pipeline_depth` megabytes of
+            // Telegram parts keep holding their `--inflight` permits while the
+            // request the player just opened queues behind them — measured on a
+            // phone as ttfb 1.0-5.2 s and 58-78 KB/s with a second stream open.
+            // Selecting on `tx.closed()` drops them at once.
+            //
+            // (`tokio::select!` cannot sit directly inside a `let ... else`, so
+            // it assigns first.)
+            let mut next_item = None;
+            tokio::select! {
+                _ = tx.closed() => return,
+                n = stream.next() => next_item = n,
+            }
+            let Some((index, result)) = next_item else {
+                break;
+            };
             let mut data = match result {
                 Ok(d) => d,
                 Err(e) => {
