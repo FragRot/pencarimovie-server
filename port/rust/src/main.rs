@@ -373,11 +373,14 @@ fn open_browser(url: &str) {
 }
 
 /// One-line build identity, printed by `--version`:
-/// `pencarimovie-server 2.7.9 (rustc 1.99.1, aarch64-android)`.
+/// `pencarimovie-server 1.0.50-3-g9fc84e1 (build 9fc84e1, rustc 1.99.1, x86_64-windows)`.
+/// The first field is what this install reports (`/api/version` → `current_version`);
+/// the second is the git state the binary was compiled from.
 fn version_line() -> String {
     format!(
-        "pencarimovie-server {} (rustc {}, {}-{})",
+        "pencarimovie-server {} (build {}, rustc {}, {}-{})",
         config::app_version(),
+        config::build_id(),
         rustc_version(),
         std::env::consts::ARCH,
         std::env::consts::OS

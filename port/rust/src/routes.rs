@@ -4065,6 +4065,10 @@ async fn check_version() -> Value {
                 "client_version".to_string(),
                 serde_json::json!(crate::config::client_version()),
             );
+            obj.insert(
+                "build".to_string(),
+                serde_json::json!(crate::config::build_id()),
+            );
         }
         return v;
     }

@@ -374,6 +374,11 @@ jobs:
             artifact: macos-aarch64
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `build.rs` stamps `git describe --tags` in as the build version, which
+          # needs the tags (a depth-1 clone has none, so it would fall back to a
+          # bare sha for every artifact).
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 

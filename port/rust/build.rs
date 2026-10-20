@@ -71,10 +71,43 @@ fn walk(dir: &Path, acc: &mut u64) {
     }
 }
 
+/// The build's own version, taken from git so every artifact is traceable.
+///
+/// Order: `PM_BUILD_VERSION` (release pipelines can pin it) → `git describe
+/// --tags --always --dirty` → `CARGO_PKG_VERSION`. `git` is absent inside some
+/// container build contexts, so a failure here falls through instead of breaking
+/// the build.
+fn build_version(manifest_dir: &Path) -> String {
+    if let Ok(v) = std::env::var("PM_BUILD_VERSION") {
+        let v = v.trim().trim_start_matches('v').to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let described = std::process::Command::new("git")
+        .args(["describe", "--tags", "--always", "--dirty"])
+        .current_dir(manifest_dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !described.is_empty() {
+        return described.trim_start_matches('v').to_string();
+    }
+    std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0-dev".to_string())
+}
+
 fn main() {
-    let public = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let public = manifest.join("../../public");
     let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
     walk(&public, &mut acc);
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=PM_PUBLIC_FINGERPRINT={:016x}", acc);
+    // Exported as the engine version *and* as a fingerprint input: a new commit
+    // must change the version string even when no tracked file was touched.
+    let version = build_version(manifest);
+    println!("cargo:rustc-env=PM_BUILD_VERSION={}", version);
+    println!("cargo:rerun-if-env-changed=PM_BUILD_VERSION");
 }

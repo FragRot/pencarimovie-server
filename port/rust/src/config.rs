@@ -27,6 +27,13 @@ pub const WP_AJAX_URL: &str = "https://pencarimovie.com/wp-admin/admin-ajax.php"
 pub const AUTH_DEFAULT_PASSWORD: &str = "123456";
 pub const AUTH_COOKIE: &str = "pm_auth";
 
+/// The version this binary was BUILT from — `build.rs` stamps `git describe
+/// --tags --always --dirty` into it, so every artifact is traceable even when
+/// nothing was tagged. `PM_BUILD_VERSION` at build time overrides that.
+pub fn build_id() -> &'static str {
+    option_env!("PM_BUILD_VERSION").unwrap_or("0.0.0-dev")
+}
+
 /// The version of the APP SHELL that started us (the Android APK's versionName),
 /// passed as `--app-version` / `PM_APP_VERSION`. `/api/version` reports it so the
 /// dashboard can show what the user actually installed; without it the page only
@@ -44,8 +51,10 @@ pub fn client_version() -> String {
     CLIENT_VERSION.get().cloned().unwrap_or_default()
 }
 
-/// `FD_APP_VERSION`: `<appRoot>/.release-tag` (v-prefix stripped) or the 2.7.9
-/// fallback the PHP uses for a shared-hosting upload with no stamp.
+/// `FD_APP_VERSION`: `<appRoot>/.release-tag` (v-prefix stripped) when the
+/// install was stamped by the OTA updater, otherwise the version the binary was
+/// BUILT from (`git describe`). The old hardcoded "2.7.9" made every native
+/// build — whatever commit it came from — report the same number.
 pub fn app_version() -> String {
     use std::fs;
     if let Ok(tag) = fs::read_to_string(app_root().join(".release-tag")) {
@@ -54,7 +63,7 @@ pub fn app_version() -> String {
             return t.trim_start_matches('v').to_string();
         }
     }
-    "2.7.9".to_string()
+    build_id().to_string()
 }
 
 /// The port reports its own identity in the user agent; the PHP uses
