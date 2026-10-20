@@ -306,7 +306,7 @@ download_extract() {
   if [ "$target" = "server" ]; then
     url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
   else
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-downloader-$target.tar.gz"
+    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server-$target.tar.gz"
     fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
   fi
   local tmp src
