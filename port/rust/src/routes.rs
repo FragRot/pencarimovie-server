@@ -774,7 +774,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "environment_fatal": false,
                 "environment_problems": [],
                 "environment_hints": [],
-                "runtime": "rust-grammers",
+                // Neutral label: this is shown in the dashboard's bot/session
+                // card, so it must not name the engine.
+                "runtime": "pencarimovie-server",
             }),
         );
     }
@@ -4094,10 +4096,11 @@ async fn manifest(base_url: &str) -> Value {
 
     let doc = serde_json::json!({
         "id": format!("org.pencarimovie.addon.{}", mode),
-        // The real build version, not "1.0.0": Stremio/Nuvio parse and DISPLAY
-        // this, and a fixed value made every install look like the first release
-        // (some clients also treat it as "already at that version").
-        "version": crate::config::semver(),
+        // The APP version (`1.0.52` on Android), not "1.0.0" and not the engine's
+        // `git describe`: Stremio/Nuvio parse and DISPLAY this, so a fixed value
+        // made every install look like the first release, and an engine stamp
+        // made every APK release look like the same addon version.
+        "version": crate::config::descriptor_version(),
         "name": "PencariMovie",
         "description": "Telegram movie, series and music catalogs with 4K streaming, subtitles and direct downloads.",
         "resources": resources,

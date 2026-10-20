@@ -272,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
             "max_streams": max_streams,
             "storage": storage::storage_dir().display().to_string(),
             "version": config::app_version(),
-            "runtime": format!("rustc {}", rustc_version()),
+            "runtime": format!("pencarimovie-server {}", config::app_version()),
             "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
         })),
     );

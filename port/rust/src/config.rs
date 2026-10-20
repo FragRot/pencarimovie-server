@@ -60,6 +60,13 @@ pub fn client_version() -> String {
 /// build — whatever commit it came from — report the same number.
 pub fn app_version() -> String {
     use std::fs;
+    // The app shell's own versionName wins when it told us (`--app-version`).
+    // On Android `.release-tag` can be a leftover from the OLD PHP install — it
+    // is why a 1.0.5x APK reported `app_version: "2.7.9"` in every diagnostic.
+    let client = client_version();
+    if !client.is_empty() {
+        return client;
+    }
     if let Ok(tag) = fs::read_to_string(app_root().join(".release-tag")) {
         let t = tag.trim();
         if !t.is_empty() {
@@ -75,8 +82,7 @@ pub fn app_version() -> String {
 /// A `git describe` stamp (`2.8.8-6-ge36d439-dirty`) is not a descriptor
 /// version, and the manifest used to hardcode `1.0.0`, so every client showed
 /// the addon as the first release forever no matter which build was installed.
-pub fn semver() -> String {
-    let raw = app_version();
+fn xyz(raw: &str) -> Option<String> {
     let head = raw.trim().trim_start_matches('v');
     let head = head.split(['-', '+']).next().unwrap_or(head);
     let mut parts: Vec<String> = head
@@ -85,7 +91,7 @@ pub fn semver() -> String {
         .collect();
     // A bare commit sha (`--always` when no tag exists) carries no version.
     if parts.len() < 2 || parts[0].is_empty() {
-        return env!("CARGO_PKG_VERSION").to_string();
+        return None;
     }
     for p in parts.iter_mut() {
         if p.is_empty() {
@@ -96,13 +102,30 @@ pub fn semver() -> String {
         parts.push("0".to_string());
     }
     parts.truncate(3);
-    parts.join(".")
+    Some(parts.join("."))
+}
+
+pub fn semver() -> String {
+    xyz(&app_version()).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// The version a CLIENT should DISPLAY (the addon descriptor's `version`).
+///
+/// On Android the app shell passes its own `versionName` as `--app-version`
+/// (e.g. `1.0.52`) and that is the real product version; the engine's
+/// `git describe` (`2.8.8-14-g…`) is an internal detail that never changes
+/// between APK releases. Reporting the engine made every app update look like
+/// the same addon version on the device.
+pub fn descriptor_version() -> String {
+    xyz(&client_version()).unwrap_or_else(semver)
 }
 
 /// The port reports its own identity in the user agent; the PHP uses
 /// `pencarimovie-server/<version>` and the WordPress logs show it.
 pub fn user_agent() -> String {
-    format!("pencarimovie-server/{} (rust)", app_version())
+    // No engine suffix: this string is sent to the origin and shows up in ITS
+    // logs and dashboards, so it must read as the product, nothing else.
+    format!("pencarimovie-server/{}", app_version())
 }
 
 pub fn imdb_aka_api_base() -> String {

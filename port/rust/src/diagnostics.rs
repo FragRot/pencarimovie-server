@@ -186,7 +186,7 @@ pub fn device_info() -> Value {
         "process_rss_mb": rss_kb / 1024,
         "open_fds": fd_count,
         "uptime_s": uptime_s,
-        "runtime": "rust",
+        "runtime": "pencarimovie-server",
     })
 }
 
@@ -238,7 +238,7 @@ pub fn record(
     let file = reports_dir().join(format!("{}_{}.json", report_type, ms));
     let mut payload = serde_json::json!({
         "report_type": report_type,
-        "platform": "rust-port",
+        "platform": "server",
         "device_id": get_device_id(),
         "app_version": app_version(),
         "created_at": now(),
@@ -439,7 +439,7 @@ ro.build.description=generic_x86-user 5.1.1 LMY48Z 30 test-keys
         // Everything must degrade to a placeholder rather than fail - this is how
         // a diagnostics report survives Android's restricted /proc.
         let info = device_info();
-        assert_eq!(info["runtime"], "rust");
+        assert_eq!(info["runtime"], "pencarimovie-server");
         assert_eq!(info["platform"], std::env::consts::OS);
         assert!(info["device_id"].as_str().unwrap_or("").len() >= 6);
     }
