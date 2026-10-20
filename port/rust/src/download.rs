@@ -93,6 +93,17 @@ fn id_of(v: &Value) -> String {
     }
 }
 
+/// How many bytes the FIRST response writes before it starts streaming.
+///
+/// It used to be a whole 1 MB window, which is what makes a SEEK feel like
+/// buffering: the player aborts, asks for a far offset, and the server pulls a
+/// full megabyte before writing byte one — 2.5 s at the ~400 KB/s a phone sees
+/// from the DC. 256 KB keeps the part legal (multiple of 4096, and a divisor of
+/// the 1 MB window) while cutting that wait ~4x; the rest of the window follows
+/// immediately so later windows stay exactly 1 MB-aligned and steady-state
+/// throughput is untouched.
+const PRIME_BYTES: u64 = 256 * 1024;
+
 /// How many 1 MB windows to keep in flight per stream.
 ///
 /// Default **8**: that is the depth the PHP downloader measured at 7.5-9.7 MiB/s
@@ -767,7 +778,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // response headers were written: the player sat at `readyState 0 /
     // networkState 2` forever and Nuvio logged "still downloading data".
     // A Range request looked fine only because there `total` was already small.
-    let prime = total.min(crate::telegram::MB);
+    let prime = total.min(PRIME_BYTES);
     for attempt in 1..=max_attempts {
         if std::time::Instant::now() >= preflight_deadline {
             log(
@@ -1040,23 +1051,58 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let pipeline = pipeline_depth();
         use futures_util::StreamExt as _;
 
-        // MB-stepped windows from `aligned` (which is 4096-aligned, and MB is a
-        // multiple of 4096), so every window start stays a legal chunk offset.
+        let mut skip = start.saturating_sub(aligned) as usize;
+        let mut remaining = total;
+        let mut primed = first_buf;
+
+        // Emit the primed head BEFORE planning: it is the bytes that were pulled
+        // while the headers were being written, and the player can start on them
+        // immediately instead of waiting for a whole window.
+        let plen = primed.len() as u64;
+        if plen > 0 && remaining > 0 {
+            if (skip as u64) < plen {
+                let at = skip;
+                let take = ((plen - at as u64) as usize).min(remaining as usize);
+                if take > 0 {
+                    let out = Bytes::copy_from_slice(&primed[at..at + take]);
+                    if tx.send(Ok(out)).await.is_err() {
+                        return;
+                    }
+                    remaining -= take as u64;
+                }
+                skip = 0;
+            } else {
+                skip -= plen as usize;
+            }
+        }
+
+        // Windows continue from the end of the primed piece. When that piece is
+        // shorter than a 1 MB window the REST OF THAT WINDOW is fetched first, so
+        // every later window starts on an exact 1 MB boundary (full-size legal
+        // parts, unchanged throughput); only the head of the body is finer.
         let mut plan: Vec<(u64, u64)> = Vec::new();
         {
-            let mut p = aligned;
-            let mut rem = total;
+            let mut p = aligned + plen;
+            // `+ skip`: the windows start at an ALIGNED base, so they must cover
+            // the bytes discarded before `start` as well. Without it every seek
+            // answered `total - skip` bytes — up to 1 MB SHORT of the
+            // Content-Length we just sent, and a player reads a short body as a
+            // truncated stream (the "buffers after fast-forward" symptom).
+            let mut rem = remaining + skip as u64;
+            let mb = crate::telegram::MB;
+            if rem > 0 && plen > 0 && plen < mb {
+                let want = (mb - plen).min(rem);
+                plan.push((p, want));
+                p += want;
+                rem -= want;
+            }
             while rem > 0 {
-                let want = rem.min(crate::telegram::MB);
+                let want = rem.min(mb);
                 plan.push((p, want));
                 p += want;
                 rem -= want;
             }
         }
-
-        let mut skip = start.saturating_sub(aligned) as usize;
-        let mut remaining = total;
-        let mut primed = first_buf;
 
         let stream = futures_util::stream::iter(plan.into_iter().enumerate().map(|(i, (p, w))| {
             let client = client_for_task.clone();
@@ -1092,10 +1138,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         return;
                     }
             };
-            if index == 0 && !primed.is_empty() {
-                // Reuse the priming fetch instead of pulling chunk 0 twice.
-                data = std::mem::take(&mut primed);
-            }
+            let _ = index;
             let slice_start = skip.min(data.len());
             let take = (data.len() - slice_start).min(remaining as usize);
             if take > 0 {

@@ -4188,8 +4188,10 @@ async fn manifest(base_url: &str) -> Value {
         "catalogs": catalogs,
         // A path that EXISTS in the embedded `public/`: the old `/logo.png`
         // 404s, so clients showed a broken logo (and an empty background).
-        "logo": format!("{}/assets/images/icon.png", rtrim(base_url)),
-        "background": format!("{}/assets/images/icon.png", rtrim(base_url)),
+        // `/logo.png` is the PencariMovie mark; `assets/images/icon.png` was
+        // Nuvio's app icon and `nuviotv.png` their wordmark (both removed).
+        "logo": format!("{}/logo.png", rtrim(base_url)),
+        "background": format!("{}/logo.png", rtrim(base_url)),
         "behaviorHints": {},
     });
     upstream::fit_descriptor(doc, local_count)
