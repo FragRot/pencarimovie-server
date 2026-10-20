@@ -1,18 +1,15 @@
 # syntax=docker/dockerfile:1
 #
-# PencariMovie Server - Alpine (musl) image for the native build.
+# PencariMovie Server - Alpine (musl) image.
 #
 #   docker build -f Dockerfile.rust -t pencarimovie-server .
 #   docker run --rm -p 8088:8088 -v pmdata:/data pencarimovie-server
 #
 # The whole server is ONE binary: `public/` is embedded at compile time
 # (`include_dir!`), so the runtime image needs nothing but the executable and a
-# CA bundle - no PHP, no Composer, no vendor/, no public/.
-#
-# Heroku: `heroku.yml` names the Dockerfile. Point its `web:` at `Dockerfile.rust`
-# to ship this build (Linux/amd64 is what the dyno runs). The bind address is
-# automatic: the binary binds 0.0.0.0 whenever it sees a PaaS marker (DYNO,
-# RENDER, K_SERVICE, or PORT without an explicit host).
+# CA bundle. `heroku.yml` builds this same file for Heroku; the bind address is
+# automatic there (the binary binds 0.0.0.0 whenever it sees a PaaS marker:
+# DYNO, RENDER, K_SERVICE, or PORT without an explicit host).
 #
 # State (Telegram sessions, auth.json, caches, logs) lives in PM_APP_ROOT and is
 # the only thing worth a volume.

@@ -1,17 +1,9 @@
-# Heroku container deploy.
+# Heroku container deploy — the native engine.
 #
-# Two builds live in this repo:
-#
-#   Dockerfile        PHP + FrankenPHP + MadelineProto (the original stack)
-#   Dockerfile.rust   the native build: ONE binary, dashboard embedded, musl,
-#                     no PHP/Composer/vendor
-#
-# This file now deploys the NATIVE engine. The binary is its own entrypoint, so
-# there is no docker-entrypoint.sh; it reads PORT (dynos set it), binds 0.0.0.0
-# on a PaaS marker and keeps state under PM_APP_ROOT (/data, set in the image).
-#
-# To go back to the PHP stack, set `web:` to Dockerfile and restore the
-# docker-entrypoint.sh run command.
+# One binary: the dashboard, the Stremio/Eclipse addon and the Telegram engine are
+# all compiled into `pencarimovie-server` (no PHP, no Composer, no vendor/). The
+# binary is its own entrypoint, reads PORT (dynos set it), binds 0.0.0.0 on a PaaS
+# marker and keeps state under PM_APP_ROOT (/data, set in the image).
 build:
   docker:
     web: Dockerfile.rust
