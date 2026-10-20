@@ -2,7 +2,7 @@
 //! `fd_log` (backend.php:368-510).
 //!
 //! Same on-disk paths (`storage/debug_mode.txt`, `storage/debug.log`), same 5 MB
-//! cap, same `[YYYY-MM-DD HH:MM:SS] [PencariMovie Downloader] <msg> <json>` line
+//! cap, same `[YYYY-MM-DD HH:MM:SS] [PencariMovie Server] <msg> <json>` line
 //! shape. Timestamps are UTC (the PHP used the process timezone; the port has no
 //! tz database, so it documents UTC instead of guessing).
 
@@ -73,7 +73,7 @@ pub fn log(message: &str, ctx: &Value) {
         format!(" {}", ctx)
     };
     let line = format!(
-        "[{}] [PencariMovie Downloader] {}{}\n",
+        "[{}] [PencariMovie Server] {}{}\n",
         stamp(now()),
         message,
         suffix
@@ -85,7 +85,7 @@ pub fn log(message: &str, ctx: &Value) {
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
-    eprint!("[PencariMovie Downloader] {}{}\n", message, suffix);
+    eprint!("[PencariMovie Server] {}{}\n", message, suffix);
     limit_file_size(&path, MAX_LOG_SIZE);
 }
 
