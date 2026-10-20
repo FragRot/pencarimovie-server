@@ -1,16 +1,19 @@
 # Heroku container deploy.
 #
-# `web:` names the Dockerfile Heroku builds. Two builds live in this repo:
+# Two builds live in this repo:
 #
 #   Dockerfile        PHP + FrankenPHP + MadelineProto (the original stack)
 #   Dockerfile.rust   the native build: ONE binary, dashboard embedded, musl,
-#                     ~20 MB image, no PHP/Composer/vendor
+#                     no PHP/Composer/vendor
 #
-# Switch to the native build by pointing `web:` at Dockerfile.rust. Nothing else
-# changes: the binary reads PORT (dynos set it), binds 0.0.0.0 on a PaaS marker,
-# and keeps its state under PM_APP_ROOT (already /data in that image).
+# This file now deploys the NATIVE engine. The binary is its own entrypoint, so
+# there is no docker-entrypoint.sh; it reads PORT (dynos set it), binds 0.0.0.0
+# on a PaaS marker and keeps state under PM_APP_ROOT (/data, set in the image).
+#
+# To go back to the PHP stack, set `web:` to Dockerfile and restore the
+# docker-entrypoint.sh run command.
 build:
   docker:
-    web: Dockerfile
+    web: Dockerfile.rust
 run:
-  web: /usr/local/bin/docker-entrypoint.sh
+  web: pencarimovie-server
