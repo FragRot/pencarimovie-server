@@ -983,24 +983,28 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         );
     }
 
-    /* ── version gate (backend.php:19121-19142) ───────────────────────────── */
-    if p.starts_with("/api/") {
-        let v = check_version().await;
-        if v.get("update_needed").and_then(|x| x.as_bool()).unwrap_or(false) {
-            let current = jstr(&v, "current_version");
-            let minimum = jstr(&v, "minimum_version");
-            return json_response(
-                426,
-                &serde_json::json!({
-                    "ok": 0,
-                    "message": format!("Update Required. Your version ({}) is below the minimum required version ({}).", current, minimum),
-                    "update_needed": true,
-                    "current_version": current,
-                    "minimum_version": minimum,
-                    "update_url": jstr(&v, "update_url"),
-                }),
-            );
+    /* ── version gate: REMOVED on purpose ─────────────────────────────────── */
+    // The PHP build blocked every /api/* call with HTTP 426 when the engine was
+    // older than the WordPress minimum. That made an outdated binary unusable
+    // instead of merely out of date, and it fought the native build (which
+    // reports `git describe` version strings). The check still RUNS — `/api/version`
+    // returns `update_needed`, `minimum_version` and `update_url`, and the
+    // dashboard shows a banner in #settings / #addon with a one-click update —
+    // but nothing is ever blocked.
+    let _ = check_version;
+
+    /* ── desktop self-update ──────────────────────────────────────────────── */
+    // `check` only reads the GitHub release feed. `apply` downloads and then hands
+    // the archive to the shipped apply-update script, so it is privileged (a LAN
+    // peer must not be able to push a binary onto the host).
+    if p == "/api/update/check" && m == "GET" {
+        return json_response(200, &crate::update::check().await);
+    }
+    if p == "/api/update/apply" && m == "POST" {
+        if let Some(resp) = require_privileged(&ctx) {
+            return resp;
         }
+        return json_response(200, &crate::update::apply().await);
     }
 
     /* ── diagnostics / reports (backend.php:19149-19202) ──────────────────── */
@@ -4085,6 +4089,7 @@ async fn check_version() -> Value {
             "update_needed": false,
             "current_version": app_version(),
             "client_version": client_version,
+            "build": crate::config::build_id(),
         });
     }
     let current = app_version();
@@ -4093,6 +4098,7 @@ async fn check_version() -> Value {
         "update_needed": version_less(&current, &min_version),
         "current_version": current,
         "client_version": client_version,
+        "build": crate::config::build_id(),
         "minimum_version": min_version,
         "update_url": jstr(&r, "update_url"),
         "release_notes": jstr(&r, "release_notes"),

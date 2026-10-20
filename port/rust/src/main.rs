@@ -38,6 +38,7 @@ mod session;
 mod storage;
 mod telegram;
 mod tunnel;
+mod update;
 mod upstream;
 mod wp_data;
 

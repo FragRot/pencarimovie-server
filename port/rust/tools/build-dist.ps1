@@ -33,10 +33,15 @@ if (-not (Test-Path $exe)) {
   throw "missing $exe - run: cargo build --profile $Configuration"
 }
 
-if (Test-Path $OutDir) { Remove-Item $OutDir -Recurse -Force }
-New-Item -ItemType Directory -Path $OutDir | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $OutDir 'storage') | Out-Null
-Copy-Item $exe (Join-Path $OutDir 'pencarimovie-server.exe')
+# Rebuild IN PLACE: `storage/` is live state (sessions, auth.json) and a running
+# cloudflared/server keeps its log open, so deleting the whole tree either loses
+# state or fails outright. Only the code/launcher files are replaced.
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+Get-ChildItem $OutDir -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+if (-not (Test-Path (Join-Path $OutDir 'storage'))) {
+  New-Item -ItemType Directory -Path (Join-Path $OutDir 'storage') | Out-Null
+}
+Copy-Item $exe (Join-Path $OutDir 'pencarimovie-server.exe') -Force
 
 # Optional desktop helpers (tray, launchers, login entry) + the product logo.
 $desk = Join-Path $root 'desktop'

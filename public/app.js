@@ -5509,13 +5509,17 @@ class PencariMovieApp {
           }
         }
         if (data && data.update_needed) {
-          if (data.minimum_version && data.current_version) {
-            if (!this._isVersionBelow(data.current_version, data.minimum_version)) {
-              return null;
-            }
-          }
-          return data;
+          // A NOTIFICATION, not a wall: the server no longer refuses requests from
+          // an older build, so show what is available in #settings / #addon.
+          this.renderUpdateNotice({
+            current: data.client_version || data.current_version,
+            latest: data.minimum_version,
+            url: data.update_url
+          });
+          return null;
         }
+        // Desktop builds also read their own release feed (silent, best effort).
+        void this.checkDesktopUpdate();
         return null;
       } catch (e) {
         console.warn("Version check request failed:", e);
@@ -5544,6 +5548,83 @@ class PencariMovieApp {
     const connectedEl = this.$("#settingsConnectedVersion");
     if (setupEl) setupEl.textContent = versionText + suffix;
     if (connectedEl) connectedEl.textContent = versionText + suffix;
+  }
+
+  /**
+   * Ask the engine's own release feed (GitHub) whether a newer desktop build
+   * exists. Best effort: offline or rate-limited is not an error.
+   */
+  checkDesktopUpdate() {
+    return __async(this, null, function* () {
+      try {
+        const resp = yield fetch("".concat(this.localApiBase, "/api/update/check"));
+        if (!resp.ok) return;
+        const info = yield resp.json();
+        if (info && info.ok && info.update_available) {
+          this.renderUpdateNotice({
+            current: info.current,
+            latest: info.latest,
+            build: info.build
+          });
+        }
+      } catch (e) {}
+    });
+  }
+
+  /** A dismissible bar at the top of #settings and #addon (never a blocker). */
+  renderUpdateNotice(info) {
+    if (!info) return;
+    const roots = [this.$("#settingsGate"), this.$("#addonModal")].filter(Boolean);
+    if (!roots.length) return;
+    const text = "Update available: v".concat(info.latest || "?", " (installed ").concat(info.current || "?", ")");
+    roots.forEach(root => {
+      let bar = root.querySelector(".pm-update-notice");
+      if (!bar) {
+        bar = document.createElement("div");
+        bar.className = "pm-update-notice";
+        bar.setAttribute("style", "margin:10px 0;padding:10px 12px;border-radius:8px;background:#2b2110;border:1px solid #ff6b35;color:#ffd8c2;font-size:13px;line-height:1.5;display:flex;gap:10px;align-items:center;justify-content:space-between");
+        root.insertBefore(bar, root.firstChild);
+      }
+      bar.textContent = "";
+      const label = document.createElement("span");
+      label.textContent = text;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Update now";
+      btn.setAttribute("style", "background:#ff6b35;color:#141414;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer");
+      btn.addEventListener("click", () => {
+        this.applyUpdate(btn);
+      });
+      bar.appendChild(label);
+      bar.appendChild(btn);
+    });
+  }
+
+  /** POST /api/update/apply — download, verify, then the server restarts itself. */
+  applyUpdate(btn) {
+    return __async(this, null, function* () {
+      const label = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Downloading...";
+      try {
+        const resp = yield fetch("".concat(this.localApiBase, "/api/update/apply"), {
+          method: "POST",
+          body: "{}"
+        });
+        const res = yield resp.json();
+        if (res && res.ok) {
+          btn.textContent = "Restarting...";
+          return;
+        }
+        btn.disabled = false;
+        btn.textContent = label;
+        alert((res && res.error) || "Update failed.");
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = label;
+        alert("Update failed: ".concat(e.message));
+      }
+    });
   }
   /**
    * Show the update required overlay with version details.

@@ -13,13 +13,13 @@
 # that is what "Stop server" is for.
 
 param(
-  [switch]$StartServer,
-  [int]$Port = 0,
-  # Accepted for compatibility with the `pms` CLI (pencarimovie-windows.bat
-  # runs `tray.ps1 -Port … -OpenUrl … -StopBat … -StartServer`). PowerShell -File
-  # REJECTS an unknown parameter, so these must exist even when unused.
-  [string]$OpenUrl = '',
-  [string]$StopBat = ''
+    [switch]$StartServer,
+    [int]$Port = 0,
+    # Accepted for compatibility with the `pms` CLI (pencarimovie-windows.bat
+    # runs `tray.ps1 -Port … -OpenUrl … -StopBat … -StartServer`). PowerShell -File
+    # REJECTS an unknown parameter, so these must exist even when unused.
+    [string]$OpenUrl = '',
+    [string]$StopBat = ''
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -179,6 +179,31 @@ $script:autoItem.Checked = Test-Autostart
 $script:autoItem.add_Click({ Set-Autostart $script:autoItem.Checked })
 $logItem = $menu.Items.Add('Open log')
 $logItem.add_Click({ if (Test-Path $logFile) { Start-Process notepad.exe $logFile } })
+$updateItem = $menu.Items.Add('Check for updates...')
+$updateItem.add_Click({
+        try {
+            $r = Invoke-RestMethod -Uri "$base/api/update/check" -TimeoutSec 25
+            if ($r.ok -and $r.update_available) {
+                $ans = [System.Windows.Forms.MessageBox]::Show(
+                    ("Update available: {0}`nInstalled: {1} (build {2})`n`nDownload and restart now?" -f $r.latest, $r.current, $r.build),
+                    'PencariMovie Server', 'YesNo', 'Question')
+                if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    Show-Balloon 'Downloading the update...'
+                    $a = Invoke-RestMethod -Uri "$base/api/update/apply" -Method POST -Body '{}' -ContentType 'application/json' -TimeoutSec 900
+                    if ($a.ok) { Show-Balloon $a.message } else {
+                        [void][System.Windows.Forms.MessageBox]::Show($a.error, 'PencariMovie Server', 'OK', 'Error')
+                    }
+                }
+            }
+            else {
+                $msg = if ($r.ok) { "Already up to date: $($r.current) (build $($r.build))" } else { $r.error }
+                [void][System.Windows.Forms.MessageBox]::Show($msg, 'PencariMovie Server', 'OK', 'Information')
+            }
+        }
+        catch {
+            [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'PencariMovie Server', 'OK', 'Error')
+        }
+    })
 [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 $exitItem = $menu.Items.Add('Exit tray (leaves server running)')
 $exitItem.add_Click({ $script:notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
