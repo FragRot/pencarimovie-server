@@ -479,6 +479,29 @@ pub async fn stream_files_by_title(
     (resolved_title, files)
 }
 
+/// `GET {WP_API_BASE}/search-files?search=…&limit=…` — the keyword search the
+/// dashboard uses.
+///
+/// `stream-files?title=` only returns the rows the origin ties to that post /
+/// identity, so the SAME episode uploaded by another release group is invisible
+/// to it (measured on "Positively Yours 2026": the post set holds 22 files but
+/// the OMG 720p/1080p MalaySub variants only appear in the keyword search).
+/// Merging both is what makes an episode list several sources, like the PHP.
+pub async fn search_files(search: &str, limit: usize) -> Vec<WpFile> {
+    let res = fetch_stream_ajax(
+        "search_files",
+        &[
+            ("search".to_string(), search.to_string()),
+            ("limit".to_string(), limit.to_string()),
+        ],
+    )
+    .await;
+    rows_of(&res, &["files", "items"])
+        .iter()
+        .filter_map(wp_file_from)
+        .collect()
+}
+
 /// Rows from any of the shapes the origin uses: a bare array, or an object with
 /// one of `keys` holding the array.
 fn rows_of(v: &Value, keys: &[&str]) -> Vec<Value> {
