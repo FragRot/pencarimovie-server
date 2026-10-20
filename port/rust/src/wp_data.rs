@@ -479,24 +479,39 @@ pub async fn stream_files_by_title(
     (resolved_title, files)
 }
 
-/// `GET {WP_API_BASE}/search-files?search=…&limit=…` — the keyword search the
-/// dashboard uses.
+/// `GET {WP_API_BASE}/stream-files?type=series&season=…&episode=…&limit=…`
+/// `[&title=<keyword>][&id=post:<id>]` — the PER-EPISODE index search, the
+/// backend.php:10178-10219 step of `fd_fetch_episode_stream_files()`.
 ///
-/// `stream-files?title=` only returns the rows the origin ties to that post /
-/// identity, so the SAME episode uploaded by another release group is invisible
-/// to it (measured on "Positively Yours 2026": the post set holds 22 files but
-/// the OMG 720p/1080p MalaySub variants only appear in the keyword search).
-/// Merging both is what makes an episode list several sources, like the PHP.
-pub async fn search_files(search: &str, limit: usize) -> Vec<WpFile> {
-    let res = fetch_stream_ajax(
-        "search_files",
-        &[
-            ("search".to_string(), search.to_string()),
-            ("limit".to_string(), limit.to_string()),
-        ],
-    )
-    .await;
-    rows_of(&res, &["files", "items"])
+/// This is the call that surfaces the episode's other releases: the post's own
+/// attached files are a subset, so the same episode uploaded by another group
+/// only appears here. Cached by the same cache-first layer (`stream_files` TTL).
+pub async fn stream_files_episode(
+    media_type: &str,
+    keyword: &str,
+    year: &str,
+    id: &str,
+    season: i32,
+    episode: i32,
+    limit: usize,
+) -> Vec<WpFile> {
+    let mut params = vec![
+        ("type".to_string(), media_type.to_string()),
+        ("season".to_string(), season.to_string()),
+        ("episode".to_string(), episode.to_string()),
+        ("limit".to_string(), limit.to_string()),
+    ];
+    if !keyword.is_empty() {
+        params.push(("title".to_string(), keyword.to_string()));
+    }
+    if !year.is_empty() {
+        params.push(("year".to_string(), year.to_string()));
+    }
+    if !id.is_empty() {
+        params.push(("id".to_string(), id.to_string()));
+    }
+    let res = fetch_stream_ajax("stream_files", &params).await;
+    rows_of(&res, &["items", "files"])
         .iter()
         .filter_map(wp_file_from)
         .collect()

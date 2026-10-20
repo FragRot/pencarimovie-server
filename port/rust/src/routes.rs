@@ -1859,6 +1859,37 @@ async fn await_upstream(
     }
 }
 
+/// `fd_stream_keyword_from_post_title()` (backend.php:9805) — the CLEANED
+/// search keyword for a post title.
+///
+/// `"Positively Yours 2026 TvSeries"` → `"Positively Yours"`, `"X • Movie"` →
+/// `"X"`. The origin's per-episode search is keyed on this keyword; asking it
+/// with the raw decorated title returns only the post's own rows (or nothing),
+/// which is exactly the "only one source per episode" symptom.
+fn stream_keyword_from_post_title(title: &str) -> String {
+    let mut k = crate::matcher::decode_html_entities(title);
+    k = k
+        .chars()
+        .map(|c| if (c as u32) < 0x20 { ' ' } else { c })
+        .collect();
+    if let Some(i) = k.find(['•', '·']) {
+        k.truncate(i);
+    }
+    let mut k = k.trim().to_string();
+    for pattern in [
+        r"\s*\(\d{4}\)\s*$",                 // trailing "(2024)"
+        r"\s+\d{4}\s*$",                     // trailing " 2024"
+        r"\b(?:tvseries|tv\s*series|movie)\b", // type words, anywhere
+    ] {
+        if let Ok(re) = fancy_regex::Regex::new(&format!("(?i){pattern}")) {
+            k = re.replace_all(&k, "").to_string();
+        }
+    }
+    let k = k.split_whitespace().collect::<Vec<_>>().join(" ");
+    k.trim_matches(|c: char| " \t\r\n.!?:;,-".contains(c))
+        .to_string()
+}
+
 /// `pm:post:<id>[:S:E]` — Fast Path 2a/2b, the same shape as the PHP:
 /// title/year come from the post, the file set from the post's own pages, and
 /// the matcher decides. `episode_names` is empty because the upstream
@@ -1932,61 +1963,59 @@ async fn handle_post_stream(
     // a 65-episode post).
     let mut files = crate::wp_data::fetch_post_files_paged(&post_id, 200, 600, 3).await;
 
-    // ALSO search the origin by title and MERGE, always — not only when the post
-    // set is empty.
+    // STEP 1 of `fd_fetch_episode_stream_files()` (backend.php:10178-10219): the
+    // PER-EPISODE index search, and it must NOT be gated on "the post set is
+    // empty".
     //
-    // A post only owns the releases uploaded under THAT post; the other
-    // MalaySub / quality variants of the same episode sit on sibling posts under
-    // the same title. The PHP has always listed them because it searches by
-    // title; this port listed one file per episode (reported: "Positively Yours"
-    // EP12 720p OMG matched, the 1080p OMG silently missing). One extra cached
-    // origin call, deduped by `short_code`; the strict matcher still decides
-    // which of those rows belong to this title, so a sibling film's files are
-    // rejected exactly as before.
-    let kind0 = if item_type == "series" || season > 0 { "series" } else { "movie" };
-    let (_, more) = crate::wp_data::stream_files_by_title(kind0, &title, &year, item_id).await;
-    if !more.is_empty() {
-        let own = files.len();
-        let mut seen: std::collections::HashSet<String> =
-            files.iter().map(|f| f.short_code.clone()).collect();
-        for f in more {
-            if seen.insert(f.short_code.clone()) {
-                files.push(f);
-            }
-        }
-        log(
-            "stream: merged title search into post set",
-            &serde_json::json!({"post_id": post_id, "own": own, "merged": files.len()}),
-        );
-    }
-
-    // And the KEYWORD search: this is the only way to see the same episode
-    // uploaded by another release group (the origin's `stream-files?title=`
-    // only returns rows tied to this post/identity). Measured on
-    // "Positively Yours 2026": 22 post files, while the OMG 720p/1080p MalaySub
-    // variants of EP9-E12 appear only here — the difference between one source
-    // per episode and many.
-    if !title.is_empty() {
-        let more = crate::wp_data::search_files(&title, 120).await;
-        if !more.is_empty() {
-            let before = files.len();
-            let mut seen: std::collections::HashSet<String> =
-                files.iter().map(|f| f.short_code.clone()).collect();
-            for f in more {
-                if seen.insert(f.short_code.clone()) {
-                    files.push(f);
+    // Step 0 reads the post's OWN attached files, which is a SUBSET: the other
+    // MalaySub / quality variants of the same episode were uploaded under OTHER
+    // posts of the same title. The PHP therefore always also asks the origin for
+    // this exact episode, keyed on the CLEANED keyword (`fd_stream_keyword_from_post_title`,
+    // e.g. "Positively Yours" from "Positively Yours 2026 TvSeries") and
+    // `id=post:<id>`, and unions the rows (dedupe by short_code). Without it the
+    // port listed one source per episode — measured on "Positively Yours 2026":
+    // 22 post files, while EP1 had many more in the index (reported as
+    // "only match one... other malaysub missing").
+    //
+    // Only the budget gate is kept, so a post that genuinely carries everything
+    // does not pay the call.
+    const MAX_FILES: usize = 250;
+    if files.len() < MAX_FILES && (season > 0 || episode > 0) {
+        let keyword = stream_keyword_from_post_title(&title);
+        if !keyword.is_empty() {
+            let id_param = format!("post:{}", post_id);
+            let more = crate::wp_data::stream_files_episode(
+                "series",
+                &keyword,
+                &year,
+                &id_param,
+                season,
+                episode,
+                MAX_FILES,
+            )
+            .await;
+            if !more.is_empty() {
+                let before = files.len();
+                let mut seen: std::collections::HashSet<String> =
+                    files.iter().map(|f| f.short_code.clone()).collect();
+                for f in more {
+                    if seen.insert(f.short_code.clone()) {
+                        files.push(f);
+                    }
                 }
-            }
-            if files.len() > before {
                 log(
-                    "stream: merged keyword search into post set",
-                    &serde_json::json!({"post_id": post_id, "before": before, "after": files.len()}),
+                    "stream: episode index search merged",
+                    &serde_json::json!({
+                        "post_id": post_id, "season": season, "episode": episode,
+                        "keyword": keyword, "before": before, "after": files.len(),
+                    }),
                 );
             }
         }
     }
     if files.is_empty() && !aka.is_empty() {
         // Nothing at all yet: the alternate title may be the one the origin uses.
+        let kind0 = if item_type == "series" || season > 0 { "series" } else { "movie" };
         let (_, f2) = crate::wp_data::stream_files_by_title(kind0, &aka, &year, item_id).await;
         files = f2;
     }
