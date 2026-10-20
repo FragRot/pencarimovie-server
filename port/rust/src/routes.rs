@@ -1798,7 +1798,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
         "NO_STREAMS",
         "",
         item_id,
-        serde_json::json!({"item_type": item_type, "runtime": "rust"}),
+        serde_json::json!({"item_type": item_type, "runtime": "pencarimovie-server"}),
     );
     stremio_json(200, &serde_json::json!({"streams": []}), "no-store")
 }
@@ -1918,7 +1918,7 @@ async fn handle_post_stream(
             "NO_STREAMS",
             "",
             item_id,
-            serde_json::json!({"item_type": item_type, "post_id": post_id, "runtime": "rust"}),
+            serde_json::json!({"item_type": item_type, "post_id": post_id, "runtime": "pencarimovie-server"}),
         );
         // No title means the matcher has nothing to match against — answer with
         // the tappable "No Streams Found" card instead of an empty array. An
@@ -1946,6 +1946,20 @@ async fn handle_post_stream(
         ctx, item_type, item_id, &title, &year, &aka, &imdb_id, files, season, episode, upstream,
     )
     .await
+}
+
+/// The first 4-digit year in a string (`"2023–"`, `"2019-03-01"`, `"2019"`).
+fn first_year_of(s: &str) -> String {
+    let d: Vec<char> = s.chars().collect();
+    if d.len() < 4 {
+        return String::new();
+    }
+    for i in 0..=(d.len() - 4) {
+        if d[i..i + 4].iter().all(|c| c.is_ascii_digit()) {
+            return d[i..i + 4].iter().collect();
+        }
+    }
+    String::new()
 }
 
 /// `tt…` / `tmdb:…` / `kitsu:…` / `mal:…` / `tvdb:…` / `anilist:…` /
@@ -1994,6 +2008,67 @@ async fn handle_external_stream(
             };
             return Some(handle_post_stream(ctx, item_type, item_id, &rest, upstream).await);
         }
+        // (1) ID-ONLY ORIGIN PROBE. `/stream-files` resolves the identity from
+        // `id` itself and answers `resolved_title`, so an id that is not in the
+        // local `media_ids_idx` can still be recovered in ONE origin call.
+        let kind = if item_type == "series" || season > 0 { "series" } else { "movie" };
+        let (by_id_title, by_id_files) =
+            crate::wp_data::stream_files_by_title(kind, "", "", item_id).await;
+        if !by_id_files.is_empty() {
+            let t = if by_id_title.is_empty() {
+                item_id.to_string()
+            } else {
+                by_id_title
+            };
+            log(
+                "stream: external id resolved by origin id search",
+                &serde_json::json!({"item_id": item_id, "title": t, "files": by_id_files.len()}),
+            );
+            return Some(
+                build_streams_from_files(
+                    ctx,
+                    item_type,
+                    item_id,
+                    &t,
+                    &year,
+                    &aka,
+                    &episode_media_id,
+                    by_id_files,
+                    season,
+                    episode,
+                    upstream,
+                )
+                .await,
+            );
+        }
+
+        // (2) UPSTREAM META. `backend.php`'s `fd_resolve_external_media_metadata()`
+        // asks the meta-capable addons (AIOMetadata) for `/meta/<type>/<id>`;
+        // without this an unindexed id had NO title at all, so the matcher had
+        // nothing to search and the item answered "No Streams Found". Measured
+        // on a real phone: tt6751668, tt21952924, tt34809853, tt34991493.
+        let settings = load_catalog_settings_merged();
+        if let Some(body) = upstream::forward_meta(&settings, item_type, item_id).await {
+            let meta = body.get("meta").cloned().unwrap_or(Value::Null);
+            let name = jstr(&meta, "name");
+            if !name.is_empty() {
+                title = name;
+                if year.is_empty() {
+                    let rel = {
+                        let r = jstr(&meta, "releaseInfo");
+                        if r.is_empty() { jstr(&meta, "year") } else { r }
+                    };
+                    year = first_year_of(&rel);
+                }
+                log(
+                    "stream: external id resolved from upstream meta",
+                    &serde_json::json!({"item_id": item_id, "title": title, "year": year}),
+                );
+            }
+        }
+    }
+
+    if title.is_empty() {
         log(
             "stream: external id resolved without a title",
             &serde_json::json!({"item_id": item_id}),
@@ -2006,7 +2081,7 @@ async fn handle_external_stream(
             "NO_STREAMS",
             "",
             item_id,
-            serde_json::json!({"item_type": item_type, "runtime": "rust"}),
+            serde_json::json!({"item_type": item_type, "runtime": "pencarimovie-server"}),
         );
         let merged = await_upstream(upstream, true).await;
         return Some(finish_streams(ctx, item_type, item_id, item_id, merged, false, 0).await);
@@ -2184,7 +2259,7 @@ async fn build_streams_from_files(
             item_id,
             serde_json::json!({
                 "item_type": item_type, "title": title, "year": year,
-                "season": season, "episode": episode, "runtime": "rust",
+                "season": season, "episode": episode, "runtime": "pencarimovie-server",
             }),
         );
         let merged = await_upstream(upstream, true).await;
@@ -2225,7 +2300,7 @@ async fn build_streams_from_files(
             item_id,
             serde_json::json!({
                 "item_type": item_type, "title": title,
-                "files_before_filter": matched.len(), "runtime": "rust",
+                "files_before_filter": matched.len(), "runtime": "pencarimovie-server",
             }),
         );
         let merged = await_upstream(upstream, true).await;
