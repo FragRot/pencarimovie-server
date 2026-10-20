@@ -235,6 +235,46 @@ pub fn norm_title_for_match(title: &str) -> String {
     squash(&a)
 }
 
+/// Port of `fd_stream_keyword_variants()` (backend.php:9820).
+///
+/// The origin's `search_files` is a literal Manticore match, so an apostrophe in
+/// a catalogue title makes the query miss files the uploaders named differently:
+/// `"Grey's Anatomy"` is stored as `Greys Anatomy`, `Grey s Anatomy` or
+/// `Grey Anatomy` depending on the uploader. Returns the keyword plus each
+/// normalised form, in the PHP's order, de-duplicated and empty-free.
+///
+/// Used by the zero-result fallback ladder in the stream route
+/// (`fd_fetch_episode_stream_files()` step 3, backend.php:10291).
+///
+/// The third form reproduces the PHP exactly, quirk included: the alternation is
+/// `['’`]s|s['’`]|\bs\b`, scanned left to right, so a word ending in `s` before
+/// the possessive (`"Princess's"`) matches the `s'` branch first and yields
+/// `"Princes"` — while `"Grey's"` correctly yields `"Grey"`. Verified against
+/// `bin/php.exe` for both, so do NOT "fix" it: a different form would issue a
+/// query the PHP never issues.
+pub fn stream_keyword_variants(keyword: &str) -> Vec<String> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Vec::new();
+    }
+    fn push(out: &mut Vec<String>, v: String) {
+        if !v.is_empty() && !out.iter().any(|x| x == &v) {
+            out.push(v);
+        }
+    }
+    let mut out: Vec<String> = vec![keyword.to_string()];
+    // 1. apostrophe -> space ("Princess's" -> "Princess s").
+    push(&mut out, squash(&replace_all("['\u{2019}`]", keyword, " ")));
+    // 2. apostrophe removed entirely ("Princess's" -> "Princesss").
+    push(&mut out, squash(&replace_all("['\u{2019}`]", keyword, "")));
+    // 3. possessive removed ("Princess's" -> "Princess", "Grey's" -> "Grey").
+    push(
+        &mut out,
+        squash(&replace_all("(?:['\u{2019}`]s|s['\u{2019}`]|\\bs\\b)", keyword, "")),
+    );
+    out
+}
+
 /// `fd_title_words_prefix_match()`: only a whole-word PREFIX extension is the
 /// same work, so `balan the boy` is NOT `the boy` while `khurafat perjanjian
 /// syaitan` IS `khurafat`.
@@ -1832,6 +1872,30 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /* fd_stream_keyword_variants -------------------------------------------- */
+
+    #[test]
+    fn stream_keyword_variants_cover_the_possessive_forms() {
+        // Values verified against `bin/php.exe` running the real
+        // `fd_stream_keyword_variants()`: every form it produces must be probe-able
+        // or the fallback ladder finds nothing.
+        assert_eq!(
+            stream_keyword_variants("Grey's Anatomy"),
+            vec!["Grey's Anatomy", "Grey s Anatomy", "Greys Anatomy", "Grey Anatomy"]
+        );
+        // The PHP's `s['’`]` branch wins before `\bs\b` for a word ending in "s",
+        // so "Princess's" yields "Princes" — identical in PHP (asserted there), and
+        // deliberately reproduced rather than corrected.
+        assert_eq!(
+            stream_keyword_variants("Princess's"),
+            vec!["Princess's", "Princess s", "Princesss", "Princes"]
+        );
+        // A plain title has exactly one form, so the ladder adds no queries.
+        assert_eq!(stream_keyword_variants("Positively Yours"), vec!["Positively Yours"]);
+        // Empty in, nothing out (never a query of "").
+        assert!(stream_keyword_variants("   ").is_empty());
     }
 
     /* trap 4: a title whose LAST word is a type word ------------------------ */

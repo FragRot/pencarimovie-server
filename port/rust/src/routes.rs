@@ -1890,11 +1890,13 @@ fn stream_keyword_from_post_title(title: &str) -> String {
         .to_string()
 }
 
-/// `pm:post:<id>[:S:E]` — Fast Path 2a/2b, the same shape as the PHP:
-/// title/year come from the post, the file set from the post's own pages, and
-/// the matcher decides. `episode_names` is empty because the upstream
-/// episode-name lookup is not ported yet — that guard fails OPEN, so it can
-/// never hide a stream.
+/// `pm:post:<id>[:S:E]` — Fast Path 1/2a, the same shape as the PHP.
+///
+/// A series ROOT (`pm:post:<id>` with no `:S:E`) is **S01E01** in the PHP:
+/// `fd_fetch_episode_stream_files($postId, $targetSeason ?? 1, $targetEpisode ?? 1, 250)`
+/// (backend.php:16828). Matching the root with season/episode 0 instead read the
+/// post's own files with no episode filter and listed 5 E01-ish rows where the
+/// PHP lists the whole of episode 1.
 async fn handle_post_stream(
     ctx: &ReqCtx,
     item_type: &str,
@@ -1909,6 +1911,8 @@ async fn handle_post_stream(
     if post_id.is_empty() || !post_id.chars().all(|c| c.is_ascii_digit()) {
         return stremio_json(200, &serde_json::json!({"streams": []}), "no-store");
     }
+    let is_series = item_type.contains("series") || season > 0 || episode > 0;
+    let (eff_season, eff_episode) = effective_season_episode(is_series, season, episode);
 
     let post = crate::wp_data::get_post(&post_id).await;
     let mut title = crate::wp_data::post_title(&post);
@@ -1958,71 +1962,384 @@ async fn handle_post_stream(
         let merged = await_upstream(upstream, true).await;
         return finish_streams(ctx, item_type, item_id, item_id, merged, false, 0).await;
     }
-    // Paged, never a single request: the origin returns newest-episode-first and
-    // a single `limit=200` call truncates a long series (measured: E1 missing on
-    // a 65-episode post).
-    let mut files = crate::wp_data::fetch_post_files_paged(&post_id, 200, 600, 3).await;
 
-    // STEP 1 of `fd_fetch_episode_stream_files()` (backend.php:10178-10219): the
-    // PER-EPISODE index search, and it must NOT be gated on "the post set is
-    // empty".
-    //
-    // Step 0 reads the post's OWN attached files, which is a SUBSET: the other
-    // MalaySub / quality variants of the same episode were uploaded under OTHER
-    // posts of the same title. The PHP therefore always also asks the origin for
-    // this exact episode, keyed on the CLEANED keyword (`fd_stream_keyword_from_post_title`,
-    // e.g. "Positively Yours" from "Positively Yours 2026 TvSeries") and
-    // `id=post:<id>`, and unions the rows (dedupe by short_code). Without it the
-    // port listed one source per episode — measured on "Positively Yours 2026":
-    // 22 post files, while EP1 had many more in the index (reported as
-    // "only match one... other malaysub missing").
-    //
-    // Only the budget gate is kept, so a post that genuinely carries everything
-    // does not pay the call.
+    let mut files = if is_series {
+        // Fast Path 1 — the whole `fd_fetch_episode_stream_files()` ladder, which
+        // also owns the post's own file set (its step 0).
+        let resolved = resolve_episode_files(
+            &post_id, &title, &year, &imdb_id, eff_season, eff_episode,
+        )
+        .await;
+        title = resolved.title;
+        year = resolved.year;
+        resolved.files
+    } else {
+        // Fast Path 2a — the MOVIE's own file set, paged (never a single `limit=200`
+        // call: the origin answers newest-first and truncates a long list).
+        crate::wp_data::fetch_post_files_paged(&post_id, 200, 600, 3).await
+    };
+    if files.is_empty() && !aka.is_empty() {
+        // Nothing at all yet: the alternate title may be the one the origin uses.
+        let kind0 = if is_series { "series" } else { "movie" };
+        let (_, _, f2) = crate::wp_data::stream_files_by_title(kind0, &aka, &year, item_id).await;
+        files = f2;
+    }
+    build_streams_from_files(
+        ctx,
+        item_type,
+        item_id,
+        &title,
+        &year,
+        &aka,
+        &imdb_id,
+        files,
+        eff_season,
+        eff_episode,
+        upstream,
+    )
+    .await
+}
+
+/// Season/episode the matcher runs with.
+///
+/// A series ROOT resolves to **S01E01** — the PHP passes
+/// `$targetSeason ?? 1` / `$targetEpisode ?? 1`. A MOVIE keeps 0/0 so
+/// [`build_streams_from_files()`] takes the movie branch.
+fn effective_season_episode(is_series: bool, season: i32, episode: i32) -> (i32, i32) {
+    if is_series {
+        (season.max(1), episode.max(1))
+    } else {
+        (0, 0)
+    }
+}
+
+/// Result of [`resolve_episode_files()`] — `title`/`year` may have been adopted
+/// from the origin or derived from the post's own file set, and the caller (and
+/// the matcher) must use the resolved values.
+struct EpisodeResolution {
+    title: String,
+    year: String,
+    files: Vec<crate::wp_data::WpFile>,
+}
+
+/// The `$add()` closure of `fd_fetch_episode_stream_files()` (backend.php:10060):
+/// dedupe by `short_code`, then the episode filter, then the strict series
+/// matcher. A file must clear all three to join the list.
+#[allow(clippy::too_many_arguments)]
+fn add_episode_files(
+    all: &mut Vec<crate::wp_data::WpFile>,
+    seen: &mut std::collections::HashSet<String>,
+    files: &[crate::wp_data::WpFile],
+    title: &str,
+    keyword: &str,
+    year: &str,
+    season: i32,
+    episode: i32,
+    names: &[String],
+    max: usize,
+) {
+    let series_title = if title.trim().is_empty() { keyword } else { title };
+    for f in files {
+        if all.len() >= max {
+            return;
+        }
+        if f.short_code.is_empty() || seen.contains(&f.short_code) {
+            continue;
+        }
+        let parsed = crate::matcher::classify_season_episode(
+            &f.title,
+            f.season_num,
+            f.episode_num,
+            &f.caption,
+        );
+        if !crate::matcher::file_matches_episode(parsed, season, episode) {
+            continue;
+        }
+        if !crate::matcher::series_file_matches_title(
+            &f.title,
+            series_title,
+            season,
+            episode,
+            year,
+            &f.caption,
+            names,
+        ) {
+            continue;
+        }
+        seen.insert(f.short_code.clone());
+        all.push(f.clone());
+    }
+}
+
+/// The per-episode token list of `fd_fetch_episode_stream_files()` step 3
+/// (backend.php:10301-10312), RAREST FIRST so the `max` cap is spent on the
+/// conventions that return few results rather than on `S01E01`.
+fn episode_tokens(season: i32, episode: i32) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    if episode <= 0 {
+        return tokens;
+    }
+    if episode < 10 {
+        // Rare, unpadded forms first (EP1, E1) — few uploaders use these.
+        tokens.push(format!("EP{}", episode));
+        tokens.push(format!("E{}", episode));
+    }
+    // Padded EP form (EP01) — also uncommon.
+    tokens.push(format!("EP{:02}", episode));
+    // Common forms last (E01, S01E01) — these return the most results.
+    tokens.push(format!("E{:02}", episode));
+    tokens.push(format!("S{:02}E{:02}", season.max(1), episode));
+    tokens
+}
+
+/// The ordered `search_files` probe list of step 3 (backend.php:10331-10352).
+///
+/// Order matters: `$add()` stops at the cap, so the targeted per-token queries
+/// run BEFORE the broad OR-group, which would otherwise fill the page with
+/// `S01E01` variants and hide the single `EP1` release. When the year is known
+/// each token is also probed WITH the year, because Manticore ANDs every term and
+/// the year sits between the title and the episode token in names like
+/// `Agent.Kim.Reactivated.2026.EP01.MalaySub.mp4`.
+fn episode_probe_queries(keyword: &str, year: &str, season: i32, episode: i32) -> Vec<String> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Vec::new();
+    }
+    let tokens = episode_tokens(season, episode);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let group = format!("({})", tokens.join(" | "));
+    let mut out: Vec<String> = Vec::new();
+    for tok in &tokens {
+        out.push(format!("{} {}", keyword, tok));
+        if !year.is_empty() {
+            out.push(format!("{} {} {}", keyword, year, tok));
+        }
+    }
+    if !year.is_empty() {
+        out.push(format!("{} {} {}", keyword, year, group));
+    }
+    out.push(format!("{} {}", keyword, group));
+    out.push(format!("{} {}", group, keyword));
+    // Possessive variants ("Princess's" vs "Princesss" vs "Princess") only add
+    // probes for the OR-group, and only when the hint actually has an apostrophe.
+    for variant in crate::matcher::stream_keyword_variants(keyword)
+        .into_iter()
+        .skip(1)
+    {
+        out.push(format!("{} {}", variant, group));
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    out.retain(|q| seen.insert(q.to_lowercase()));
+    out
+}
+
+/// Port of `fd_fetch_episode_stream_files()` (backend.php:9987-10388): every
+/// playable file of ONE series episode.
+///
+/// Steps, in the PHP's order:
+///
+/// 0. the POST'S OWN file set — one fetch serves every episode (the per-episode
+///    origin call below is a distinct URL, so without this every episode started
+///    cold). This is also where the YEAR is derived from a clear majority of the
+///    post's files, which is what keeps a 1999 anime from listing the 2023
+///    live-action's episodes (the ±1-year guard is inert without a year).
+/// 1. the PER-EPISODE index search — NOT gated on step 0 being empty: the post's
+///    own files are a SUBSET, so another uploader's MalaySub/quality variant of
+///    the SAME episode only appears here. It also supplies `resolved_title` /
+///    `resolved_year` when nothing else knows the title.
+/// 2. `get_post` when the title is still unknown, so the ladder below has a
+///    keyword to search with.
+/// 3. the parallel `search_files` probe ladder (rare token conventions first),
+///    run only when the per-episode search did NOT already confirm an answer —
+///    the origin answers `ok` even with zero items, and the PHP stops there
+///    rather than burning seconds on pointless scans (backend.php:10265).
+async fn resolve_episode_files(
+    post_id: &str,
+    title: &str,
+    year: &str,
+    imdb_id: &str,
+    season: i32,
+    episode: i32,
+) -> EpisodeResolution {
     const MAX_FILES: usize = 250;
-    if files.len() < MAX_FILES && (season > 0 || episode > 0) {
-        let keyword = stream_keyword_from_post_title(&title);
-        if !keyword.is_empty() {
-            let id_param = format!("post:{}", post_id);
-            let more = crate::wp_data::stream_files_episode(
-                "series",
-                &keyword,
-                &year,
-                &id_param,
-                season,
-                episode,
-                MAX_FILES,
-            )
-            .await;
-            if !more.is_empty() {
-                let before = files.len();
-                let mut seen: std::collections::HashSet<String> =
-                    files.iter().map(|f| f.short_code.clone()).collect();
-                for f in more {
-                    if seen.insert(f.short_code.clone()) {
-                        files.push(f);
-                    }
+    /// `$thinThreshold = max(3, ceil($maxFiles / 4))` — backend.php:10290.
+    const THIN_MIN: usize = 3;
+
+    let mut title = title.to_string();
+    let mut year = year.to_string();
+    let mut keyword = stream_keyword_from_post_title(&title);
+    let mut all: Vec<crate::wp_data::WpFile> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Verified episode names, resolved ONCE for every retrieval path below —
+    // `$episodeNames` in the PHP (backend.php:10052-10055). They let the matcher
+    // reject a file that names ANOTHER show's episode after this episode's marker
+    // (the sibling-work case). An empty list means "no evidence", and the guard
+    // then fails OPEN, so this can never hide a stream on its own.
+    let episode_names: Vec<String> = if imdb_id.trim().is_empty() {
+        Vec::new()
+    } else {
+        let settings = load_catalog_settings_merged();
+        upstream::episode_names(&settings, imdb_id, season, episode, &title, &year).await
+    };
+
+    // ── 0. the post's own file set ───────────────────────────────────────────
+    let post_files = crate::wp_data::fetch_post_files_paged(post_id, 200, 600, 3).await;
+    if !post_files.is_empty() {
+        if year.is_empty() {
+            if let Some(derived) = crate::wp_data::derive_year_from_files(&post_files) {
+                log(
+                    "stream: series year derived from post set",
+                    &serde_json::json!({
+                        "post_id": post_id, "year": derived,
+                        "tagged": post_files.len(), "total": post_files.len(),
+                    }),
+                );
+                year = derived;
+            }
+        }
+        add_episode_files(
+            &mut all,
+            &mut seen,
+            &post_files,
+            &title,
+            &keyword,
+            &year,
+            season,
+            episode,
+            &episode_names,
+            MAX_FILES,
+        );
+        log(
+            "stream: episode files from cached post set",
+            &serde_json::json!({
+                "post_id": post_id, "season": season, "episode": episode,
+                "post_files": post_files.len(), "matched": all.len(),
+            }),
+        );
+    }
+
+    // ── 1. the per-episode index search ──────────────────────────────────────
+    let mut fast_path_done = false;
+    if all.len() < MAX_FILES && post_id.chars().all(|c| c.is_ascii_digit()) {
+        let id_param = format!("post:{}", post_id);
+        let more = crate::wp_data::stream_files_episode(
+            "series",
+            &keyword,
+            &id_param,
+            season,
+            episode,
+            MAX_FILES,
+        )
+        .await;
+        if more.ok {
+            fast_path_done = true;
+            if title.is_empty() && !more.resolved_title.is_empty() {
+                title = more.resolved_title;
+                keyword = stream_keyword_from_post_title(&title);
+                if !more.resolved_year.is_empty() {
+                    year = more.resolved_year;
+                } else if year.is_empty() {
+                    year = first_year_of(&title);
                 }
                 log(
-                    "stream: episode index search merged",
+                    "stream: episode title adopted from the origin",
                     &serde_json::json!({
-                        "post_id": post_id, "season": season, "episode": episode,
-                        "keyword": keyword, "before": before, "after": files.len(),
+                        "post_id": post_id, "title": title, "year": year,
                     }),
                 );
             }
         }
+        let before = all.len();
+        add_episode_files(
+            &mut all,
+            &mut seen,
+            &more.files,
+            &title,
+            &keyword,
+            &year,
+            season,
+            episode,
+            &episode_names,
+            MAX_FILES,
+        );
+        if all.len() > before {
+            log(
+                "stream: episode index search merged",
+                &serde_json::json!({
+                    "post_id": post_id, "season": season, "episode": episode,
+                    "keyword": keyword, "before": before, "after": all.len(),
+                }),
+            );
+        }
     }
-    if files.is_empty() && !aka.is_empty() {
-        // Nothing at all yet: the alternate title may be the one the origin uses.
-        let kind0 = if item_type == "series" || season > 0 { "series" } else { "movie" };
-        let (_, f2) = crate::wp_data::stream_files_by_title(kind0, &aka, &year, item_id).await;
-        files = f2;
+
+    // ── 2. `get_post` when the title is still unknown ────────────────────────
+    let mut fetched_fallback_post = false;
+    if title.is_empty() {
+        // Cache-first, so this is normally free: the route already asked for it.
+        let p = crate::wp_data::get_post(post_id).await;
+        let t = crate::wp_data::post_title(&p);
+        if !t.is_empty() {
+            title = t;
+            keyword = stream_keyword_from_post_title(&title);
+            if year.is_empty() {
+                year = crate::wp_data::post_year(&p);
+            }
+            fetched_fallback_post = true;
+        }
     }
-    build_streams_from_files(
-        ctx, item_type, item_id, &title, &year, &aka, &imdb_id, files, season, episode, upstream,
-    )
-    .await
+
+    // ── 3. the probe ladder ──────────────────────────────────────────────────
+    //
+    // Skipped when the per-episode search CONFIRMED an answer (`ok` — even with
+    // zero items) and no fallback post was needed: at that point the origin has
+    // already been asked about this exact episode, and the PHP returns rather
+    // than running up to 11 more searches (measured: +4-5 s for nothing).
+    let thin = THIN_MIN.max((MAX_FILES as f64 / 4.0).ceil() as usize);
+    let skip_ladder = fast_path_done && !keyword.is_empty() && !fetched_fallback_post;
+    if all.len() < thin && !keyword.is_empty() && !skip_ladder {
+        let queries = episode_probe_queries(&keyword, &year, season, episode);
+        if !queries.is_empty() {
+            let results = futures_util::future::join_all(queries.iter().map(|q| {
+                let q = q.clone();
+                async move { crate::wp_data::search_files(&q, 50).await }
+            }))
+            .await;
+            for (i, _q) in queries.iter().enumerate() {
+                if all.len() >= MAX_FILES {
+                    break;
+                }
+                add_episode_files(
+                    &mut all,
+                    &mut seen,
+                    &results[i],
+                    &title,
+                    &keyword,
+                    &year,
+                    season,
+                    episode,
+                    &episode_names,
+                    MAX_FILES,
+                );
+            }
+            log(
+                "stream: episode fallback probes",
+                &serde_json::json!({
+                    "post_id": post_id, "season": season, "episode": episode,
+                    "queries": queries.len(), "matched": all.len(),
+                }),
+            );
+        }
+    }
+
+    EpisodeResolution {
+        title,
+        year,
+        files: all,
+    }
 }
 
 /// The first 4-digit year in a string (`"2023–"`, `"2019-03-01"`, `"2019"`).
@@ -2089,7 +2406,7 @@ async fn handle_external_stream(
         // `id` itself and answers `resolved_title`, so an id that is not in the
         // local `media_ids_idx` can still be recovered in ONE origin call.
         let kind = if item_type == "series" || season > 0 { "series" } else { "movie" };
-        let (by_id_title, by_id_files) =
+        let (by_id_title, by_id_year, by_id_files) =
             crate::wp_data::stream_files_by_title(kind, "", "", item_id).await;
         if !by_id_files.is_empty() {
             let t = if by_id_title.is_empty() {
@@ -2097,6 +2414,12 @@ async fn handle_external_stream(
             } else {
                 by_id_title
             };
+            // The origin resolved the year too (PHP backend.php:17212-17217): it is
+            // the only place it exists for an id that is not in `media_ids_idx`, and
+            // the ±1-year guard in the matcher is inert without it.
+            if year.is_empty() && !by_id_year.is_empty() {
+                year = by_id_year;
+            }
             log(
                 "stream: external id resolved by origin id search",
                 &serde_json::json!({"item_id": item_id, "title": t, "files": by_id_files.len()}),
@@ -2165,10 +2488,14 @@ async fn handle_external_stream(
     }
 
     let kind = if item_type == "series" || season > 0 { "series" } else { "movie" };
-    let (resolved, mut files) = crate::wp_data::stream_files_by_title(kind, &title, &year, item_id).await;
+    let (resolved, resolved_year, mut files) =
+        crate::wp_data::stream_files_by_title(kind, &title, &year, item_id).await;
+    if year.is_empty() && !resolved_year.is_empty() {
+        year = resolved_year;
+    }
     // AKA fallback: "Superstition" finds nothing, "Khurafat" finds the files.
     if files.is_empty() && !aka.is_empty() {
-        let (r2, f2) = crate::wp_data::stream_files_by_title(kind, &aka, &year, item_id).await;
+        let (r2, _, f2) = crate::wp_data::stream_files_by_title(kind, &aka, &year, item_id).await;
         if !f2.is_empty() {
             files = f2;
             title = if r2.is_empty() { aka.clone() } else { r2 };
@@ -4363,6 +4690,54 @@ mod tests {
         for good in ["10.0.0.5", "172.16.4.9", "172.31.255.254", "192.168.2.118"] {
             assert!(super::is_private_ipv4(good), "{good} must be accepted");
         }
+    }
+
+    #[test]
+    fn series_root_is_s01e01_like_the_php() {
+        // `pm:post:<id>` with no `:S:E` resolves to `$targetSeason ?? 1` /
+        // `$targetEpisode ?? 1`, so the ROOT must run the episode resolver too.
+        assert_eq!(effective_season_episode(true, 0, 0), (1, 1));
+        assert_eq!(effective_season_episode(true, 2, 0), (2, 1));
+        assert_eq!(effective_season_episode(true, 1, 7), (1, 7));
+        // A MOVIE keeps 0/0 so `build_streams_from_files()` takes the movie branch.
+        assert_eq!(effective_season_episode(false, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn episode_tokens_put_the_rare_conventions_first() {
+        // The cap is spent on the conventions that return FEW results first.
+        assert_eq!(
+            episode_tokens(1, 1),
+            vec!["EP1", "E1", "EP01", "E01", "S01E01"]
+        );
+        // Episode 12 is never written unpadded, so those forms are dropped.
+        assert_eq!(episode_tokens(1, 12), vec!["EP12", "E12", "S01E12"]);
+        assert!(episode_tokens(1, 0).is_empty());
+    }
+
+    #[test]
+    fn probe_queries_mirror_the_php_ladder() {
+        let q = episode_probe_queries("Agent Kim", "2026", 1, 1);
+        assert_eq!(q[0], "Agent Kim EP1");
+        // The year sits BETWEEN the title and the token in real release names, and
+        // Manticore ANDs every term, so each token is probed with it as well.
+        assert_eq!(q[1], "Agent Kim 2026 EP1");
+        assert_eq!(q[2], "Agent Kim E1");
+        assert!(q.contains(&"Agent Kim 2026 (EP1 | E1 | EP01 | E01 | S01E01)".to_string()));
+        // The reversed group finds releases that put the episode tag FIRST.
+        assert_eq!(q[q.len() - 1], "(EP1 | E1 | EP01 | E01 | S01E01) Agent Kim");
+        // An unknown year adds no year-qualified probes.
+        let no_year = episode_probe_queries("Agent Kim", "", 1, 1);
+        assert!(!no_year.iter().any(|s| s.contains("2026")));
+        assert_eq!(no_year[0], "Agent Kim EP1");
+        // An apostrophe adds the possessive variants of the OR-group only.
+        let apos = episode_probe_queries("Grey's Anatomy", "", 1, 1);
+        assert!(apos.iter().any(|s| s.starts_with("Greys Anatomy (")));
+        assert!(apos.iter().any(|s| s.starts_with("Grey Anatomy (")));
+        // A title without an apostrophe gains no extra probes.
+        assert_eq!(episode_probe_queries("Agent Kim", "", 1, 1).len(), no_year.len());
+        // Nothing to probe -> no queries at all.
+        assert!(episode_probe_queries("", "", 1, 1).is_empty());
     }
 
     #[test]

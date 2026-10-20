@@ -101,6 +101,15 @@ pub fn stream_ajax_wants_bot(action: &str) -> bool {
 /// code read the file "at any age" for this; bounded now.
 const AJAX_STALE_GRACE: i64 = 21_600;
 
+/// Freshness of the PER-EPISODE `stream-files` search.
+///
+/// The PHP fetches that exact URL through `fd_cached_wp_json($url, 15)`
+/// (backend.php:10185) — 15 seconds, not the 300 the generic
+/// `fd_fetch_stream_ajax()` layer uses — so a freshly uploaded episode shows up
+/// almost immediately. A longer TTL here means a new release can stay invisible
+/// for minutes after the PHP would already list it.
+pub const PER_EPISODE_SEARCH_TTL: i64 = 15;
+
 /// `fd_fetch_stream_ajax()`: cache + single-flight + stale fallback, `bot_id` added
 /// when the caller did not supply one (the origin resolves files per bot, so a
 /// missing `bot_id` changes the answer, not just the cache key).
@@ -448,12 +457,20 @@ pub async fn lookup_id(prefix: &str, id: &str) -> Value {
 /// searches by title and answers `{ok, resolved_title, items: […]}`. The
 /// matcher still decides which of those items belong to the title, because the
 /// origin's title search returns a superset (it ignores `year`).
+/// Returns `(resolved_title, resolved_year, files)`.
+///
+/// It goes through [`httpc::cached_wp_json`] (the port of `fd_cached_wp_json()`),
+/// **not** [`fetch_stream_ajax`]: that layer unwraps `items` (PHP:
+/// `$decoded['data'] ?? $decoded['items'] ?? $decoded`, backend.php:9561), which
+/// throws away `ok` and `resolved_title`/`resolved_year` — the two fields this
+/// endpoint exists to supply. The PHP's fast paths call `fd_http_json()` /
+/// `fd_cached_wp_json()` on the same URL for exactly that reason.
 pub async fn stream_files_by_title(
     media_type: &str,
     title: &str,
     year: &str,
     id: &str,
-) -> (String, Vec<WpFile>) {
+) -> (String, String, Vec<WpFile>) {
     let mut params = vec![
         ("type".to_string(), media_type.to_string()),
         ("title".to_string(), title.to_string()),
@@ -464,19 +481,39 @@ pub async fn stream_files_by_title(
     if !id.is_empty() {
         params.push(("id".to_string(), id.to_string()));
     }
-    let res = fetch_stream_ajax("stream_files", &params).await;
+    let url = query_add(rest_route("stream_files"), &params);
+    let res = httpc::cached_wp_json(&url, stream_ajax_ttl("stream_files"), 15).await;
     let resolved_title = res
         .get("resolved_title")
         .and_then(|v| v.as_str())
         .unwrap_or(title)
+        .trim()
         .to_string();
-    // CRITICAL: `/stream-files` answers a BARE JSON ARRAY of file rows, not an
-    // object with `items`. Reading only `items` made every `tt…` stream request
-    // answer "no file matched the title" (measured: `tt11540908:1:1` "Carrie"
-    // returned 75,264 B of real files that were parsed as ZERO).
+    let resolved_year = match res.get("resolved_year") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    };
+    // CRITICAL: `/stream-files` may answer a BARE JSON ARRAY of file rows instead
+    // of an object with `items`. Reading only `items` made every `tt…` stream
+    // request answer "no file matched the title" (measured: `tt11540908:1:1`
+    // "Carrie" returned 75,264 B of real files that were parsed as ZERO).
     let items = rows_of(&res, &["items", "files"]);
     let files = items.iter().filter_map(wp_file_from).collect();
-    (resolved_title, files)
+    (resolved_title, resolved_year, files)
+}
+
+/// The per-episode `stream-files` answer.
+///
+/// `ok` is the PHP's `isset($res['ok'])` — the origin answers `ok` **even with
+/// zero items**, and that is what tells the caller to STOP instead of running the
+/// expensive fallback ladder (backend.php:10265).
+#[derive(Debug, Clone, Default)]
+pub struct EpisodeFiles {
+    pub ok: bool,
+    pub resolved_title: String,
+    pub resolved_year: String,
+    pub files: Vec<WpFile>,
 }
 
 /// `GET {WP_API_BASE}/stream-files?type=series&season=…&episode=…&limit=…`
@@ -485,16 +522,22 @@ pub async fn stream_files_by_title(
 ///
 /// This is the call that surfaces the episode's other releases: the post's own
 /// attached files are a subset, so the same episode uploaded by another group
-/// only appears here. Cached by the same cache-first layer (`stream_files` TTL).
+/// only appears here. Cached with the PHP's own 15 s freshness
+/// ([`PER_EPISODE_SEARCH_TTL`]) so a new upload appears as quickly as it does on
+/// the PHP.
+///
+/// `year` is deliberately NOT sent: the PHP's URL carries only
+/// `type/season/episode/limit/title/id`, and the origin ignores `year` anyway
+/// (it matches on the resolved title alone). Sending it would also split the
+/// cache key the moment the year becomes known from the post's own file set.
 pub async fn stream_files_episode(
     media_type: &str,
     keyword: &str,
-    year: &str,
     id: &str,
     season: i32,
     episode: i32,
     limit: usize,
-) -> Vec<WpFile> {
+) -> EpisodeFiles {
     let mut params = vec![
         ("type".to_string(), media_type.to_string()),
         ("season".to_string(), season.to_string()),
@@ -504,17 +547,97 @@ pub async fn stream_files_episode(
     if !keyword.is_empty() {
         params.push(("title".to_string(), keyword.to_string()));
     }
-    if !year.is_empty() {
-        params.push(("year".to_string(), year.to_string()));
-    }
     if !id.is_empty() {
         params.push(("id".to_string(), id.to_string()));
     }
-    let res = fetch_stream_ajax("stream_files", &params).await;
-    rows_of(&res, &["items", "files"])
+    // Whole body, 15 s: the SAME shape the PHP uses (`fd_cached_wp_json($url, 15)`).
+    // Going through `fetch_stream_ajax()` would unwrap `items` and lose `ok` —
+    // which is the flag that stops the fallback ladder — plus `resolved_title`.
+    let url = query_add(rest_route("stream_files"), &params);
+    let res = httpc::cached_wp_json(&url, PER_EPISODE_SEARCH_TTL, 15).await;
+    EpisodeFiles {
+        ok: res.get("ok").is_some(),
+        resolved_title: res
+            .get("resolved_title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+        resolved_year: match res.get("resolved_year") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        },
+        files: rows_of(&res, &["items", "files"])
+            .iter()
+            .filter_map(wp_file_from)
+            .collect(),
+    }
+}
+
+/// `search_files` (`GET {WP_API_BASE}/search-files?search=…&limit=…`) — the
+/// free-text index probe the episode fallback ladder races in parallel
+/// (`fd_search_files_parallel()`, backend.php:9881).
+pub async fn search_files(search: &str, limit: usize) -> Vec<WpFile> {
+    if search.trim().is_empty() {
+        return Vec::new();
+    }
+    let params = vec![
+        ("search".to_string(), search.to_string()),
+        ("limit".to_string(), limit.to_string()),
+        ("offset".to_string(), "0".to_string()),
+    ];
+    let res = fetch_stream_ajax("search_files", &params).await;
+    rows_of(&res, &["files", "items"])
         .iter()
         .filter_map(wp_file_from)
         .collect()
+}
+
+/// Derive the entry YEAR from a post's own file set
+/// (backend.php:10121-10142).
+///
+/// `lookup-id?prefix=post&id=8798795472` answers with the title "One Piece" and
+/// nothing else, yet all 600 of that post's files are `One.Piece.1999.<episode>`.
+/// Without a year the ±1-year guard in `series_file_matches_title()` is inert, so
+/// the 2023 live-action's and the 2026 remake's Episode-1 files were accepted
+/// under the 1999 anime — the reported sibling-work mixing.
+///
+/// Adopted only from a clear majority: at least **20** tagged files, the winner
+/// covering at least **60%** of them, and only for a plausible year (≥1950).
+/// Ties resolve to the year seen FIRST, like PHP's stable `arsort`.
+pub fn derive_year_from_files(files: &[WpFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    // Insertion-ordered counts (a map would lose the tie-break order).
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let year_re = fancy_regex::Regex::new(r"\b(19\d{2}|20\d{2})\b").ok()?;
+    for f in files {
+        let Some(caps) = year_re.captures(&f.title).ok().flatten() else {
+            continue;
+        };
+        let Some(m) = caps.get(1) else { continue };
+        let y = m.as_str().to_string();
+        match order.iter_mut().find(|(k, _)| *k == y) {
+            Some(slot) => slot.1 += 1,
+            None => order.push((y, 1)),
+        }
+    }
+    let mut best: Option<&(String, usize)> = None;
+    for slot in &order {
+        if best.map(|b| slot.1 > b.1).unwrap_or(true) {
+            best = Some(slot);
+        }
+    }
+    let (year, count) = best?;
+    let tagged: usize = order.iter().map(|(_, c)| c).sum();
+    let plausible = year.parse::<i32>().map(|y| y >= 1950).unwrap_or(false);
+    if plausible && *count >= 20 && (*count as f64) >= 0.6 * tagged as f64 {
+        Some(year.clone())
+    } else {
+        None
+    }
 }
 
 /// Rows from any of the shapes the origin uses: a bare array, or an object with
@@ -587,6 +710,60 @@ mod tests {
         assert_eq!(stream_ajax_ttl("post_files"), 600);
         assert_eq!(stream_ajax_ttl("trending"), 3600);
         assert_eq!(stream_ajax_ttl("something_else"), 300);
+        // The per-episode search is fresher than every generic action, exactly
+        // like the PHP's explicit `fd_cached_wp_json($url, 15)`.
+        assert_eq!(PER_EPISODE_SEARCH_TTL, 15);
+        assert!(PER_EPISODE_SEARCH_TTL < stream_ajax_ttl("stream_files"));
+    }
+
+    fn files(titles: &[&str]) -> Vec<WpFile> {
+        titles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| WpFile {
+                short_code: format!("c{i}"),
+                title: t.to_string(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn derives_year_from_a_clear_majority_of_the_post_set() {
+        // The One Piece 1999 anime post: every file carries the year.
+        let mut list = Vec::new();
+        for i in 1..=25 {
+            list.push(format!("One.Piece.1999.EP{:02}.1080p.mkv", i));
+        }
+        list.push("One.Piece.Live.Action.1080p.mkv".to_string());
+        let year = derive_year_from_files(&files(&list.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+        assert_eq!(year.as_deref(), Some("1999"));
+    }
+
+    #[test]
+    fn year_derivation_needs_20_tagged_files() {
+        // 19 tagged files is below the PHP's floor: the guard stays inert rather
+        // than re-dating a show from a handful of rows.
+        let list: Vec<String> = (1..=19).map(|i| format!("Show.2004.EP{i}.mkv")).collect();
+        assert!(derive_year_from_files(&files(&list.iter().map(|s| s.as_str()).collect::<Vec<_>>())).is_none());
+    }
+
+    #[test]
+    fn year_derivation_needs_a_60_percent_majority() {
+        // 20 files say 1999 but 20 say 2023 — no majority, so nothing is adopted.
+        let mut list: Vec<String> = (1..=20).map(|i| format!("Show.1999.EP{i}.mkv")).collect();
+        list.extend((1..=20).map(|i| format!("Show.2023.EP{i}.mkv")));
+        assert!(derive_year_from_files(&files(&list.iter().map(|s| s.as_str()).collect::<Vec<_>>())).is_none());
+    }
+
+    #[test]
+    fn year_derivation_ignores_untagged_files_and_empty_sets() {
+        assert!(derive_year_from_files(&[]).is_none());
+        // Untagged rows must not count towards either the floor or the ratio.
+        let mut list: Vec<String> = (1..=20).map(|i| format!("Show.2011.EP{i}.mkv")).collect();
+        list.extend((1..=80).map(|i| format!("Show.EP{i}.mkv")));
+        let year = derive_year_from_files(&files(&list.iter().map(|s| s.as_str()).collect::<Vec<_>>()));
+        assert_eq!(year.as_deref(), Some("2011"));
     }
 
     #[test]

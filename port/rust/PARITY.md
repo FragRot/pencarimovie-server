@@ -607,3 +607,47 @@ on-device with [`android/pencarimovie-rust/tools/skew_check.mjs`](../../android/
 
 Keep the sign and the wording in step: if the subtraction is ever flipped back,
 `ahead`/`behind` swap with it.
+
+## Series episodes: the whole `fd_fetch_episode_stream_files()` ladder
+
+[`routes.rs`](src/routes.rs) `resolve_episode_files()` is now a step-for-step port
+of `fd_fetch_episode_stream_files()` (backend.php:9987-10388), and the post route
+runs it for **every** series request — a series ROOT included.
+
+| Piece               | PHP                                                                                                   | Rust                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| root is S01E01      | `$targetSeason ?? 1` / `$targetEpisode ?? 1` (backend.php:16828)                                      | `effective_season_episode()` (unit-tested)               |
+| step 0              | the post's OWN files, `fd_fetch_post_files_paged(200/600/3)`                                          | `fetch_post_files_paged()` + `add_episode_files()`       |
+| year from files     | mode of 4-digit years, ≥20 tagged, ≥60 % (backend.php:10121-10142)                                    | `wp_data::derive_year_from_files()` (4 unit tests)       |
+| step 1              | per-episode `stream-files?type=series&season&episode&limit&title&id`, NOT gated on step 0 being empty | `wp_data::stream_files_episode()`                        |
+| title/year adoption | `resolved_title` / `resolved_year` when the title is empty                                            | adopted in step 1                                        |
+| early stop          | `if ($fastPathDone && $keyword !== '' && !$fetchedFallbackPost) return`                               | `skip_ladder`                                            |
+| step 2              | `get_post` when the title is still unknown                                                            | same (cache-first)                                       |
+| step 3              | 13 `search_files` probes, rare episode-token conventions first                                        | `episode_probe_queries()` + `join_all`                   |
+| episode names       | `fd_upstream_episode_names()` resolved ONCE for the whole function                                    | `upstream::episode_names()` in `resolve_episode_files()` |
+
+Four things are load-bearing and each was measured:
+
+1. **The per-episode call must NOT go through `fetch_stream_ajax()`.** That layer
+   unwraps `$decoded['items']` (PHP does the same at backend.php:9561), which
+   drops `ok` and `resolved_title`/`resolved_year` — `ok` is the flag that stops
+   the fallback ladder, so without it every episode paid the full 13-probe scan
+   (measured: 719 ms → 549 ms on `pm:post:9000020617`, and the probe block
+   disappears from the log). Both `/stream-files` helpers therefore use
+   `httpc::cached_wp_json()`, the port of `fd_cached_wp_json()`.
+2. **The per-episode TTL is 15 s** (`PER_EPISODE_SEARCH_TTL`), the PHP's explicit
+   `fd_cached_wp_json($url, 15)`, so a freshly uploaded episode appears as fast as
+   it does on PHP. The by-title search keeps the generic 300 s.
+3. **`year` is not sent on the per-episode URL.** The PHP does not send it either,
+   the origin ignores it, and sending it would split the cache key the moment the
+   year becomes known from the post's own file set.
+4. **`fd_stream_keyword_variants()` is a quirk-for-quirk port.** The PHP's
+   alternation `['’`]s|s['’`]|\bs\b`scans left to right, so`"Princess's"`yields`Princes`while`"Grey's"`yields`Grey`. Verified against
+`bin/php.exe`and pinned by`matcher::stream_keyword_variants_cover_the_possessive_forms`.
+
+Verified with [`storage/_ep_list.ps1`](../../storage/_ep_list.ps1) and
+[`storage/_type_check.ps1`](../../storage/_type_check.ps1) (cold caches):
+root **20** media (was 5 — it is episode 1's whole file list now, like PHP),
+`:1:1` 20, `:1:2` 14, `:1:12` 12, Kudrat 9, Siccîn 4, Zul Aaryan 3;
+`pm:post:8798795472:1:1` **54** with 0 × 2023 / 0 × LEGO / 0 × live-action;
+`storage/_id_resolve.ps1` unchanged (101/2/30/5/101/38).
