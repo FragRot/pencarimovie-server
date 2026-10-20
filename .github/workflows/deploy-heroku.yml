@@ -24,16 +24,21 @@ concurrency:
   group: heroku-deploy
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  # Pull the native image that `release.yml` publishes as :native.
+  packages: read
+
 jobs:
   deploy:
-    name: Push to Heroku (container stack)
+    name: Promote the native image to Heroku
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Heroku needs a non-shallow clone to accept the push.
+          # Heroku needs a non-shallow clone to accept the git fallback below.
           fetch-depth: 0
 
       # Fail fast with a clear message instead of a confusing auth error.
@@ -46,21 +51,50 @@ jobs:
             exit 1
           fi
 
-      # Same syntax gate the repo's own test workflow uses, so a broken build
-      # never reaches Heroku.
-      - name: Validate PHP syntax
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq php-cli
-          php -l backend.php
-          php -l router.php
-          php -l index.php
-
-      - name: Deploy
+      # Fast path: Heroku's container stack CANNOT pull an external registry image
+      # through `heroku.yml` (that always builds a Dockerfile), but the container
+      # registry accepts a prebuilt one: pull the CI-built native image (GHCR),
+      # retag it for registry.heroku.com and release it. No Rust rebuild per push.
+      - name: Deploy the prebuilt image (no rebuild)
+        id: image
+        continue-on-error: true
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
           HEROKU_APP: pm-server
         run: |
+          set -euo pipefail
+          IMG="ghcr.io/${{ github.repository }}:native"
+
+          # Public package: no login needed. Private: the workflow token can read
+          # this repository's own packages.
+          if ! docker pull "$IMG" 2>/dev/null; then
+            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            docker pull "$IMG"
+          fi
+
+          echo "$HEROKU_API_KEY" | docker login --username=_ --password-stdin registry.heroku.com
+          docker tag "$IMG" "registry.heroku.com/${HEROKU_APP}/web"
+          docker push "registry.heroku.com/${HEROKU_APP}/web"
+
+          # Same effect as `heroku container:release web`.
+          curl -sS -X PATCH \
+            -H "Accept: application/vnd.heroku+json; version=3" \
+            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"updates":[{"type":"web"}]}' \
+            "https://api.heroku.com/apps/${HEROKU_APP}/formation" -o /dev/null
+          echo "Promoted ${IMG} to ${HEROKU_APP}."
+
+      # Fallback: no GHCR image yet (or the pull failed) -> build on Heroku from
+      # the commit, which is the slow path this job exists to avoid but must keep
+      # working so a push is never a red deploy.
+      - name: Deploy by building on Heroku (fallback)
+        if: steps.image.outcome != 'success'
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+          HEROKU_APP: pm-server
+        run: |
+          echo "::notice::No prebuilt image; building on Heroku instead."
           set -euo pipefail
 
           # Heroku authenticates with the API key as the password and any
