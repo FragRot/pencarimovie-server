@@ -355,3 +355,121 @@ jobs:
 
             file_put_contents(getenv("GITHUB_STEP_SUMMARY"), $summary, FILE_APPEND);
           '
+
+  # ── the native build: same product, one binary, no PHP ─────────────────────
+  # `port/rust` embeds `public/` at compile time, so every artifact below is a
+  # single executable plus the optional launcher scripts in port/rust/desktop.
+  # Built on each desktop OS: a cross-compiled binary is not something we ship.
+  native-build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+          - os: windows-latest
+            artifact: windows-x86_64
+          - os: macos-latest
+            artifact: macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (dashboard embedded)
+        working-directory: port/rust
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="pencarimovie-server-${{ matrix.artifact }}"
+          BIN="port/rust/target/release/pencarimovie-server"
+          [ -f "$BIN" ] || BIN="$BIN.exe"
+          echo "binary: $BIN"
+          "$BIN" --version
+
+          mkdir -p "stage/$NAME/storage" dist-rust
+          cp "$BIN" "stage/$NAME/"
+          cp port/rust/desktop/README.txt "stage/$NAME/"
+          case "$RUNNER_OS" in
+            Windows)
+              cp port/rust/desktop/windows/* "stage/$NAME/"
+              [ -f tray.ico ] && cp tray.ico "stage/$NAME/pencarimovie.ico" || true
+              ;;
+            Linux)
+              cp port/rust/desktop/linux/* "stage/$NAME/"
+              [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
+              ;;
+            macOS)
+              cp port/rust/desktop/macos/* "stage/$NAME/"
+              [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
+              ;;
+          esac
+          chmod +x "stage/$NAME"/*.sh "stage/$NAME"/*.command 2>/dev/null || true
+          chmod +x "stage/$NAME/pencarimovie-server" 2>/dev/null || true
+
+          tar -czf "dist-rust/$NAME.tar.gz" -C stage "$NAME"
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd dist-rust && sha256sum "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          else
+            ( cd dist-rust && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          fi
+          ls -lh dist-rust/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist-rust/*
+
+      - name: Attach to the release
+        if: ${{ github.event.inputs.tag != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
+          gh release upload "$TAG" dist-rust/* --clobber
+
+  # ── Alpine (musl) image: the deployable form for Docker / Heroku ───────────
+  # Built and smoke-tested here because the dev machine has no Docker: the image
+  # must answer /api/version and serve the embedded dashboard before it is
+  # published.
+  native-docker:
+    runs-on: ubuntu-latest
+    needs: native-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -f Dockerfile.rust -t pencarimovie-server:native .
+
+      - name: Smoke test (version + dashboard)
+        run: |
+          set -euo pipefail
+          docker run -d --name pm -p 18088:8088 pencarimovie-server:native
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18088/api/version >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          echo "--- /api/version"; curl -fsS http://127.0.0.1:18088/api/version; echo
+          echo "--- /"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/
+          echo "--- /manifest.json"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/manifest.json
+          docker logs pm | tail -n 20
+          docker rm -f pm
+
+      - name: Push to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
+          IMG="ghcr.io/${{ github.repository }}"
+          docker tag pencarimovie-server:native "$IMG:native"
+          docker push "$IMG:native"
+          if [ -n "$TAG" ]; then
+            docker tag pencarimovie-server:native "$IMG:native-$TAG"
+            docker push "$IMG:native-$TAG"
+          fi

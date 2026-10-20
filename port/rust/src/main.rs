@@ -1,0 +1,498 @@
+//! HTTP entry point. `axum` + `tokio`, `127.0.0.1:8088` by default.
+//!
+//! ```text
+//!   pencarimovie-server --port 8088 [--host 127.0.0.1] [--workers N]
+//!                     [--inflight 8] [--max-streams 256]
+//!   pencarimovie-server --decode <file_id_mt> [expected_id]
+//! ```
+//!
+//! `--inflight N` (default 8) caps `upload.getFile` parts in flight **per
+//! connection**: each `Client` in a `BotEntry` owns its own semaphore, so
+//! `--workers 8 --inflight 8` is 64 parts across 8 connections. `--max-streams`
+//! (default 256) caps concurrent `/api/download` bodies; excess viewers queue for
+//! 5 s and then get 503 + `Retry-After`.
+//!
+//! `--workers N` creates N independent grammers `Client`s (each with its own
+//! `SenderPool`, therefore its own connection set) and round-robins requests
+//! over them. That is the only way to get more than one connection per DC with
+//! grammers; see README.md for the measured difference between
+//! "1 client x 4 tasks" and "4 clients x 1 task".
+
+mod assets;
+mod audio;
+mod auth;
+mod cache;
+mod config;
+mod credentials;
+mod diagnostics;
+mod download;
+mod eclipse;
+mod fileid;
+mod httpc;
+mod log;
+mod matcher;
+mod resolve;
+mod respond;
+mod routes;
+mod session;
+mod storage;
+mod telegram;
+mod tunnel;
+mod upstream;
+mod wp_data;
+
+use std::io::IsTerminal;
+use std::net::SocketAddr;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+use axum::Router;
+use axum::extract::Request;
+use axum::response::Response;
+use tokio::net::TcpListener;
+
+pub struct AppState {
+    pub port: u16,
+    pub workers: usize,
+    /// Max `upload.getFile` parts in flight per grammers `Client` connection.
+    pub inflight: usize,
+    /// Global cap on concurrent `/api/download` responses (`--max-streams`).
+    pub download_gate: Arc<tokio::sync::Semaphore>,
+    pub max_streams: usize,
+    pub telegram: telegram::TelegramPool,
+}
+
+fn arg_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == flag)?;
+    args.get(i + 1).cloned()
+}
+
+fn arg_pos(flag: &str) -> Option<usize> {
+    let args: Vec<String> = std::env::args().collect();
+    args.iter().position(|a| a == flag)
+}
+
+/// One `AppState` per process; the router has a single fallback, so the state is
+/// stored here instead of behind an extractor (a plain `Arc<AppState>` argument
+/// is not an extractor, and `State<..>` would force a generic router).
+static STATE: std::sync::OnceLock<Arc<AppState>> = std::sync::OnceLock::new();
+
+#[allow(dead_code)]
+fn _assert_future_send() {
+    fn need<T: Send>(_: T) {}
+    let req = Request::builder().body(axum::body::Body::empty()).unwrap();
+    need(serve_all(req));
+}
+
+async fn serve_all(req: Request) -> Response {
+    let state = STATE
+        .get()
+        .expect("AppState must be initialised before serving")
+        .clone();
+    routes::handle(state, req).await
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // `--version` / `-V`: one line, no storage, no network. This is what the
+    // packaging scripts assert on every platform (`--version` must print *before*
+    // anything tries to boot grammers or read `storage/`).
+    if arg_pos("--version").is_some() || arg_pos("-V").is_some() {
+        println!("{}", version_line());
+        return Ok(());
+    }
+
+    // The APP shell that launched this engine (the Android APK's versionName).
+    // `/api/version` reports it as `client_version`; without it the dashboard
+    // could only show the engine version, so users could not tell which APK they
+    // were running.
+    if let Some(v) = arg_value("--app-version").or_else(|| storage::env("PM_APP_VERSION")) {
+        config::set_client_version(&v);
+    }
+
+    // `--decode` / `--selftest`: print the Bot API file_id decoding, then exit.
+    if let Some(i) = arg_pos("--decode").or_else(|| arg_pos("--selftest")) {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(raw) = args.get(i + 1) else {
+            eprintln!("usage: pencarimovie-server --decode <file_id_mt> [expected_id]");
+            std::process::exit(2);
+        };
+        let expected = args.get(i + 2).map(|s| s.as_str());
+        match fileid::decode_file_id(raw) {
+            Ok(d) => {
+                let mut out = d.to_json();
+                if let Some(exp) = expected {
+                    out["id_matches_expected"] = serde_json::json!(exp == d.id.to_string());
+                }
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{{\"ok\":0,\"error\":\"{}\"}}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // `--audio-probe <file>`: print what the ALAC decoder sees for a local
+    // `.m4a`, and optionally decode a window of PCM from it. This is how a
+    // "rejected, falling back to the raw download" log line is diagnosed.
+    if let Some(i) = arg_pos("--audio-probe") {
+        let args: Vec<String> = std::env::args().collect();
+        let Some(path) = args.get(i + 1) else {
+            eprintln!("usage: pencarimovie-server --audio-probe <file.m4a> [start_pcm_byte] [bytes]");
+            std::process::exit(2);
+        };
+        let bytes = std::fs::read(path)?;
+        match audio::probe_why(&bytes) {
+            Ok(info) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": 1,
+                        "file": path,
+                        "bytes": bytes.len(),
+                        "sample_rate": info.sample_rate,
+                        "channels": info.channels,
+                        "n_frames": info.n_frames,
+                        "pcm_bytes": info.pcm_bytes(),
+                        "wav_total_bytes": info.total_bytes(),
+                    }))?
+                );
+                let start = args.get(i + 2).and_then(|s| s.parse::<u64>().ok());
+                if let Some(start) = start {
+                    let want = args
+                        .get(i + 3)
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(4096);
+                    let pcm = audio::decode_range(&bytes, start, want);
+                    let nonzero = pcm.iter().filter(|b| **b != 0).count();
+                    println!(
+                        "decoded from pcm offset {}: {} of {} bytes, {} non-zero",
+                        start,
+                        pcm.len(),
+                        want,
+                        nonzero
+                    );
+                    if want >= 8 && pcm.len() >= 8 {
+                        println!(
+                            "first samples: {:?}",
+                            (0..4)
+                                .map(|k| i16::from_le_bytes([pcm[k * 2], pcm[k * 2 + 1]]))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "ok": 0,
+                        "file": path,
+                        "error": e,
+                    }))?
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let port: u16 = arg_value("--port")
+        .or_else(|| storage::env("PM_LISTEN_PORT"))
+        .or_else(|| storage::env("PORT"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8088);
+    let host = arg_value("--host")
+        .or_else(|| storage::env("PM_LISTEN_HOST"))
+        .or_else(|| storage::env("HOST"))
+        .unwrap_or_else(|| default_bind_host(cfg!(target_os = "android"), paas_env_present()).to_string());
+    let workers: usize = arg_value("--workers")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    // Telegram's own guidance is N connections x a handful of in-flight parts
+    // per connection. grammers multiplexes a whole DC over ONE connection, so
+    // 200 concurrent `upload.getFile` on one `Client` get reset by the DC
+    // (measured: 914 x "Connection reset by peer (os error 104)"). The default
+    // 8 is the shape the TS port holds 200/200 with (4 sessions x 4 in flight).
+    let inflight: usize = arg_value("--inflight")
+        .or_else(|| storage::env("PM_INFLIGHT"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8)
+        .max(1);
+    // Global cap on concurrent download responses: 400+ viewers queue here
+    // instead of all opening a Telegram part at once.
+    let max_streams: usize = arg_value("--max-streams")
+        .or_else(|| storage::env("PM_MAX_STREAMS"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256)
+        .max(1);
+
+    let state = Arc::new(AppState {
+        port,
+        workers,
+        inflight,
+        download_gate: Arc::new(tokio::sync::Semaphore::new(max_streams)),
+        max_streams,
+        telegram: telegram::TelegramPool::new(workers, inflight),
+    });
+    storage::prune_cache_files(false);
+
+    let _ = STATE.set(state.clone());
+    // One fallback handles every path, exactly like backend.php's dispatch block.
+    let app = Router::new().fallback(serve_all);
+    let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+    // Double-clicking the executable must not end in a red error: if the port is
+    // already taken, that is almost always a server this user started earlier, so
+    // open it instead of failing.
+    let listener = match TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let url = format!("http://127.0.0.1:{port}/");
+            println!("\n  PencariMovie Server is already running on {url}");
+            println!("  Opening it in your browser instead of starting a second copy.");
+            println!("  To restart it, stop the running one first (pms stop, stop.bat, or close its window).\n");
+            open_browser(&url);
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    log::stderr_log(
+        "PencariMovie Server listening",
+        Some(&serde_json::json!({
+            "port": port,
+            "host": host,
+            "workers": workers,
+            "inflight": inflight,
+            "max_streams": max_streams,
+            "storage": storage::storage_dir().display().to_string(),
+            "version": config::app_version(),
+            "runtime": format!("rustc {}", rustc_version()),
+            "target": format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        })),
+    );
+    // `--host 0.0.0.0` (Android, Docker, PaaS) is not reachable as 0.0.0.0, so
+    // print the address a browser can actually use.
+    let shown = if host == "0.0.0.0" || host == "::" {
+        "127.0.0.1".to_string()
+    } else {
+        host.clone()
+    };
+    println!(
+        "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n",
+        shown,
+        port,
+        host,
+        port,
+        storage::storage_dir().display(),
+        workers,
+        inflight,
+        workers * inflight,
+        max_streams
+    );
+    if host == "0.0.0.0" || host == "::" {
+        println!("  LAN/TV:      http://<this-device-ip>:{}\n", port);
+    }
+
+    // A user who double-clicks the exe expects a browser, not a black window with
+    // logs. A terminal was inherited only when a human launched it, so that is the
+    // signal; `--open` forces it, `--no-open` suppresses it (tray, autostart,
+    // service managers, scripts).
+    let url = format!("http://{shown}:{port}/");
+    let interactive = !cfg!(target_os = "android")
+        && !paas_env_present()
+        && arg_pos("--no-open").is_none()
+        && (arg_pos("--open").is_some() || std::io::stdout().is_terminal());
+    if interactive {
+        println!("  Close this window (or press Ctrl+C) to stop the server.\n");
+        open_browser(&url);
+    }
+
+    let shutdown = shutdown_signal();
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
+    // The cache writes behind a 400 ms buffer; commit whatever is still queued so a
+    // clean stop does not lose the last window.
+    let flushed = cache::flush();
+    if flushed > 0 {
+        log::log("cache flushed on shutdown", &serde_json::json!({"entries": flushed}));
+    }
+    telegram::disconnect_all();
+    Ok(())
+}
+
+fn rustc_version() -> &'static str {
+    option_env!("RUSTC_VERSION").unwrap_or("unknown")
+}
+
+/// Open `url` in the user's default browser. Best effort: a box with no browser
+/// (server install, headless CI) must never stop the server from running, so a
+/// failure is only logged.
+fn open_browser(url: &str) {
+    let spawned = if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin, and its first quoted argument is the window
+        // TITLE - passing an empty "" is what makes the second one the URL.
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else {
+        Command::new("xdg-open")
+            .arg(url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    match spawned {
+        Ok(mut child) => {
+            // `xdg-open` blocks until the browser exits; reap it off the runtime.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => log::log(
+            "could not open a browser",
+            &serde_json::json!({"url": url, "error": e.to_string()}),
+        ),
+    }
+}
+
+/// One-line build identity, printed by `--version`:
+/// `pencarimovie-server 2.7.9 (rustc 1.99.1, aarch64-android)`.
+fn version_line() -> String {
+    format!(
+        "pencarimovie-server {} (rustc {}, {}-{})",
+        config::app_version(),
+        rustc_version(),
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    )
+}
+
+/// The default bind address.
+///
+/// `127.0.0.1` is the documented desktop default (Windows, Linux, macOS) — do
+/// not change it, `stop.bat` / `stop.sh` and every doc assume a loopback
+/// listener. Two deployments need `0.0.0.0` instead:
+///
+/// - **Android / Termux**: a phone or TV box is only useful when the TV (or
+///   another device on the LAN) can reach it, and there is no host firewall to
+///   hide behind.
+/// - **PaaS / Docker**: every PaaS (Heroku, Render, Fly, Railway, Cloud Run,
+///   Azure) routes traffic to the container's external interface; a `127.0.0.1`
+///   listener is unreachable and the health check fails.
+///
+/// `--host`, `PM_LISTEN_HOST` and `HOST` all override this.
+pub fn default_bind_host(is_android: bool, paas: bool) -> &'static str {
+    if is_android || paas {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    }
+}
+
+/// Environment markers a PaaS sets that a desktop never does.
+///
+/// `PORT` is deliberately NOT one: the PHP launchers set `PORT=8088` on a
+/// desktop, and treating it as "public" would silently expose a LAN listener.
+const PAAS_MARKERS: [&str; 8] = [
+    "DYNO",                  // Heroku
+    "RENDER",                // Render
+    "FLY_APP_NAME",          // Fly.io
+    "RAILWAY_ENVIRONMENT",   // Railway
+    "K_SERVICE",             // Google Cloud Run
+    "WEBSITE_SITE_NAME",     // Azure App Service
+    "PM_PAAS",               // explicit opt-in for any other container host
+    "PM_BIND_PUBLIC",        // explicit opt-in on a VPS
+];
+
+/// Pure so it can be tested without mutating the process environment.
+pub fn paas_env_predicate(get: impl Fn(&str) -> bool) -> bool {
+    PAAS_MARKERS.iter().any(|k| get(k))
+}
+
+fn paas_env_present() -> bool {
+    paas_env_predicate(|k| storage::env(k).is_some())
+}
+
+/// Ctrl-C everywhere, plus SIGTERM on Unix.
+///
+/// `tokio::signal::unix` is `#[cfg(unix)]` inside tokio, so the previous
+/// unconditionally-unix version of this block was the ONLY thing that stopped
+/// the Windows (MSVC) build — every dependency, including grammers, compiled.
+/// Windows has no SIGTERM: `stop.bat` kills the listener and a console close
+/// event is not interceptable from a background process, so Ctrl-C is the
+/// graceful path there.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_keeps_the_documented_loopback_default() {
+        // `start.bat` / `start.sh` and every doc assume a 127.0.0.1 listener.
+        assert_eq!(default_bind_host(false, false), "127.0.0.1");
+    }
+
+    #[test]
+    fn android_and_paas_bind_all_interfaces() {
+        assert_eq!(default_bind_host(true, false), "0.0.0.0");
+        assert_eq!(default_bind_host(false, true), "0.0.0.0");
+        assert_eq!(default_bind_host(true, true), "0.0.0.0");
+    }
+
+    #[test]
+    fn port_alone_is_not_a_paas_marker() {
+        // The PHP launchers export PORT=8088 on a desktop; that must not turn a
+        // loopback listener into a LAN-exposed one.
+        assert!(!paas_env_predicate(|k| k == "PORT"));
+        assert!(!paas_env_predicate(|_| false));
+    }
+
+    #[test]
+    fn every_paas_marker_is_recognised() {
+        for marker in PAAS_MARKERS {
+            assert!(
+                paas_env_predicate(|k| k == marker),
+                "{marker} must select 0.0.0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn version_line_names_this_target() {
+        let line = version_line();
+        assert!(line.starts_with("pencarimovie-server "));
+        let target = format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS);
+        assert!(line.contains(&target), "{line} must contain {target}");
+    }
+}

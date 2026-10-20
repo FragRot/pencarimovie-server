@@ -27,6 +27,20 @@ if "%IN_PLACE%"=="1" (
     )
 )
 
+rem ── native build (Rust engine) ────────────────────────────────────────────────
+rem The native package is ONE file: pencarimovie-server.exe with the dashboard
+rem embedded (no backend.php, no bin\, no vendor\). The same `pms` commands drive
+rem it: start / stop / restart / tunnel / autostart / uninstall. Detected by the
+rem exe, so one CLI can serve either build.
+if exist "%~dp0pencarimovie-server.exe" (
+    set "APP_DIR=%~dp0."
+    set "NATIVE=1"
+    rem There is no release tarball to overlay: an update replaces the exe.
+    set "IN_PLACE=1"
+)
+if exist "%APP_DIR%\pencarimovie-server.exe" set "NATIVE=1"
+if "%NATIVE%"=="1" set "IN_PLACE=1"
+
 if "%1"=="--stop" goto stop
 if "%1"=="stop" goto stop
 if "%1"=="--restart" goto restart
@@ -95,6 +109,25 @@ if not exist "%APP_DIR%" (
     exit /b 1
 )
 cd /d "%APP_DIR%"
+
+if "%NATIVE%"=="1" (
+    echo Starting PencariMovie Server ^(native^) in the background...
+    rem APP_DIR / PORT are cmd variables, so PowerShell sees them as $env:APP_DIR
+    rem and $env:PORT.
+    powershell -NoProfile -Command "$d = $env:APP_DIR; Start-Process -FilePath (Join-Path $d 'pencarimovie-server.exe') -ArgumentList @('--port', $env:PORT) -WorkingDirectory $d -WindowStyle Hidden" >nul 2>nul
+    rem Wait for the port before printing URLs (cold start ~1s on a desktop).
+    powershell -NoProfile -Command "for ($i=0; $i -lt 60; $i++) { try { Invoke-WebRequest -UseBasicParsing -Uri ('http://127.0.0.1:' + $env:PORT + '/api/version') -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep -Milliseconds 250 } }; exit 1" >nul 2>nul
+    echo.
+    echo PencariMovie Server is running in the background.
+    call :print_urls
+    echo   CLI:      pms [start^|stop^|restart^|tunnel^|autostart]
+    echo   Stop:     pms stop
+    echo   Restart:  pms restart
+    echo   Tunnel:   pms tunnel
+    echo   Autostart: pms autostart [on^|off]
+    echo   Tray:     start-tray.bat in the app folder ^(or right-click the tray icon^)
+    exit /b 0
+)
 
 rem Ensure bin\php.ini exists and has required Windows extensions enabled
 if exist "bin\ext\php_fileinfo.dll" (
@@ -205,6 +238,15 @@ if "%1"=="off" (
 )
 if exist "%APP_DIR%\storage\.no_autostart" del /f /q "%APP_DIR%\storage\.no_autostart" 2>nul
 if not exist "%STARTUP_DIR%" mkdir "%STARTUP_DIR%" 2>nul
+rem The native package starts through start-tray.bat (hidden server + tray icon);
+rem its start.bat is the CONSOLE launcher, so passing "start" to it is wrong.
+if "%NATIVE%"=="1" (
+    (
+        echo Set WshShell = CreateObject^("WScript.Shell"^)
+        echo WshShell.Run """%APP_DIR%\start-tray.bat""", 0, False
+    ) > "%VBS_FILE%"
+    goto :eof
+)
 (
     echo Set WshShell = CreateObject^("WScript.Shell"^)
     echo WshShell.Run """%APP_DIR%\start.bat"" start", 0, False
@@ -271,6 +313,9 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %PORT% -State Li
 
 rem Kill any leftover FrankenPHP or PHP CLI IPC processes that may be holding DLL locks (e.g. php_curl.dll)
 powershell -NoProfile -Command "Get-Process -Name frankenphp,php -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like '*pencarimovie*' } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }" >nul 2>nul
+rem Native build: the server process is not a port owner we can infer reliably, so
+rem stop it by name as well (it is our own binary).
+powershell -NoProfile -Command "Get-Process -Name pencarimovie-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>nul
 call :stop_tray
 goto :eof
 

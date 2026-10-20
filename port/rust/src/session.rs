@@ -1,0 +1,774 @@
+//! Port of the `telegram_session` group, backend.php:554-1075 and 6324-6459:
+//! `fd_get_bot_id`, `fd_clear_bot_id`, `fd_get_bot_session_path`,
+//! `fd_has_local_session`, `fd_load_session_meta`, `fd_save_session_meta`,
+//! `fd_clear_session_meta`, `fd_get_bot_pool`, `fd_save_bot_pool`,
+//! `fd_add_pool_bot`, `fd_remove_pool_bot`, `fd_pick_pool_bot`,
+//! `fd_is_guest_provision_in_progress`, `fd_auto_provision_guest`,
+//! `fd_find_orphan_session_bot_id`, `fd_clear_session_directory`,
+//! `fd_clear_session`, `fd_measure_clock_offset`, `fd_clock_skew_message`,
+//! `fd_friendly_login_error`.
+//!
+//! The bot is never copied from the PHP install: provisioning asks WordPress
+//! for a guest token (`GET {WP_API_BASE}/provision-session` -> `{ok, bot_token,
+//! api_secret}`) and this port logs that bot in with grammers, persisting its
+//! own session under `storage/sessions/<bot_id>/session.rust.json`.
+//!
+//! Locking: the PHP uses `flock()`. Here the same semantics (exclusive,
+//! non-blocking, 30s wait, 300s staleness reclaim, heartbeat file) are
+//! reproduced with an `O_EXCL` lock file and a heartbeat stamp.
+
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use rand::RngCore;
+use serde_json::Value;
+
+use crate::config::wp_api_base;
+use crate::credentials::{save_api_secret, get_api_secret};
+use crate::httpc::http_json;
+use crate::log::log;
+use crate::storage::{env, now, storage_path};
+
+/* ── identity ────────────────────────────────────────────────────────────── */
+
+pub fn session_meta_path() -> PathBuf {
+    storage_path("session_meta.json")
+}
+
+pub fn bot_pool_path() -> PathBuf {
+    storage_path("bot_pool.json")
+}
+
+pub fn bot_id_cache_path() -> PathBuf {
+    storage_path("bot_id.txt")
+}
+
+pub fn load_session_meta() -> Value {
+    fs::read_to_string(session_meta_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+pub fn save_session_meta(bot_id: &str, bot_username: &str, bot_name: &str) {
+    let body = serde_json::json!({
+        "bot_id": bot_id,
+        "bot_username": bot_username,
+        "bot_name": bot_name,
+    });
+    let _ = fs::write(session_meta_path(), body.to_string());
+    add_pool_bot(serde_json::json!({
+        "bot_id": bot_id,
+        "bot_username": bot_username,
+        "bot_name": bot_name,
+        "is_active": true,
+        "status": "online",
+        "updated_at": now(),
+    }));
+    clear_bot_id();
+}
+
+pub fn clear_session_meta() {
+    let _ = fs::remove_file(session_meta_path());
+}
+
+pub fn get_bot_id() -> String {
+    let meta = load_session_meta();
+    let from_meta = meta
+        .get("bot_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !from_meta.is_empty() {
+        return from_meta;
+    }
+    let env_token = env("BOT_TOKEN").or_else(|| env("TG_BOT_TOKEN")).unwrap_or_default();
+    if !env_token.is_empty() {
+        let id = env_token.split(':').next().unwrap_or("").trim();
+        if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
+            return id.to_string();
+        }
+    }
+    let pool = read_pool_file();
+    for b in &pool {
+        let active = b.get("is_active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+        if active && !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    if let Some(first) = pool.first() {
+        let id = first.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+        if !id.is_empty() {
+            return id.to_string();
+        }
+    }
+    fs::read_to_string(bot_id_cache_path())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn clear_bot_id() {
+    let _ = fs::remove_file(bot_id_cache_path());
+}
+
+/// PHP path for the *session directory*; the port's own session file lives in it.
+pub fn get_bot_session_path(bot_id: &str) -> PathBuf {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return storage_path("session.madeline");
+    }
+    let safe: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    storage_path(&format!("sessions/{}/session.madeline", safe))
+}
+
+pub fn has_local_session(bot_id: &str) -> bool {
+    let id = bot_id.trim();
+    if !id.is_empty() {
+        return crate::telegram::has_session_file(id);
+    }
+    let active = get_bot_id();
+    if !active.is_empty() && crate::telegram::has_session_file(&active) {
+        return true;
+    }
+    for b in get_bot_pool() {
+        let bid = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+        if !bid.is_empty() && crate::telegram::has_session_file(bid) {
+            return true;
+        }
+    }
+    false
+}
+
+/* ── bot pool ────────────────────────────────────────────────────────────── */
+
+fn read_pool_file() -> Vec<Value> {
+    fs::read_to_string(bot_pool_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+}
+
+pub fn get_bot_pool() -> Vec<Value> {
+    let mut pool = read_pool_file();
+    let active = get_bot_id();
+    // Only repair a genuinely missing entry (session_meta.json on disk), exactly
+    // like the PHP: never resurrect a cleared session.
+    if !active.is_empty()
+        && !pool
+            .iter()
+            .any(|b| b.get("bot_id").and_then(|v| v.as_str()) == Some(active.as_str()))
+        && session_meta_path().exists()
+    {
+        let meta = load_session_meta();
+        pool.push(serde_json::json!({
+            "bot_id": active,
+            "bot_username": meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or(""),
+            "bot_name": meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or(active.as_str()),
+            "status": "online",
+            "added_at": now(),
+            "updated_at": now(),
+            "is_active": true,
+        }));
+        save_bot_pool(&pool);
+    }
+    pool
+}
+
+pub fn save_bot_pool(pool: &[Value]) {
+    let body = serde_json::to_string_pretty(&Value::Array(pool.to_vec()))
+        .unwrap_or_else(|_| "[]".to_string());
+    let _ = fs::write(bot_pool_path(), body);
+}
+
+pub fn add_pool_bot(bot_data: Value) -> Vec<Value> {
+    let bot_id = bot_data.get("bot_id").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if bot_id.is_empty() {
+        return Vec::new();
+    }
+    let mut pool = get_bot_pool();
+    let mut found = false;
+    for item in pool.iter_mut() {
+        if item.get("bot_id").and_then(|v| v.as_str()) == Some(bot_id.as_str()) {
+            if let (Some(dst), Some(src)) = (item.as_object_mut(), bot_data.as_object()) {
+                for (k, v) in src {
+                    dst.insert(k.clone(), v.clone());
+                }
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        let mut entry = serde_json::json!({
+            "bot_id": bot_id,
+            "bot_username": "",
+            "bot_name": "",
+            "status": "online",
+            "added_at": now(),
+            "updated_at": now(),
+        });
+        if let (Some(dst), Some(src)) = (entry.as_object_mut(), bot_data.as_object()) {
+            for (k, v) in src {
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        pool.push(entry);
+    }
+    save_bot_pool(&pool);
+    pool
+}
+
+pub fn remove_pool_bot(bot_id: &str) -> Vec<Value> {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return get_bot_pool();
+    }
+    let next: Vec<Value> = get_bot_pool()
+        .into_iter()
+        .filter(|b| b.get("bot_id").and_then(|v| v.as_str()) != Some(id))
+        .collect();
+    save_bot_pool(&next);
+    clear_session_directory(&crate::telegram::session_dir(id));
+    let active = get_bot_id();
+    if active == id {
+        if let Some(first) = next.first() {
+            save_session_meta(
+                first.get("bot_id").and_then(|v| v.as_str()).unwrap_or(""),
+                first.get("bot_username").and_then(|v| v.as_str()).unwrap_or(""),
+                first.get("bot_name").and_then(|v| v.as_str()).unwrap_or(""),
+            );
+        } else {
+            clear_session_meta();
+            clear_session();
+        }
+    }
+    if next.is_empty() {
+        let _ = fs::remove_file(bot_pool_path());
+        clear_session_meta();
+        clear_session();
+    }
+    next
+}
+
+pub fn pick_pool_bot() -> Option<Value> {
+    let pool = get_bot_pool();
+    let active = get_bot_id();
+    let ts = now();
+    let valid: Vec<&Value> = pool
+        .iter()
+        .filter(|b| {
+            let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                return false;
+            }
+            let cooldown = b.get("cooldown_until").and_then(|v| v.as_i64()).unwrap_or(0);
+            if cooldown > ts {
+                return false;
+            }
+            crate::telegram::has_session_file(id)
+        })
+        .collect();
+    if valid.is_empty() {
+        if !active.is_empty() {
+            let meta = load_session_meta();
+            return Some(serde_json::json!({
+                "bot_id": active,
+                "bot_username": meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or(""),
+                "bot_name": meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or(""),
+            }));
+        }
+        return None;
+    }
+    let rr = storage_path("rr_bot_index.txt");
+    let idx: usize = fs::read_to_string(&rr)
+        .ok()
+        .and_then(|t| t.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let picked = valid[idx % valid.len()].clone();
+    let _ = fs::write(&rr, ((idx + 1) % valid.len()).to_string());
+    Some(picked)
+}
+
+/* ── guest provisioning ──────────────────────────────────────────────────── */
+
+fn provision_lock_path() -> PathBuf {
+    storage_path("guest_provision.lock")
+}
+
+fn provision_heartbeat_path() -> PathBuf {
+    storage_path("guest_provision.heartbeat")
+}
+
+/// `fd_is_guest_provision_in_progress()`: stale locks (>300s) are reclaimed.
+pub fn is_guest_provision_in_progress() -> bool {
+    let file = provision_lock_path();
+    let meta = match fs::metadata(&file) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let age = crate::storage::mtime_secs(&file)
+        .map(|m| now() - m)
+        .unwrap_or(0);
+    let _ = meta;
+    if age > 300 {
+        log("reclaimed stale guest_provision.lock", &serde_json::json!({"age": age}));
+        let _ = fs::remove_file(&file);
+        return false;
+    }
+    if let Ok(hb) = fs::read_to_string(provision_heartbeat_path()) {
+        if let Ok(v) = hb.trim().parse::<i64>() {
+            if now() - v < 30 {
+                return true;
+            }
+        }
+    }
+    age < 120
+}
+
+struct ProvisionLock;
+
+impl ProvisionLock {
+    async fn acquire(wait_ms: u64) -> Option<ProvisionLock> {
+        let file = provision_lock_path();
+        let start = std::time::Instant::now();
+        loop {
+            match fs::OpenOptions::new().write(true).create_new(true).open(&file) {
+                Ok(mut f) => {
+                    let _ = f.write_all(b"1");
+                    let _ = fs::write(provision_heartbeat_path(), now().to_string());
+                    return Some(ProvisionLock);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(m) = crate::storage::mtime_secs(&file) {
+                        if now() - m > 300 {
+                            let _ = fs::remove_file(&file);
+                            continue;
+                        }
+                    }
+                    if start.elapsed().as_millis() as u64 > wait_ms {
+                        return None;
+                    }
+                    let _ = fs::write(provision_heartbeat_path(), now().to_string());
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for ProvisionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(provision_lock_path());
+        let _ = fs::remove_file(provision_heartbeat_path());
+    }
+}
+
+pub struct ClockProbe {
+    pub ok: bool,
+    pub offset: i64,
+    pub server_time: i64,
+    pub local_time: i64,
+    pub error: Option<String>,
+}
+
+fn parse_http_date(raw: &str) -> Option<i64> {
+    // RFC 7231 IMF-fixdate: "Mon, 20 Oct 2026 00:32:39 GMT" — the FIRST token
+    // is the weekday, so it must be skipped (reading parts[0] as the day made
+    // every probe report "clock probe unreachable").
+    let mut parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() >= 6 && parts[0].ends_with(',') {
+        parts.remove(0);
+    }
+    let parts = parts;
+    if parts.len() < 5 {
+        return None;
+    }
+    let day: i64 = parts[0].parse().ok()?;
+    let month = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts[2].parse().ok()?;
+    let time: Vec<&str> = parts[3].split(':').collect();
+    if time.len() != 3 {
+        return None;
+    }
+    let hh: i64 = time[0].parse().ok()?;
+    let mm: i64 = time[1].parse().ok()?;
+    let ss: i64 = time[2].parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn date_of(resp: &reqwest::Response) -> Option<i64> {
+    let date = resp.headers().get(reqwest::header::DATE)?;
+    parse_http_date(date.to_str().ok()?)
+}
+
+/// `fd_measure_clock_offset()`: `Date` header vs local time.
+pub async fn measure_clock_offset() -> ClockProbe {
+    let local = now();
+    for url in ["https://pencarimovie.com/", "https://core.telegram.org/"] {
+        // HEAD is cheap, but some edges answer it without a Date header, so a
+        // GET is tried before giving up on the host.
+        for use_head in [true, false] {
+            let resp = {
+                let c = crate::httpc::client();
+                let req = if use_head { c.head(url) } else { c.get(url) };
+                req.timeout(Duration::from_secs(4)).send().await
+            };
+            if let Ok(resp) = resp {
+                if let Some(server) = date_of(&resp) {
+                    return ClockProbe {
+                        ok: true,
+                        // PHP: `offset = $localTime - $serverTime` — POSITIVE
+                        // means the local clock is AHEAD. Subtracting the other
+                        // way round flips the "ahead of"/"behind" wording of
+                        // clock_skew_message(), and a device 40 s BEHIND was
+                        // told it was ahead — the one fact the user cannot
+                        // check for themselves. Pinned by a unit test.
+                        offset: now() - server,
+                        server_time: server,
+                        local_time: now(),
+                        error: None,
+                    };
+                }
+            }
+        }
+    }
+    ClockProbe {
+        ok: false,
+        offset: 0,
+        server_time: 0,
+        local_time: local,
+        error: Some("clock probe unreachable".to_string()),
+    }
+}
+
+pub fn clock_skew_message(offset_seconds: i64) -> String {
+    let off = offset_seconds.abs();
+    let mins = off / 60;
+    let secs = off % 60;
+    let human = if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    };
+    // offset is `local - server` (PHP), so positive = local is ahead.
+    let dir = if offset_seconds > 0 { "ahead of" } else { "behind" };
+    format!("Your clock is {} {} Telegram's server time.", human, dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sign convention is PHP's (`local - server`) and it drives the only
+    /// user-facing sentence here, so it is worth pinning: getting it backwards
+    /// tells a fast clock it is slow.
+    #[test]
+    fn clock_skew_message_says_ahead_for_a_fast_clock() {
+        assert!(clock_skew_message(40).contains("40s ahead of"));
+        assert!(clock_skew_message(-40).contains("40s behind"));
+        assert!(clock_skew_message(72).contains("1m 12s ahead of"));
+        assert_eq!(
+            clock_skew_message(-432),
+            "Your clock is 7m 12s behind Telegram's server time."
+        );
+    }
+}
+
+pub fn is_clock_or_authkey_error(message: &str) -> bool {
+    let s = message.to_ascii_lowercase();
+    if s.is_empty() {
+        return false;
+    }
+    if s.contains("session is busy") || s.contains("lock") || s.contains("econnrefused") {
+        return false;
+    }
+    s.contains("auth_key")
+        || s.contains("new_nonce_hash")
+        || s.contains("msg_id too")
+        || s.contains("message id")
+        || s.contains("time delta")
+        || s.contains("clock")
+        || s.contains("sync your date")
+}
+
+pub fn friendly_login_error(message: &str) -> String {
+    if is_clock_or_authkey_error(message) {
+        return "Your device clock is out of sync with Telegram.\nEnable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server.".to_string();
+    }
+    message.to_string()
+}
+
+pub fn find_orphan_session_bot_id() -> String {
+    let dir = storage_path("sessions");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if crate::telegram::has_session_file(&name) {
+                return name;
+            }
+        }
+    }
+    String::new()
+}
+
+pub fn clear_session_directory(dir: &std::path::Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+pub fn clear_session() {
+    let _ = fs::remove_dir_all(storage_path("sessions"));
+    let _ = fs::remove_dir_all(storage_path("session.madeline"));
+    crate::telegram::disconnect_all();
+}
+
+pub struct ProvisionResult {
+    pub bot_id: String,
+    pub bot_username: String,
+    pub bot_name: String,
+    pub error: Option<String>,
+}
+
+impl ProvisionResult {
+    pub fn error(msg: impl Into<String>) -> Self {
+        Self {
+            bot_id: String::new(),
+            bot_username: String::new(),
+            bot_name: String::new(),
+            error: Some(msg.into()),
+        }
+    }
+}
+
+/// PHP truthiness for a JSON scalar (`"ok": 1` counts as true).
+pub fn truthy(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0) != 0 || n.as_f64().unwrap_or(0.0) != 0.0,
+        Some(Value::String(s)) => !s.is_empty() && s != "0" && s != "false",
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(Value::Null) | None => false,
+    }
+}
+
+fn random_suffix() -> String {
+    let mut buf = [0u8; 8];
+    rand::rng().fill_bytes(&mut buf);
+    hex::encode(buf)
+}
+
+/// `fd_auto_provision_guest()` (backend.php:976): same order of checks, same
+/// error strings, same "try twice" loop — but the login is this stack's own.
+pub async fn auto_provision_guest(
+    tg: &crate::telegram::TelegramPool,
+) -> Result<ProvisionResult, ProvisionResult> {
+    // ── clock pre-check ───────────────────────────────────────────────────
+    let clock = measure_clock_offset().await;
+    if clock.ok && clock.offset.abs() > 30 {
+        log(
+            "auto provision aborted: clock skew too large",
+            &serde_json::json!({"offset_seconds": clock.offset}),
+        );
+        let human = clock_skew_message(clock.offset);
+        return Err(ProvisionResult::error(format!(
+            "Device clock out of sync!\n{}\n\nEnable 'Set time automatically' (Automatic date and time / NTP) in your device Settings, then restart the PencariMovie Server.",
+            human
+        )));
+    }
+
+    // ── existing session ──────────────────────────────────────────────────
+    let existing = get_bot_id();
+    if !existing.is_empty() && crate::telegram::has_session_file(&existing) {
+        let meta = load_session_meta();
+        match tg.boot(&existing, None).await {
+            Ok(_) => {
+                return Ok(ProvisionResult {
+                    bot_id: existing,
+                    bot_username: meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    error: None,
+                })
+            }
+            Err(e) => {
+                if is_clock_or_authkey_error(&e) {
+                    return Err(ProvisionResult::error(friendly_login_error(&e)));
+                }
+                log(
+                    "existing session boot failed",
+                    &serde_json::json!({"bot_id": existing, "error": e}),
+                );
+            }
+        }
+    }
+
+    if existing.is_empty() {
+        let orphan = find_orphan_session_bot_id();
+        if !orphan.is_empty() {
+            log(
+                "auto provision aborted: orphan session dir present without bot_id",
+                &serde_json::json!({"orphan_bot_id": orphan}),
+            );
+            return Err(ProvisionResult::error(
+                "A previous login did not finish. Please restart the PencariMovie Server and try again.",
+            ));
+        }
+    }
+
+    let _lock = match ProvisionLock::acquire(30_000).await {
+        Some(l) => l,
+        None => {
+            log(
+                "auto provision skipped: another provision is currently in progress",
+                &serde_json::json!({}),
+            );
+            return Err(ProvisionResult::error(
+                "Connecting guest bot in progress. Please refresh or try again in a few seconds.",
+            ));
+        }
+    };
+
+    // Re-check after acquiring the lock (another worker may have finished).
+    let recheck = get_bot_id();
+    if !recheck.is_empty() && crate::telegram::has_session_file(&recheck) {
+        let meta = load_session_meta();
+        if tg.boot(&recheck, None).await.is_ok() {
+            return Ok(ProvisionResult {
+                bot_id: recheck,
+                bot_username: meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                error: None,
+            });
+        }
+    }
+
+    // Static BOT_TOKEN / TG_BOT_TOKEN wins when present (container installs).
+    if let Some(env_token) = env("BOT_TOKEN").or_else(|| env("TG_BOT_TOKEN")) {
+        let env_token = env_token.trim().to_string();
+        let id_part = env_token.split(':').next().unwrap_or("").to_string();
+        let target = if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
+            id_part
+        } else {
+            format!("env_{}", random_suffix())
+        };
+        match tg.boot(&target, Some(&env_token)).await {
+            Ok(entry) => {
+                save_session_meta(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
+                let meta = load_session_meta();
+                return Ok(ProvisionResult {
+                    bot_id: meta.get("bot_id").and_then(|v| v.as_str()).unwrap_or(&entry.identity.id).to_string(),
+                    bot_username: meta.get("bot_username").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    bot_name: meta.get("bot_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    error: None,
+                });
+            }
+            Err(e) => log("BOT_TOKEN from environment failed to boot", &serde_json::json!({"error": e})),
+        }
+    }
+
+    let mut last_error: Option<String> = None;
+    for attempt in 0..2 {
+        let url = format!(
+            "{}/provision-session?_nocache={}_{}",
+            wp_api_base(),
+            now(),
+            (rand::random::<u32>() % 9000) + 1000
+        );
+        let resp = http_json(&url, &[], "GET", 6).await;
+        // WordPress answers `"ok": 1` (a NUMBER) here, not `true`; `as_bool()`
+        // alone silently rejected every valid provision response.
+        let ok = truthy(resp.get("ok"));
+        let token = resp.get("bot_token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+        if !ok || token.is_empty() {
+            log(
+                "provision endpoint returned error or incomplete payload",
+                &serde_json::json!({"resp": resp, "attempt": attempt + 1}),
+            );
+            continue;
+        }
+        if let Some(secret) = resp.get("api_secret").and_then(|v| v.as_str()) {
+            save_api_secret(secret);
+        }
+        let target = match resp.get("bot_id") {
+            Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => format!("prov_{}", random_suffix()),
+        };
+
+        match tg.boot(&target, Some(&token)).await {
+            Ok(entry) => {
+                let real_id = if entry.identity.id.is_empty() {
+                    target.clone()
+                } else {
+                    entry.identity.id.clone()
+                };
+                save_session_meta(&real_id, &entry.identity.username, &entry.identity.first_name);
+                log(
+                    "guest bot provisioned",
+                    &serde_json::json!({"bot_id": real_id, "username": entry.identity.username}),
+                );
+                return Ok(ProvisionResult {
+                    bot_id: real_id,
+                    bot_username: entry.identity.username.clone(),
+                    bot_name: entry.identity.first_name.clone(),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                log(
+                    "auto provision login failed",
+                    &serde_json::json!({"error": e, "bot_id": target, "attempt": attempt + 1}),
+                );
+                if is_clock_or_authkey_error(&e) {
+                    return Err(ProvisionResult::error(friendly_login_error(&e)));
+                }
+                last_error = Some(e);
+            }
+        }
+    }
+    match last_error {
+        Some(e) => Err(ProvisionResult::error(e)),
+        None => Err(ProvisionResult::error(
+            "Could not obtain guest bot session from server.",
+        )),
+    }
+}
+
+/// Only used by `/api/provision` to echo the secret; kept here so the route has
+/// one import.
+pub fn api_secret_for_response() -> String {
+    get_api_secret()
+}

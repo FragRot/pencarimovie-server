@@ -1,3 +1,14 @@
+# Heroku container deploy.
+#
+# `web:` names the Dockerfile Heroku builds. Two builds live in this repo:
+#
+#   Dockerfile        PHP + FrankenPHP + MadelineProto (the original stack)
+#   Dockerfile.rust   the native build: ONE binary, dashboard embedded, musl,
+#                     ~20 MB image, no PHP/Composer/vendor
+#
+# Switch to the native build by pointing `web:` at Dockerfile.rust. Nothing else
+# changes: the binary reads PORT (dynos set it), binds 0.0.0.0 on a PaaS marker,
+# and keeps its state under PM_APP_ROOT (already /data in that image).
 build:
   docker:
     web: Dockerfile

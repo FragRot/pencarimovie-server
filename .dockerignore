@@ -2,6 +2,13 @@ dist/*
 !dist/pencarimovie-downloader-linux-*.tar.gz
 pkgroot/
 target/
+# The native build keeps live state (sessions, auth.json, api_secret.key) and
+# local build output inside the crate; never ship any of it into an image.
+port/rust/storage/
+port/rust/dist/
+port/rust/dist-native/
+port/rust/target/
+port/rust/tests/
 node_modules/
 .git/
 android/
