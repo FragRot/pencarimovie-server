@@ -287,6 +287,12 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
+          # Multi-arch: amd64 for Heroku/Render, arm64 for Raspberry Pi / ARM VPS.
+          # arm64 is EMULATED (QEMU) on an x86 runner, so it compiles the whole Rust
+          # dependency tree in emulation — that is why this job is slow. The
+          # Dockerfile keeps the cargo registry + target dirs in BuildKit cache
+          # mounts and this step uses the gha layer cache, so only the first
+          # arm64 build pays the full price.
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
@@ -437,6 +443,17 @@ jobs:
         run: |
           set -euo pipefail
           TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
+
+          # This job runs in PARALLEL with `build-and-release`, which is the one
+          # that creates the release. `gh release upload` on a tag that does not
+          # exist yet fails with "release not found", and with `set -e` that made
+          # the whole run red. Create it first (idempotent) and retry until it is
+          # visible; softprops later updates the same tag with the other assets.
+          for i in $(seq 1 20); do
+            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
+            gh release create "$TAG" --title "$TAG" --generate-notes >/dev/null 2>&1 || true
+            sleep 15
+          done
           gh release upload "$TAG" dist-rust/* --clobber
 
   # ── Alpine (musl) image: the deployable form for Docker / Heroku ───────────

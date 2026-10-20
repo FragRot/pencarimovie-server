@@ -21,7 +21,14 @@ WORKDIR /src
 COPY port/rust ./port/rust
 COPY public ./public
 WORKDIR /src/port/rust
-RUN cargo build --release --locked
+# BuildKit cache mounts: the crate registry and the target dir survive between
+# builds (including across a multi-arch buildx run), so an emulated arm64 build
+# only recompiles what actually changed instead of the whole dependency tree.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/port/rust/target \
+    cargo build --release --locked \
+ && cp target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata curl \
@@ -29,7 +36,9 @@ RUN apk add --no-cache ca-certificates tzdata curl \
  && mkdir -p /data \
  && chown -R 10001:10001 /data
 
-COPY --from=build /src/port/rust/target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
+# The build stage copied the binary OUT of the cached target dir, because a cache
+# mount is not part of the image filesystem.
+COPY --from=build /usr/local/bin/pencarimovie-server /usr/local/bin/pencarimovie-server
 
 ENV PM_APP_ROOT=/data \
     PM_LISTEN_HOST=0.0.0.0 \
