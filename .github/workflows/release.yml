@@ -487,10 +487,16 @@ jobs:
           fi
           echo "Verified: $BIN is statically linked"
 
-          mkdir -p "dist-container/${{ matrix.container_arch }}"
-          cp "$BIN" "dist-container/${{ matrix.container_arch }}/pencarimovie-server"
-          chmod +x "dist-container/${{ matrix.container_arch }}/pencarimovie-server"
-          ls -lh "dist-container/${{ matrix.container_arch }}/"
+          # ABSOLUTE, not relative: this step runs with
+          # `working-directory: port/rust`, so a relative `dist-container/...`
+          # lands in port/rust/dist-container and the upload-artifact step (which
+          # resolves from the workspace root) then fails with
+          # "No files were found with the provided path". Verified the hard way.
+          OUT="$GITHUB_WORKSPACE/dist-container/${{ matrix.container_arch }}"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/pencarimovie-server"
+          chmod +x "$OUT/pencarimovie-server"
+          ls -lh "$OUT/"
 
       - name: Package
         shell: bash
@@ -602,7 +608,16 @@ jobs:
       - name: Build image (COPY only — no toolchain, no source)
         run: |
           set -euo pipefail
-          chmod +x "dist-docker/${{ matrix.arch }}/pencarimovie-server"
+          BIN="dist-docker/${{ matrix.arch }}/pencarimovie-server"
+          # Fail with a clear message instead of Docker's opaque
+          # "COPY failed: no source files were specified" when the artifact
+          # download landed somewhere unexpected.
+          if [ ! -f "$BIN" ]; then
+            echo "::error::$BIN is missing — the container artifact was not downloaded"
+            ls -R dist-docker 2>/dev/null || true
+            exit 1
+          fi
+          chmod +x "$BIN"
           docker build \
             -f Dockerfile.release \
             --build-arg ARCH=${{ matrix.arch }} \
