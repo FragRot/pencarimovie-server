@@ -1116,21 +1116,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 
         futures_util::pin_mut!(stream);
         loop {
-            // A seek or a closed tab drops the receiver. Waiting for the next
-            // WINDOW to notice means up to `pipeline_depth` megabytes of
-            // Telegram parts keep holding their `--inflight` permits while the
-            // request the player just opened queues behind them — measured on a
-            // phone as ttfb 1.0-5.2 s and 58-78 KB/s with a second stream open.
-            // Selecting on `tx.closed()` drops them at once.
-            //
-            // (`tokio::select!` cannot sit directly inside a `let ... else`, so
-            // it assigns first.)
-            let mut next_item = None;
-            tokio::select! {
-                _ = tx.closed() => return,
-                n = stream.next() => next_item = n,
+            // A seek or a closed tab drops the receiver. Detecting it only when
+            // the next WINDOW is ready to send means up to `pipeline_depth`
+            // megabytes of Telegram parts keep holding their `--inflight`
+            // permits while the request the player just opened queues behind
+            // them (seen on a phone as ttfb 1.0-5.2 s with a second stream
+            // open). `is_closed()` is a plain non-blocking check — deliberately
+            // NOT a `select!`, which could end a body while the client is still
+            // reading and make playback look slow instead.
+            if tx.is_closed() {
+                return;
             }
-            let Some((index, result)) = next_item else {
+            let Some((index, result)) = stream.next().await else {
                 break;
             };
             let mut data = match result {
