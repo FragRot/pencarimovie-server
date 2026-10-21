@@ -74,9 +74,12 @@ detect_target() {
       esac
       ;;
     Darwin)
+      # These MUST match the published artifact names
+      # (`pencarimovie-server-<os>-<arch>.tar.gz`): macos-aarch64 / macos-x86_64.
+      # They used to be mac-arm64 / mac-x86_64, which 404'd on every Mac.
       case "$arch" in
-        arm64|aarch64) echo "mac-arm64" ;;
-        x86_64|amd64)  echo "mac-x86_64" ;;
+        arm64|aarch64) echo "macos-aarch64" ;;
+        x86_64|amd64)  echo "macos-x86_64" ;;
         *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
       esac
       ;;
@@ -143,6 +146,11 @@ do_stop() {
   pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
+  # The published engine is the Rust binary, which none of the patterns above
+  # match. Without this, `pms stop` left it running and `pms restart` raced it
+  # for the port.
+  pkill -9 -f "$APP_DIR/pencarimovie-server" 2>/dev/null || true
+  pkill -9 -f "\./pencarimovie-server --port" 2>/dev/null || true
 
   if command -v lsof >/dev/null 2>&1; then
     local pids_port
@@ -267,15 +275,13 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url=""
+  # There is exactly ONE artifact shape now: the per-target Rust package
+  # `pencarimovie-server-<os>-<arch>.tar.gz`. The universal
+  # `pencarimovie-server.tar.gz` (the old PHP product) is no longer published, so
+  # a fallback to it only produced a 404 after the real download had already
+  # succeeded — keep the two variables so the .sha256 probe loop below still works.
+  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server-$target.tar.gz"
   local fallback_url=""
-
-  if [ "$target" = "server" ]; then
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-  else
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server-$target.tar.gz"
-    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -335,7 +341,11 @@ install_or_update() {
   current="$(current_tag)"
 
   local is_installed=0
-  if [ -d "$APP_DIR" ] && { [ -f "$APP_DIR/backend.php" ] || [ -f "$APP_DIR/bin/frankenphp" ]; }; then
+  # The published package is the Rust engine, shipped as `pencarimovie-server`
+  # with its launchers. `backend.php` / `bin/frankenphp` are the OLD PHP markers:
+  # keying only on those made a fresh Rust install look "not installed", so every
+  # `pms start` re-downloaded the whole tarball.
+  if [ -d "$APP_DIR" ] && { [ -x "$APP_DIR/pencarimovie-server" ] || [ -f "$APP_DIR/start.sh" ] || [ -f "$APP_DIR/backend.php" ] || [ -f "$APP_DIR/bin/frankenphp" ]; }; then
     is_installed=1
   fi
 
@@ -367,13 +377,15 @@ install_or_update() {
     echo "Downloading PencariMovie Server $latest ($target)..."
     download_extract "$target" "$latest"
   else
-    echo "Updating PencariMovie Server ${current:-unknown} -> $latest (fast updater: universal server package)..."
+    echo "Updating PencariMovie Server ${current:-unknown} -> $latest ($target)..."
     if port_in_use; then
       do_stop
       sleep 1
     fi
-    # Use lightweight pencarimovie-server.tar.gz for updates (keeps existing binaries, updates app/vendor code fast)
-    download_extract "server" "$latest"
+    # ALWAYS the per-target package. The old "fast updater" fetched
+    # pencarimovie-server.tar.gz, which this release no longer publishes, so an
+    # existing install could never update again.
+    download_extract "$target" "$latest"
   fi
   register_cli
   return 0
@@ -416,6 +428,61 @@ case "\${1:-}" in
     else
       echo "Autostart command not found in \$APP_DIR"
     fi
+    ;;
+  password|--password|reset-password|--reset-password|token|--token)
+    # These were MISSING from this wrapper, so `pms password foo` fell through to
+    # the default branch and only STARTED the server. They are also implemented
+    # here rather than delegated, because the Rust package does not ship
+    # pencarimovie-linux.sh inside \$APP_DIR (only the OTA installer has it).
+    PMS_PORT="\${PORT:-8088}"
+    pms_api() {
+      # $1 = path, $2 = JSON body (defaults to an empty object)
+      pms_body="\${2}"
+      [ -n "\$pms_body" ] || pms_body='{}'
+      curl -fsS -m 15 -H 'Content-Type: application/json' -X POST \\
+        -d "\$pms_body" "http://127.0.0.1:\$PMS_PORT\$1" 2>/dev/null
+    }
+    pms_tok() { sed -n 's/.*"token":"\\([^"]*\\)".*/\\1/p' | head -1; }
+    case "\${1:-}" in
+      token|--token)
+        if [ "\${2:-show}" = "rotate" ]; then
+          if ! pms_out="\$(pms_api /api/auth/token/rotate)"; then
+            echo "Server is not running. Start it once with 'pms start', then retry."
+            exit 1
+          fi
+          printf '%s\\n' "\$pms_out" | pms_tok
+          echo "Token rotated. Re-install the addon from #addon on every device."
+        else
+          curl -fsS -m 8 "http://127.0.0.1:\$PMS_PORT/api/auth/status" 2>/dev/null | pms_tok
+        fi
+        ;;
+      *)
+        # Reset to the default over loopback (privileged), then set the requested
+        # value using that default as the "current" one.
+        if ! pms_api /api/auth/reset >/dev/null; then
+          echo "Server is not running. Start it once with 'pms start', then retry."
+          exit 1
+        fi
+        pms_next="123456"
+        case "\${1:-}" in
+          reset-password|--reset-password) ;;
+          *)
+            pms_next="\${2:-}"
+            if [ -z "\$pms_next" ]; then
+              echo "Usage: pms password <new-password>"
+              exit 1
+            fi
+            ;;
+        esac
+        if pms_api /api/auth/password \\
+             "{\\"current\\":\\"123456\\",\\"next\\":\\"\$pms_next\\"}" >/dev/null; then
+          echo "Password updated."
+        else
+          echo "Password was reset to the default, but setting the new one failed."
+          exit 1
+        fi
+        ;;
+    esac
     ;;
   uninstall|--uninstall)
     bash "\$APP_DIR/stop.sh" 2>/dev/null || true
@@ -523,8 +590,10 @@ do_start() {
   done
 
   register_cli
-  # Always run start.sh detached in background so interactive terminal commands and piped curl | bash never block on child I/O
-  nohup bash -c 'cd "'"$APP_DIR"'" && PENCARIMOVIE_NO_BANNER=1 bash start.sh' </dev/null >/dev/null 2>&1 &
+  # Always run start.sh detached in background so interactive terminal commands and piped curl | bash never block on child I/O.
+  # PORT is passed explicitly: it is a local variable here, not exported, so a
+  # non-default port used to be silently dropped by the launcher.
+  nohup bash -c 'cd "'"$APP_DIR"'" && PORT="'"$PORT"'" PENCARIMOVIE_NO_BANNER=1 bash start.sh' </dev/null >/dev/null 2>&1 &
   sleep 1
   print_urls
   echo "PencariMovie Server started in the background."
@@ -708,8 +777,32 @@ EOF
   echo "Auto-start on boot has been ENABLED."
 }
 
-# Write storage/auth.json directly. Uses the bundled PHP when available so the
-# hash matches password_verify(); falls back to a plain sha256 marker otherwise.
+# auth.json is written by the ENGINE, not by this script. The old PHP-bundled
+# path hashed with password_hash() (bcrypt); the Rust engine verifies its own
+# `sha256$salt$hash` (20 000 rounds) and also accepts bcrypt, so hand-writing a
+# hash here would either be wrong for the engine or duplicate its KDF. Instead
+# drive the engine's own loopback API, which is privileged for 127.0.0.1.
+http_post_json() {
+  local path="$1" body="${2:-{}}"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl is required for this command."
+    return 1
+  fi
+  curl -fsS -m 15 -H 'Content-Type: application/json' \
+    -X POST -d "$body" "http://127.0.0.1:$PORT$path" 2>/dev/null
+}
+
+auth_api_ready() {
+  command -v curl >/dev/null 2>&1 || return 1
+  curl -fsS -m 8 -o /dev/null "http://127.0.0.1:$PORT/api/auth/status" 2>/dev/null
+}
+
+json_field() {
+  sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' | head -1
+}
+
+# Legacy installs (PHP + `bin/php`) keep the old direct-write path so their
+# bcrypt hash keeps working; new Rust installs go through the API.
 do_password() {
   local newpw="${1:-}"
   local auth_file="$APP_DIR/storage/auth.json"
@@ -725,7 +818,7 @@ do_password() {
     [ -n "$cand" ] && [ -x "$cand" ] && php_bin="$cand" && break
   done
 
-  if [ -n "$php_bin" ]; then
+  if [ -n "$php_bin" ] && [ -f "$APP_DIR/backend.php" ]; then
     "$php_bin" -r '
       $f = $_SERVER["argv"][1] ?? "";
       $newpw = $_SERVER["argv"][2] ?? "";
@@ -737,8 +830,24 @@ do_password() {
       file_put_contents($f, json_encode($d, JSON_UNESCAPED_SLASHES), LOCK_EX);
     ' "$auth_file" "$newpw"
     echo "Password updated."
+    return 0
+  fi
+
+  # Rust engine: reset to the default over loopback (privileged), then set the
+  # requested password using that default as the "current" one.
+  if ! auth_api_ready; then
+    echo "Server is not running. Start it once with 'pms start', then retry."
+    return 1
+  fi
+  if ! http_post_json "/api/auth/reset" '{}' >/dev/null; then
+    echo "Could not reset the password; the server refused the request."
+    return 1
+  fi
+  if http_post_json "/api/auth/password" \
+      "{\"current\":\"123456\",\"next\":\"$newpw\"}" >/dev/null; then
+    echo "Password updated."
   else
-    echo "PHP not found; cannot hash the password. Start the server once, then retry."
+    echo "Password was reset to the default, but setting the new one failed."
     return 1
   fi
 }
@@ -756,7 +865,7 @@ do_token() {
     for cand in "$APP_DIR/bin/php" "$(command -v php 2>/dev/null || true)"; do
       [ -n "$cand" ] && [ -x "$cand" ] && php_bin="$cand" && break
     done
-    if [ -n "$php_bin" ]; then
+    if [ -n "$php_bin" ] && [ -f "$APP_DIR/backend.php" ]; then
       "$php_bin" -r '
         $f = $_SERVER["argv"][1] ?? "";
         if ($f === "") { exit(1); }
@@ -769,8 +878,24 @@ do_token() {
       ' "$auth_file"
       echo "Token rotated. Re-install the addon from #addon on every device."
     else
-      echo "PHP not found; cannot rotate the token."
-      return 1
+      # Rust engine: `/api/auth/token/rotate` is privileged for loopback and it
+      # is the only writer that refreshes the in-process auth cache.
+      if ! auth_api_ready; then
+        echo "Server is not running. Start it once with 'pms start', then retry."
+        return 1
+      fi
+      local out tok
+      if ! out="$(http_post_json "/api/auth/token/rotate" '{}')"; then
+        echo "Could not rotate the token; the server refused the request."
+        return 1
+      fi
+      tok="$(printf '%s' "$out" | json_field token)"
+      if [ -z "$tok" ]; then
+        echo "Token rotation returned no token."
+        return 1
+      fi
+      echo "$tok"
+      echo "Token rotated. Re-install the addon from #addon on every device."
     fi
     return 0
   fi

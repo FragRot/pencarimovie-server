@@ -179,6 +179,10 @@ do_stop() {
   pkill -9 -f "frankenphp.*Caddyfile" 2>/dev/null || true
   pkill -9 -f "frankenphp.*php-server" 2>/dev/null || true
   pkill -9 -f "php.*router\.php" 2>/dev/null || true
+  # The published engine is the Rust binary; none of the patterns above match it,
+  # so `stop` left it holding the port.
+  pkill -9 -f "$APP_DIR/pencarimovie-server" 2>/dev/null || true
+  pkill -9 -f "\./pencarimovie-server --port" 2>/dev/null || true
 
   if command -v lsof >/dev/null 2>&1; then
     local pids_port
@@ -300,15 +304,11 @@ strip_crlf() {
 
 download_extract() {
   local target="$1" tag="$2"
-  local url=""
+  # One artifact shape: the per-target Rust package. The universal
+  # `pencarimovie-server.tar.gz` (old PHP product) is no longer published, so the
+  # old fallback could only 404 AFTER the real download had already succeeded.
+  local url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server-$target.tar.gz"
   local fallback_url=""
-
-  if [ "$target" = "server" ]; then
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-  else
-    url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server-$target.tar.gz"
-    fallback_url="https://github.com/$REPO/releases/download/$tag/pencarimovie-server.tar.gz"
-  fi
   local tmp src
 
   tmp="${TMPDIR:-/tmp}/pencarimovie-ota-$$"
@@ -371,7 +371,10 @@ install_or_update() {
   current="$(current_tag)"
 
   local is_installed=0
-  if [ -d "$APP_DIR" ] && { [ -f "$APP_DIR/backend.php" ] || [ -f "$APP_DIR/bin/frankenphp" ]; }; then
+  # The published package is the Rust engine (`pencarimovie-server` + launchers).
+  # `backend.php` / `bin/frankenphp` are the OLD PHP markers; keying only on those
+  # made a fresh Rust install look absent, so every start re-downloaded it.
+  if [ -d "$APP_DIR" ] && { [ -x "$APP_DIR/pencarimovie-server" ] || [ -f "$APP_DIR/start-termux.sh" ] || [ -f "$APP_DIR/backend.php" ] || [ -f "$APP_DIR/bin/frankenphp" ]; }; then
     is_installed=1
   fi
 
@@ -408,8 +411,9 @@ install_or_update() {
       do_stop
       sleep 1
     fi
-    # Use lightweight pencarimovie-server.tar.gz for updates (keeps existing binaries, updates app/vendor code fast)
-    download_extract "server" "$latest"
+    # ALWAYS the per-target package: the "lightweight server" tarball this used
+    # to fetch is no longer published, so an existing install could never update.
+    download_extract "$target" "$latest"
   fi
   register_cli
   return 0
@@ -546,8 +550,35 @@ do_start() {
 
   local started=0
 
-  # ── Primary: Attempt FrankenPHP with proot (small download size) ───────────
-  if [ -x "$FRANKENPHP_BIN" ]; then
+  # ── Primary: native Rust engine (no proot, no PHP) ─────────────────────────
+  # The published Termux package ships a STATIC musl aarch64 binary, so it execs
+  # directly on Termux's bionic userland with no PRoot and no PHP at all. This is
+  # tried FIRST because it is what the release actually contains; the
+  # FrankenPHP/proot block below now only serves legacy installs.
+  local RUST_BIN="$ROOT_DIR/pencarimovie-server"
+  if [ -x "$RUST_BIN" ]; then
+    echo "Starting PencariMovie Server (native engine)..."
+    echo "Log file: $LOG_FILE"
+    (
+      # Termux caps RLIMIT_NOFILE low and the download worker opens many sockets.
+      ulimit -n 65536 2>/dev/null || true
+      cd "$ROOT_DIR" || exit 1
+      PORT="$PORT" HOST="$HOST" LAN_IP="${LAN_IP:-}" \
+        nohup "$RUST_BIN" --port "$PORT" --host "$HOST" >>"$LOG_FILE" 2>&1 &
+      echo $! > "$PID_FILE"
+    )
+    sleep 2
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null; then
+      started=1
+    else
+      echo "Native engine did not stay up; see $LOG_FILE"
+      tail -n 20 "$LOG_FILE" 2>/dev/null || true
+      rm -f "$PID_FILE"
+    fi
+  fi
+
+  # ── Legacy: FrankenPHP via proot ───────────────────────────────────────────
+  if [ "$started" -eq 0 ] && [ -x "$FRANKENPHP_BIN" ]; then
     if ! command -v proot >/dev/null 2>&1 && command -v pkg >/dev/null 2>&1; then
       echo "Installing proot for FrankenPHP..."
       pkg install -y proot 2>/dev/null || true
