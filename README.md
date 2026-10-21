@@ -105,12 +105,6 @@ Run in terminal:
 curl -fsSL telegra.my/mac | bash
 ```
 
-#### 🤖 Android (APK)
-
-The engine runs inside the app — download and install the APK:
-
-👉 **https://telegra.my/apk**
-
 #### 🐳 Docker (Any OS / NAS / VPS)
 
 ```bash
