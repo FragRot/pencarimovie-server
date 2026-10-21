@@ -42,11 +42,15 @@ public/      the dashboard (Nuvio shell + the downloader overlays), embedded at
              release artifact stage from this path.
 desktop/     the release launchers (start / stop / restart / tray / autostart),
              copied next to the binary in each tarball.
-android/     the APK projects (pencarimovie-rust is the shipped one).
-docs/        architecture notes (ARCHITECTURE.md, SERVER.md, PARITY.md, ...).
+docs/        architecture notes (ARCHITECTURE.md, SERVER.md, ...). The port
+             audit lives at the root: PARITY.md, PORT_GAPS.md, COVERAGE.md.
 legacy/      superseded implementations - see legacy/README.md. Not built,
              not released, not deployed.
-storage/     runtime state (sessions, auth, caches). Never committed.
+storage/     runtime state (sessions, auth, caches). Gitignored: only
+             `.gitkeep` is tracked.
+android/     NOT TRACKED. The APK projects are a local build tree because they
+             hold the release signing key; only the built APK is published, as
+             a release asset. See ANDROID-SIGNING.md.
 ```
 
 Deployment in one line each: `Dockerfile` builds the crate from source;

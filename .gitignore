@@ -203,14 +203,12 @@ downloads/
 dist/
 # The Rust crate's generated output, e2e scratch and local state.
 #
-# `storage/` itself is NOT ignored as a whole: storage/catalog_settings.json,
-# storage/index.json and storage/config.example.json are tracked, and the crate
-# shares that directory. The per-file rules further up (storage/auth.json,
-# storage/bot_pool.json, storage/api_secret.key, storage/sessions/,
-# storage/cache/, ...) cover the live/deployable state, and the `_e2e*/` fixtures
-# (which hold api_secret.key / api_credentials.json) are covered by `_*/`.
-# scripts/build-rust-*.sh|bat write dist-rust/ (binary + launchers + an EMPTY
-# storage/); none of it is ever packaged or belongs in git.
+# `storage/` is RUNTIME STATE and is never tracked (see the block below): it
+# holds the bot session, the WordPress API secret, the server auth token, the
+# per-user catalog settings and every cache. Only `storage/.gitkeep` is tracked
+# so a fresh clone still has the folder the binary expects. The release
+# packaging creates its own EMPTY `stage/<name>/storage/` (`release.yml`), so no
+# file here is needed by any consumer.
 target/
 dist/
 dist-native/
@@ -338,8 +336,16 @@ android/termux-app-fork-x86_64/local.properties
 # BOM and UpdateChecker's JSONObject() would throw, silently disabling updates.
 # ---------------------------------------------------------------------------
 
-# Rust port: live state + local build output (never commit secrets).
-storage/
+# Runtime state + local build output. NEVER commit anything from storage/:
+# it accumulates the Telegram session, the WordPress API secret, the auth
+# token and the user's own catalog settings.
+storage/*
+!storage/.gitkeep
+# Android signing material. `release-key.jks` is the identity every installed
+# APK trusts, so it must never be published — neither the keystore nor its
+# password (read those from local.properties / the environment instead).
+*.jks
+*.keystore
 dist/
 dist-native/
 _*.txt
@@ -352,8 +358,8 @@ _apk*.txt
 # legacy/ - superseded implementations.
 #
 # `legacy/php/` IS tracked: it is the behavioural reference the Rust port is
-# verified against (server/PARITY.md, server/PORT_GAPS.md), so it stays in the
-# history. `legacy/ts/` is a dead TypeScript attempt that never reached parity and
+# verified against (PARITY.md and PORT_GAPS.md at the repo root), so it stays in
+# the history. `legacy/ts/` is a dead TypeScript attempt that never reached parity and
 # carries a node_modules tree; it is kept on disk for reference only, never
 # committed. Same for the port's scratch archives.
 # ---------------------------------------------------------------------------
@@ -361,3 +367,22 @@ legacy/ts/
 # The ledger generator for the archived tree's port audit; the generated
 # COVERAGE.md / ledger.json are what we keep.
 legacy/php/tools/
+
+# ---------------------------------------------------------------------------
+# android/ - LOCAL BUILD TREE, deliberately untracked.
+#
+# Every APK project lives here and none of it belongs in the public repo:
+#
+#   * it carries the RELEASE SIGNING KEY. `android/**/app/release-key.jks` is
+#     the identity every installed APK trusts, so publishing it lets anyone
+#     sign an APK that Android accepts as an upgrade over ours — a full
+#     supply-chain takeover. The keystore and its password stay on the build
+#     machine (`local.properties`, gitignored) — see ANDROID-SIGNING.md.
+#   * the compiled engine is a multi-hundred-MB `jniLibs/*.so` blob.
+#   * the shipped artifact is the APK, published as a GitHub release asset
+#     (`apk-server-latest`), not the source.
+#
+# Same reasoning already applied to `android/pencarimovie-server` and
+# `android/pencarimovie-rust` before this rule existed.
+# ---------------------------------------------------------------------------
+android/
