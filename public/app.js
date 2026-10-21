@@ -2301,8 +2301,15 @@ class PencariMovieApp {
     return __async(this, null, function* () {
       try {
         const data = yield this.requestJson("".concat(this.localApiBase, "/api/session"));
-        if (data == null ? void 0 : data.version) {
-          this.version = String(data.version);
+        // Never take a raw build stamp into the badge: an older engine answered
+        // `/api/session` with `2.9.0-9-ga8a1f3d-dirty`, which overwrote the clean
+        // value `/api/version` had already set and showed gibberish to the user.
+        // `engine_version` is the internal build id, so it only counts as a
+        // displayable engine version when it is a plain X.Y.Z.
+        const sessionVersion = this._plainVersion(data == null ? void 0 : data.version);
+        if (sessionVersion) {
+          this.version = sessionVersion;
+          this.engineVersion = this._plainVersion(data == null ? void 0 : data.engine_version);
           this.renderSettingsVersion();
         }
         if (data == null ? void 0 : data.device_id) {
@@ -5494,8 +5501,8 @@ class PencariMovieApp {
           // change between app releases.
           // `data.version` is the clean X.Y.Z the engine reports; without it a
           // desktop build showed the git stamp (`2.8.9-4-g02e7dea`) in the badge.
-          this.version = String((data == null ? void 0 : data.version) || (data == null ? void 0 : data.client_version) || data.current_version);
-          this.engineVersion = String(data.current_version);
+          this.version = this._plainVersion(data == null ? void 0 : data.version) || this._plainVersion(data == null ? void 0 : data.client_version) || this._plainVersion(data.current_version);
+          this.engineVersion = this._plainVersion(data.current_version);
           this.renderSettingsVersion();
         }
         if ((data == null ? void 0 : data.sponsor) && typeof data.sponsor === "object") {
@@ -5514,8 +5521,8 @@ class PencariMovieApp {
           // A NOTIFICATION, not a wall: the server no longer refuses requests from
           // an older build, so show what is available in #settings / #addon.
           this.renderUpdateNotice({
-            current: data.client_version || data.current_version,
-            latest: data.minimum_version,
+            current: this._plainVersion(data.client_version) || this._plainVersion(data.current_version),
+            latest: this._plainVersion(data.minimum_version),
             url: data.update_url
           });
           return null;
@@ -5543,9 +5550,19 @@ class PencariMovieApp {
     }
     return false;
   }
+  /**
+   * `X.Y.Z` or nothing. A `git describe` stamp (`2.9.0-9-ga8a1f3d-dirty`) is
+   * support information, never something a user should read in the badge.
+   */
+  _plainVersion(raw) {
+    const m = String(raw == null ? "" : raw).trim().replace(/^v/i, "").match(/^(\d+)\.(\d+)\.(\d+)$/);
+    return m ? m[0] : "";
+  }
   renderSettingsVersion() {
-    const versionText = this.version ? "v".concat(this.version) : "";
-    const suffix = this.engineVersion && this.engineVersion !== this.version ? " (engine ".concat(this.engineVersion, ")") : "";
+    const version = this._plainVersion(this.version);
+    const engine = this._plainVersion(this.engineVersion);
+    const versionText = version ? "v".concat(version) : "";
+    const suffix = engine && engine !== version ? " (engine v".concat(engine, ")") : "";
     const setupEl = this.$("#settingsVersion");
     const connectedEl = this.$("#settingsConnectedVersion");
     if (setupEl) setupEl.textContent = versionText + suffix;
@@ -5618,7 +5635,11 @@ class PencariMovieApp {
           body: "{}"
         });
         const res = yield resp.json();
-        if (res && res.ok) {
+        // ONLY a real download means the server is about to restart. `ok` alone
+        // is not enough: an up-to-date build answers `{ok:true, up_to_date:true}`
+        // and the bar used to sit on "Restarting..." forever - a dead button.
+        const applied = Boolean(res && res.ok && !res.up_to_date && !res.manual);
+        if (applied) {
           btn.textContent = "Restarting...";
           return;
         }
@@ -5628,10 +5649,15 @@ class PencariMovieApp {
         // left the button looking dead), plus a one-click manual path.
         const owner = btn.parentElement;
         if (owner) {
+          // One message, not one per click: repeated presses on a slow feed
+          // used to stack identical lines.
+          const stale = owner.querySelectorAll(".pm-update-msg");
+          for (let i = 0; i < stale.length; i++) stale[i].remove();
           const msg = document.createElement("span");
+          msg.className = "pm-update-msg";
           msg.style.cssText = "flex:1 1 100%;order:3;font-size:12px;color:#ffb27a";
-          msg.textContent = (res && res.error) || "Update failed.";
-          if (res && res.releases_url) {
+          msg.textContent = res && res.up_to_date ? String(res.message || "This is already the latest version.") : (res && res.error) || "Update failed.";
+          if (res && res.releases_url && !res.up_to_date) {
             const a = document.createElement("a");
             a.href = res.releases_url;
             a.target = "_blank";
@@ -5642,7 +5668,7 @@ class PencariMovieApp {
           }
           owner.appendChild(msg);
         }
-        if (!(res && res.releases_url)) {
+        if (!(res && res.releases_url) && !(res && res.up_to_date)) {
           alert((res && res.error) || "Update failed.");
         }
       } catch (e) {

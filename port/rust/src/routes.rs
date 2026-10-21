@@ -760,7 +760,12 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             200,
             &serde_json::json!({
                 "ok": 1,
-                "version": app_version(),
+                // `version` is what a UI displays, so it must be a clean X.Y.Z:
+                // `app_version()` can be a git stamp (`2.9.0-9-ga8a1f3d-dirty`),
+                // which the settings badge rendered verbatim.
+                "version": crate::config::descriptor_version(),
+                "engine_version": app_version(),
+                "client_version": crate::config::client_version(),
                 "has_session": has_session,
                 "is_provisioning": is_guest_provision_in_progress(),
                 "bot_id": if has_session { bot_id } else { String::new() },
