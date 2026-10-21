@@ -224,19 +224,31 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(8)
         .max(1);
-    // Global cap on concurrent download responses: 400+ viewers queue here
-    // instead of all opening a Telegram part at once.
+    // Global cap on concurrent download responses: beyond it viewers get a
+    // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.
+    //
+    // `0` (or `--max-streams 0`, `PM_MAX_STREAMS=0`) means NO CAP — the gate is
+    // then sized to the semaphore maximum and never blocks. Deliberate: the
+    // operator asked for unlimited, and the real backstop beyond that is the
+    // PaaS router (Heroku answers H12 at 30 s) plus dyno memory.
+    //
+    // NOTE: `.max(1)` used to be here, which turned `0` into a gate of ONE —
+    // i.e. a single viewer and everyone else 503. Do not put it back.
     let max_streams: usize = arg_value("--max-streams")
         .or_else(|| storage::env("PM_MAX_STREAMS"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256)
-        .max(1);
+        .unwrap_or(256);
+    let gate_permits = if max_streams == 0 {
+        tokio::sync::Semaphore::MAX_PERMITS
+    } else {
+        max_streams
+    };
 
     let state = Arc::new(AppState {
         port,
         workers,
         inflight,
-        download_gate: Arc::new(tokio::sync::Semaphore::new(max_streams)),
+        download_gate: Arc::new(tokio::sync::Semaphore::new(gate_permits)),
         max_streams,
         telegram: telegram::TelegramPool::new(workers, inflight),
     });

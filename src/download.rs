@@ -697,6 +697,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // At most `--max-streams` (default 256) downloads run at once; the rest
     // QUEUE for up to 5 s and then answer 503 + Retry-After, so 400+ viewers
     // queue deterministically instead of all opening a Telegram part at once.
+    //
+    // `--max-streams 0` / `PM_MAX_STREAMS=0` disables the cap: the gate is sized
+    // to `Semaphore::MAX_PERMITS`, so this acquire is free and never 503s.
     let stream_permit = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
         state.download_gate.clone().acquire_owned(),
