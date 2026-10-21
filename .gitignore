@@ -386,3 +386,23 @@ legacy/php/tools/
 # `android/pencarimovie-rust` before this rule existed.
 # ---------------------------------------------------------------------------
 android/
+
+# ---------------------------------------------------------------------------
+# docs/ - internal design notes, kept out of the published tree.
+#
+# `docs/` holds working material: the port ledger, stress-run results, the
+# Telegram concurrency evaluation and the addon spec. Useful while working on
+# the engine, a distraction (and a maintenance liability) in the published
+# repository. The QUANTITATIVE record that belongs next to the code —
+# PARITY.md, PORT_GAPS.md, COVERAGE.md, CROSS-PLATFORM.md — is tracked at the
+# repo root, and README.md is the user-facing document.
+# ---------------------------------------------------------------------------
+docs/
+
+# The engine's internal engineering bookkeeping. Kept on disk as the working
+# record of port parity and platform support; none of it is product
+# documentation, and every file here goes stale the moment the code moves.
+PARITY.md
+PORT_GAPS.md
+COVERAGE.md
+CROSS-PLATFORM.md
