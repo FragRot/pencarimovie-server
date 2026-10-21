@@ -1,14 +1,22 @@
-# PencariMovie â€” Rust port (native `grammers`)
+# PencariMovie Server — the engine (Rust, native `grammers`)
 
-Faithful port of [`backend.php`](../../backend.php) onto **native grammers** â€”
+This is **the product**: one self-contained binary. The crate lives at `<repo>/server`
+and embeds the dashboard from `<repo>/public` at compile time (see
+[`src/assets.rs`](src/assets.rs)), so a release artifact is a single executable
+plus its launchers.
+
+The engine is a faithful translation of the retired PHP backend
+([`legacy/php/backend.php`](../legacy/php/backend.php)) onto **native grammers** —
 `grammers-client` / `grammers-session` / `grammers-tl-types` **0.11.0** from
-crates.io (same source as codeberg master, no wrapper, no FFI) â€” plus `axum` +
+crates.io (same source as codeberg master, no wrapper, no FFI) — plus `axum` +
 `tokio`. Translation, not redesign: same function names, same defaults, same
 `storage/...` paths, same JSON shapes, same error strings.
 
-The work list is [`port/COVERAGE.md`](../COVERAGE.md) (20,527 lines, 266 `fd_*`
-functions, 57 route patterns); the per-group state of this port is
-[`PARITY.md`](PARITY.md).
+The work list is [`COVERAGE.md`](COVERAGE.md) (the original `backend.php` line-by-line
+inventory, 266 `fd_*` functions, 57 route patterns); the per-group state of this port
+is [`PARITY.md`](PARITY.md) and the remaining divergences are in
+[`PORT_GAPS.md`](PORT_GAPS.md). Cross-platform build notes are in
+[`CROSS-PLATFORM.md`](CROSS-PLATFORM.md).
 
 ---
 

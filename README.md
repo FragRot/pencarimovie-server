@@ -22,10 +22,42 @@
 
 **PencariMovie Server** is a lightweight, self-hosted streaming utility and protocol bridge connecting client applications to Telegram's MTProto API. It converts user-authorized Telegram file references into local HTTP streams with range-request (`HTTP 206`) seek support for media players including **Stremio**, **Nuvio**, and web browsers.
 
-- **Client-Side MTProto Bridge**: Directly streams authorized media to the user's local player using MadelineProto.
+- **Client-Side MTProto Bridge**: Directly streams authorized media to the user's local player over MTProto ([`grammers`](https://codeberg.org/grammers/grammers), compiled into the binary).
 - **No Remote File Hosting**: The server does not host, store, or re-transmit copyrighted files; streams originate from Telegram's network directly to the local client.
 - **Local & Private**: Runs on the user's own hardware (localhost / private LAN) without passing credentials or media bytes to external proxy servers.
 - **Cross-Platform**: Available as a native Windows tray application, Linux daemon, Android APK, Termux script, and Docker container.
+
+---
+
+## 🗂️ Repository layout
+
+The server is **one Rust binary** ([`server/`](server)) with the dashboard compiled
+into it. There is no PHP at runtime.
+
+```
+server/      the engine: axum + grammers. `cargo build --release` -> one binary.
+public/      the dashboard (Nuvio shell + the downloader overlays), embedded at
+             COMPILE TIME by server/src/assets.rs. Never moved: the addon UI and
+             every release artifact stage from this path.
+android/     the APK projects (pencarimovie-rust is the shipped one).
+scripts/     local build tooling (not committed; CI builds from server/ directly).
+docs/        architecture notes and contributor docs.
+legacy/      superseded implementations - see legacy/README.md. Not built,
+             not released, not deployed.
+storage/     runtime state (sessions, auth, caches). Never committed.
+```
+
+Deployment in one line each: `Dockerfile` builds `server/` from source;
+`Dockerfile.release` packages the prebuilt musl binary; `heroku.yml` and
+`render.yaml` run the published image — all of them the **Rust** engine. The
+PHP/FrankenPHP engine that preceded it lives in [`legacy/php/`](legacy/php).
+
+Follow-up, deliberately out of scope for the layout refactor: the root installers
+(`pencarimovie-linux.sh`, `pencarimovie-termux.sh`, `pencarimovie-windows.bat`,
+`update.ps1`) still carry PHP-era fast paths that start a bundled `frankenphp`/
+`php -S` when one is present in the install directory. They download and launch
+the Rust tarballs, so the fallback is dead weight rather than a bug — see
+`legacy/php/README.md` § "The installers did NOT move".
 
 ---
 

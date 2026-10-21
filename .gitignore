@@ -143,9 +143,9 @@ build-rootfs-termux.sh
 scripts/package-android.*
 scripts/build-bootstrap.ps1
 
-# Documentation & development docs
-docs/
-
+# `docs/` is TRACKED now: it holds the architecture notes the README points at.
+# (It used to be ignored as scratch space.)
+#
 # References and sub-repos
 references/
 
