@@ -16,7 +16,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "PM_DIR="
 if exist "%~dp0pencarimovie-server.exe" set "PM_DIR=%~dp0."
 if not defined PM_DIR if exist "%USERPROFILE%\pencarimovie-server\pencarimovie-server.exe" set "PM_DIR=%USERPROFILE%\pencarimovie-server"
-if not defined PM_DIR if exist "%~dp0server\target\release\pencarimovie-server.exe" set "PM_DIR=%~dp0server\target\release"
+if not defined PM_DIR if exist "%~dp0target\release\pencarimovie-server.exe" set "PM_DIR=%~dp0target\release"
 
 if not defined PM_DIR (
     echo PencariMovie Server is not installed.

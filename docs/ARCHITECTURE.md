@@ -24,20 +24,20 @@ Nuvio, Eclipse Music and a browser can play. It is **one Rust binary**.
 
 | Path                                                        | Responsibility                                                                                                                              |
 | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`server/src/routes.rs`](../server/src/routes.rs)           | Every HTTP route: the Stremio/Eclipse addon surface, `/api/*`, and the download streamer.                                                   |
-| [`server/src/telegram.rs`](../server/src/telegram.rs)       | grammers client lifecycle, bot login, file download chunks.                                                                                 |
-| [`server/src/resolve.rs`](../server/src/resolve.rs)         | `short_code` → `file_id` resolution, cache layers, plugin fallbacks.                                                                        |
-| [`server/src/wp_data.rs`](../server/src/wp_data.rs)         | Cached WordPress calls (catalogs, posts, post-files) with single-flight and stale-while-revalidate.                                         |
-| [`server/src/matcher.rs`](../server/src/matcher.rs)         | Filename → title/episode matching. This is where most regressions historically came from; it mirrors the archived PHP matcher case by case. |
-| [`server/src/assets.rs`](../server/src/assets.rs)           | `include_dir!` of `<repo>/public` — the dashboard is compiled into the binary.                                                              |
-| [`server/src/auth.rs`](../server/src/auth.rs)               | Server password + static token, loopback detection, route policy.                                                                           |
-| [`server/src/update.rs`](../server/src/update.rs)           | In-app OTA against the release feed.                                                                                                        |
-| [`server/src/tunnel.rs`](../server/src/tunnel.rs)           | Cloudflare tunnel management.                                                                                                               |
-| [`server/src/diagnostics.rs`](../server/src/diagnostics.rs) | Incident capture (crash / ANR / stream-miss / playback) and upload.                                                                         |
+| [`server/src/routes.rs`](../src/routes.rs)           | Every HTTP route: the Stremio/Eclipse addon surface, `/api/*`, and the download streamer.                                                   |
+| [`server/src/telegram.rs`](../src/telegram.rs)       | grammers client lifecycle, bot login, file download chunks.                                                                                 |
+| [`server/src/resolve.rs`](../src/resolve.rs)         | `short_code` → `file_id` resolution, cache layers, plugin fallbacks.                                                                        |
+| [`server/src/wp_data.rs`](../src/wp_data.rs)         | Cached WordPress calls (catalogs, posts, post-files) with single-flight and stale-while-revalidate.                                         |
+| [`server/src/matcher.rs`](../src/matcher.rs)         | Filename → title/episode matching. This is where most regressions historically came from; it mirrors the archived PHP matcher case by case. |
+| [`server/src/assets.rs`](../src/assets.rs)           | `include_dir!` of `<repo>/public` — the dashboard is compiled into the binary.                                                              |
+| [`server/src/auth.rs`](../src/auth.rs)               | Server password + static token, loopback detection, route policy.                                                                           |
+| [`server/src/update.rs`](../src/update.rs)           | In-app OTA against the release feed.                                                                                                        |
+| [`server/src/tunnel.rs`](../src/tunnel.rs)           | Cloudflare tunnel management.                                                                                                               |
+| [`server/src/diagnostics.rs`](../src/diagnostics.rs) | Incident capture (crash / ANR / stream-miss / playback) and upload.                                                                         |
 
 ## The two things that must stay where they are
 
-1. **`public/` at the repository root.** [`server/src/assets.rs`](../server/src/assets.rs)
+1. **`public/` at the repository root.** [`server/src/assets.rs`](../src/assets.rs)
    embeds it at compile time with `include_dir!("$CARGO_MANIFEST_DIR/../public")`, and
    [`server/build.rs`](../server/build.rs) folds every file's path+size+mtime into the
    crate fingerprint so a dashboard change always forces a rebuild. Moving `public/`
@@ -88,6 +88,6 @@ binary), which is why every image sets it to `/data` and mounts a volume there.
 
 The PHP + FrankenPHP + MadelineProto implementation is archived under
 [`legacy/php/`](../legacy/php). It is not built, released or deployed. It is kept because
-[`server/PARITY.md`](../server/PARITY.md) and [`server/PORT_GAPS.md`](../server/PORT_GAPS.md)
+[`server/PARITY.md`](../PARITY.md) and [`server/PORT_GAPS.md`](../PORT_GAPS.md)
 use it as the behavioural specification — go there for "what did the old engine do in
 this case", not here.

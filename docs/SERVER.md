@@ -50,7 +50,7 @@ untested), and `Dockerfile` + `docker-compose.yml`.
 Prove any of them in one command — cold boot, 16 checks, no PowerShell:
 
 ```bash
-node server/tools/smoke_boot.mjs server/dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
+node tools/smoke_boot.mjs dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
 ```
 
 `PM_APP_ROOT` decides where `storage/` lives and, when set, it is authoritative

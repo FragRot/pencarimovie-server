@@ -31,23 +31,25 @@
 
 ## 🗂️ Repository layout
 
-The server is **one Rust binary** ([`server/`](server)) with the dashboard compiled
-into it. There is no PHP at runtime.
+This repository **is** the Rust server: the crate is at the root, and the
+dashboard is compiled into the binary. There is no PHP at runtime.
 
 ```
-server/      the engine: axum + grammers. `cargo build --release` -> one binary.
+Cargo.toml   the engine: axum + grammers. `cargo build --release` -> one binary.
+src/         the engine sources (routes, telegram, matcher, assets, auth, ...).
 public/      the dashboard (Nuvio shell + the downloader overlays), embedded at
-             COMPILE TIME by server/src/assets.rs. Never moved: the addon UI and
-             every release artifact stage from this path.
+             COMPILE TIME by src/assets.rs. Never moved: the addon UI and every
+             release artifact stage from this path.
+desktop/     the release launchers (start / stop / restart / tray / autostart),
+             copied next to the binary in each tarball.
 android/     the APK projects (pencarimovie-rust is the shipped one).
-scripts/     local build tooling (not committed; CI builds from server/ directly).
-docs/        architecture notes and contributor docs.
+docs/        architecture notes (ARCHITECTURE.md, SERVER.md, PARITY.md, ...).
 legacy/      superseded implementations - see legacy/README.md. Not built,
              not released, not deployed.
 storage/     runtime state (sessions, auth, caches). Never committed.
 ```
 
-Deployment in one line each: `Dockerfile` builds `server/` from source;
+Deployment in one line each: `Dockerfile` builds the crate from source;
 `Dockerfile.release` packages the prebuilt musl binary; `heroku.yml` and
 `render.yaml` run the published image — all of them the **Rust** engine. The
 PHP/FrankenPHP engine that preceded it lives in [`legacy/php/`](legacy/php).

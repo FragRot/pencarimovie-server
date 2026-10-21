@@ -18,12 +18,11 @@ use include_dir::{include_dir, Dir};
 
 /// `<repo>/public`, embedded at compile time.
 ///
-/// The crate lives at `<repo>/server`, and `public/` deliberately stays at the
-/// repository root (it is the dashboard shared by every distribution channel and
-/// the path the release workflow stages from), so this is exactly one level up.
-/// Moving the crate deeper or moving `public/` requires updating this path *and*
-/// the `Dockerfile` COPY pair that reproduces the same relative layout.
-pub static PUBLIC: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../public");
+/// The crate lives at the repository root, so `public/` is a sibling directory:
+/// `$CARGO_MANIFEST_DIR/public`. It is the dashboard shared by every distribution
+/// channel and the path the release workflow stages from, so it must not move —
+/// [`crate::build`]-time `build.rs` resolves the SAME path for its fingerprint.
+pub static PUBLIC: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/public");
 
 /// Read an embedded asset by its path relative to `public/`
 /// (`"css/bundle.css"`, `"index.html"`).

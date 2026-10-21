@@ -17,17 +17,17 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
-# The crate embeds ../public (server/src/assets.rs), so the build context must
-# keep the repo layout: `server/` beside `public/`, exactly as in the checkout.
-COPY server ./server
+# The crate IS the repo root: `src/assets.rs` embeds `public/` with include_dir!,
+# so the build context only needs the manifest, the sources and the dashboard.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY src ./src
 COPY public ./public
-WORKDIR /src/server
 # BuildKit cache mounts: the crate registry and the target dir survive between
 # builds (including across a multi-arch buildx run), so an emulated arm64 build
 # only recompiles what actually changed instead of the whole dependency tree.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/src/server/target \
+    --mount=type=cache,target=/src/target \
     cargo build --release --locked \
  && cp target/release/pencarimovie-server /usr/local/bin/pencarimovie-server
 

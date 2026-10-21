@@ -201,31 +201,34 @@ downloads/
 
 # Release and build artifacts.
 dist/
-# The Rust crate's generated output, e2e scratch and crate-local state.
+# The Rust crate's generated output, e2e scratch and local state.
 #
-# `server/storage/` and the `server/_e2e*/` fixtures hold LIVE SECRETS
-# (api_secret.key, api_credentials.json, bot_pool.json, session files), and
-# scripts/build-rust-*.sh|bat write server/dist-rust/ (binary + start.sh + README
-# + an EMPTY storage/). None of it is ever packaged or belongs in git.
-server/target/
-server/dist/
-server/dist-native/
-server/dist-rust/
-server/storage/
-server/_*/
-server/_*.txt
-server/_*.log
-server/e2e.*.log
-server/port/
+# `storage/` itself is NOT ignored as a whole: storage/catalog_settings.json,
+# storage/index.json and storage/config.example.json are tracked, and the crate
+# shares that directory. The per-file rules further up (storage/auth.json,
+# storage/bot_pool.json, storage/api_secret.key, storage/sessions/,
+# storage/cache/, ...) cover the live/deployable state, and the `_e2e*/` fixtures
+# (which hold api_secret.key / api_credentials.json) are covered by `_*/`.
+# scripts/build-rust-*.sh|bat write dist-rust/ (binary + launchers + an EMPTY
+# storage/); none of it is ever packaged or belongs in git.
+target/
+dist/
+dist-native/
+dist-rust/
+_*/
+_*.txt
+_*.log
+e2e.*.log
+.server-port-scratch/
 # Tooling and integration-test harnesses in the crate: local-only, they talk to
 # a running server and to live Telegram bots. `cargo test --bin
 # pencarimovie-server` (the suite CI and the release gate run) does not compile
 # them.
-server/tools/
-server/tests/
+tools/
+tests/
 # Rolling "remaining work" scratchpad; nothing references it and its measured
 # numbers go stale with every release.
-server/NEXT.md
+NEXT.md
 # Rust APK (android/pencarimovie-rust): the engine is four copies of the Rust
 # ELF (~130 MB) staged into jniLibs by scripts/build-rust-apk.bat, plus Gradle
 # output. The sources, gradle files and keystores ARE tracked - only the
@@ -336,11 +339,11 @@ android/termux-app-fork-x86_64/local.properties
 # ---------------------------------------------------------------------------
 
 # Rust port: live state + local build output (never commit secrets).
-server/storage/
-server/dist/
-server/dist-native/
-server/_*.txt
-server/_*.log
+storage/
+dist/
+dist-native/
+_*.txt
+_*.log
 _pmdeploy.tgz
 _heroku*.txt
 _apk*.txt
