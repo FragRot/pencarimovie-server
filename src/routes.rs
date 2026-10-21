@@ -55,7 +55,7 @@ use crate::session::{
     has_local_session, is_guest_provision_in_progress, load_session_meta, measure_clock_offset,
     remove_pool_bot, save_session_meta,
 };
-use crate::storage::{now, storage_path};
+use crate::storage::{env, now, storage_path};
 use crate::tunnel;
 use crate::upstream;
 use crate::AppState;
@@ -2901,11 +2901,20 @@ async fn finish_streams(
     filtered: bool,
     files_before_filter: usize,
 ) -> Response {
+    // Captured BEFORE the placeholder is pushed: the notice must only promise
+    // "the streams below still work" when there really are streams below it.
+    let had_streams = !streams.is_empty();
     if streams.is_empty() {
         streams.push(no_streams_card(ctx, title, item_id, filtered, files_before_filter));
     }
     if let Some(sponsor) = sponsor_item().await {
         streams.insert(0, sponsor);
+    }
+    // The WordPress minimum-version notice as a NON-BLOCKING item: the PHP
+    // returned this card INSTEAD of the streams, which made an outdated engine
+    // unusable. Here it is one extra line on top and every stream keeps working.
+    if let Some(card) = update_notice(had_streams, &ctx.base_url).await {
+        streams.insert(0, card);
     }
     let body = serde_json::json!({"streams": streams});
     crate::cache::put(
@@ -2918,6 +2927,133 @@ async fn finish_streams(
     stremio_json(200, &body, "no-store")
 }
 
+/// Build the "update available" item from a `/api/version` answer.
+///
+/// Non-blocking by design: it never replaces the streams. `container` changes the
+/// advice, because a container updates by pulling a new image, not by replacing a
+/// binary. An app shell never reaches here (`update_needed` is false for it).
+fn build_update_notice(
+    check: &Value,
+    container: bool,
+    streams_below: bool,
+    base_url: &str,
+) -> Value {
+    let current = crate::config::clean_version(&jstr(check, "current_version"));
+    let minimum = crate::config::clean_version(&jstr(check, "minimum_version"));
+    let wp_url = jstr(check, "update_url").trim().to_string();
+    // Where "the update page" actually is, in order of usefulness:
+    //   1. the anchor WordPress publishes (`update_url`), when it is configured;
+    //   2. on a desktop build with no published URL, THIS server's `#settings`,
+    //      which carries the update banner and its one-click "Update now";
+    //   3. otherwise (container / bare build) the public release page, next to
+    //      the pull command the description already prints.
+    let (url, hint) = if container {
+        (
+            crate::update::releases_url(),
+            "run `docker compose pull && docker compose up -d`",
+        )
+    } else if !wp_url.is_empty() {
+        (wp_url, "open the update page, then restart the server")
+    } else {
+        (
+            format!("{}/#settings", base_url.trim_end_matches('/')),
+            "open Settings on this server and press Update now",
+        )
+    };
+    // Only promise the streams below when there ARE streams below — an empty
+    // list still gets the notice (its own card explains the empty result).
+    let tail = if streams_below {
+        " — the streams below still work."
+    } else {
+        "."
+    };
+    serde_json::json!({
+        "name": "⬆️ Update available",
+        "description": format!(
+            "PencariMovie v{minimum} is available (this install: v{current}).\n👉 To update {hint}{tail}",
+        ),
+        "externalUrl": url,
+    })
+}
+
+/// `None` unless the WordPress minimum version is genuinely newer than this build.
+async fn update_notice(streams_below: bool, base_url: &str) -> Option<Value> {
+    let check = check_version().await;
+    if check.get("update_needed").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    Some(build_update_notice(
+        &check,
+        crate::update::runs_in_container(),
+        streams_below,
+        base_url,
+    ))
+}
+
+/// Non-default `stream_config` entries that can hide a file, as short phrases.
+///
+/// The card used to say "hidden by your active filters (Resolution / Codec /
+/// Size / Keywords)" — true, but it never named the one that was doing it, so a
+/// leftover `required_keywords` looked exactly like a backend outage.
+fn active_filter_notes(stream_config: &Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let text = |k: &str| {
+        stream_config
+            .get(k)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let num = |k: &str| stream_config.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    let flag = |k: &str| stream_config.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let required = text("required_keywords");
+    if !required.is_empty() {
+        out.push(format!("required keywords \"{required}\""));
+    }
+    let excluded = text("excluded_keywords");
+    if !excluded.is_empty() {
+        out.push(format!("excluded keywords \"{excluded}\""));
+    }
+    if num("max_size_gb") > 0 {
+        out.push(format!("max size {} GB", num("max_size_gb")));
+    }
+    if num("min_size_mb") > 0 {
+        out.push(format!("min size {} MB", num("min_size_mb")));
+    }
+    if num("max_streams_total") > 0 {
+        out.push(format!("first {} stream(s) only", num("max_streams_total")));
+    }
+    if num("max_streams_per_resolution") > 0 {
+        out.push(format!(
+            "{} per resolution",
+            num("max_streams_per_resolution")
+        ));
+    }
+    if flag("exclude_cam") {
+        out.push("CAM releases excluded".to_string());
+    }
+    for (group, label) in [
+        ("resolutions", "resolution"),
+        ("qualities", "quality"),
+        ("encodes", "codec"),
+        ("visual_tags", "tag"),
+    ] {
+        if let Some(map) = stream_config.get(group).and_then(|v| v.as_object()) {
+            let off: Vec<&str> = map
+                .iter()
+                .filter(|(_, v)| v.as_bool() == Some(false))
+                .map(|(k, _)| k.as_str())
+                .collect();
+            if !off.is_empty() {
+                out.push(format!("{label} off: {}", off.join(", ")));
+            }
+        }
+    }
+    out
+}
+
 /// `⚠️ Streams Filtered Out` vs `No Streams Found` (backend.php:18206-18234).
 fn no_streams_card(
     ctx: &ReqCtx,
@@ -2927,11 +3063,18 @@ fn no_streams_card(
     files_before_filter: usize,
 ) -> Value {
     if filtered && files_before_filter > 0 {
+        let settings = load_catalog_settings_merged();
+        let notes = active_filter_notes(&settings["stream_config"]);
+        let detail = if notes.is_empty() {
+            "your active filters (Resolution / Codec / Size / Keywords)".to_string()
+        } else {
+            format!("your active filters — {}", notes.join("; "))
+        };
         return serde_json::json!({
             "name": "⚠️ Streams Filtered Out",
             "description": format!(
-                "🔍 {} stream(s) found on PencariMovie, but hidden by your active filters (Resolution / Codec / Size / Keywords).\n👉 Tap to open settings & adjust filters.",
-                files_before_filter
+                "🔍 {} stream(s) found on PencariMovie, but hidden by {}.\n👉 Tap to open settings & adjust filters.",
+                files_before_filter, detail
             ),
             "externalUrl": format!("{}/#configure", ctx.base_url.trim_end_matches('/')),
         });
@@ -3410,12 +3553,33 @@ fn load_catalog_settings_merged() -> Value {
     base
 }
 
+/// `PM_CATALOG_SETTINGS` (a JSON object) with `storage/catalog_settings.json`
+/// laid OVER it. Ephemeral hosts — Render, a Docker redeploy — discard the
+/// container disk, so without an env layer the dashboard's catalog/upstream/
+/// stream configuration silently reverted to the built-in defaults on every
+/// restart. The file still wins, so in-session edits from `#addon` keep working.
 fn read_catalog_settings() -> Value {
-    std::fs::read_to_string(storage_path("catalog_settings.json"))
+    let env_layer = env("PM_CATALOG_SETTINGS")
+        .and_then(|raw| serde_json::from_str::<Value>(raw.trim()).ok());
+    let file_layer = std::fs::read_to_string(storage_path("catalog_settings.json"))
         .ok()
-        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}))
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    merge_settings_layers(env_layer, file_layer)
+}
+
+/// Env layer as the base, stored file keys over it. A value that is not a JSON
+/// object is ignored rather than trusted (a typo must not blank every setting).
+fn merge_settings_layers(env_layer: Option<Value>, file_layer: Option<Value>) -> Value {
+    let mut base = match env_layer {
+        Some(v) if v.is_object() => v,
+        _ => serde_json::json!({}),
+    };
+    if let Some(obj) = file_layer.as_ref().and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            base[k] = v.clone();
+        }
+    }
+    base
 }
 
 fn write_catalog_settings(data: &Value) -> bool {
@@ -6846,6 +7010,96 @@ mod tests {
         assert_eq!(
             file_meta_pills("Movie.1080p.WEB-DL.x265.mkv", 0),
             vec!["1080p", "WEB-DL", "HEVC"]
+        );
+    }
+
+    #[test]
+    fn update_notice_is_a_non_blocking_item() {
+        let check = serde_json::json!({
+            "update_needed": true,
+            "current_version": "2.8.8-10-gabc-dirty",
+            "minimum_version": "v2.9.3",
+            "update_url": "https://example.test/download",
+        });
+        let desktop = build_update_notice(&check, false, true, "http://127.0.0.1:8088");
+        let desc = desktop["description"].as_str().unwrap();
+        assert!(desc.contains("v2.9.3"), "{desc}");
+        // The install version is shown clean — never the git stamp.
+        assert!(desc.contains("v2.8.8"), "{desc}");
+        assert!(!desc.contains("-10-g"), "{desc}");
+        assert_eq!(
+            desktop["externalUrl"],
+            serde_json::json!("https://example.test/download")
+        );
+        // It is a notification: with streams below, say they still work.
+        assert!(desc.contains("still work"), "{desc}");
+        // ... but an EMPTY list must not promise streams that are not there.
+        let empty = build_update_notice(&check, false, false, "http://127.0.0.1:8088");
+        let edesc = empty["description"].as_str().unwrap();
+        assert!(!edesc.contains("still work"), "{edesc}");
+        assert!(edesc.ends_with('.'), "{edesc}");
+        // A container is told to pull the image instead, and links to the
+        // release page (there is no local page that could install an image).
+        let container = build_update_notice(&check, true, true, "http://127.0.0.1:8088");
+        let cdesc = container["description"].as_str().unwrap();
+        assert!(cdesc.contains("docker compose pull"), "{cdesc}");
+        assert!(container["externalUrl"]
+            .as_str()
+            .unwrap()
+            .contains("releases/latest"));
+        // No WordPress update_url on a desktop → THIS server's #settings, which
+        // carries the banner and the one-click "Update now".
+        let no_url = serde_json::json!({"current_version": "2.8.8", "minimum_version": "2.9.3"});
+        let card = build_update_notice(&no_url, false, true, "http://127.0.0.1:8088/");
+        assert_eq!(
+            card["externalUrl"],
+            serde_json::json!("http://127.0.0.1:8088/#settings")
+        );
+        assert!(card["description"]
+            .as_str()
+            .unwrap()
+            .contains("press Update now"));
+    }
+
+    #[test]
+    fn filtered_out_message_names_the_active_filters() {
+        // A leftover `required_keywords` is the single most confusing cause: the
+        // card must say so instead of a generic "adjust filters".
+        let sc = serde_json::json!({
+            "required_keywords": "avengers",
+            "excluded_keywords": "",
+            "max_size_gb": 5,
+            "max_streams_total": 0,
+            "exclude_cam": false,
+            "resolutions": {"4k": false, "1080p": true},
+            "qualities": {"cam": true},
+            "encodes": {"hevc": true},
+            "visual_tags": {"dv": false}
+        });
+        let notes = active_filter_notes(&sc);
+        assert!(notes.iter().any(|n| n.contains("required keywords \"avengers\"")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("max size 5 GB")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("resolution off: 4k")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("tag off: dv")), "{notes:?}");
+        // Shipped defaults restrict nothing, so the card keeps the generic text.
+        assert!(active_filter_notes(&default_catalog_settings()["stream_config"]).is_empty());
+    }
+
+    #[test]
+    fn catalog_settings_env_layer_is_the_base() {
+        // The env layer supplies what an ephemeral host would otherwise lose ...
+        let merged = merge_settings_layers(
+            Some(serde_json::json!({"catalogs_enabled": false, "country": "MY"})),
+            Some(serde_json::json!({"country": "ID"})),
+        );
+        assert_eq!(merged["catalogs_enabled"], serde_json::json!(false));
+        // ... and a file written by the dashboard still wins over it.
+        assert_eq!(merged["country"], serde_json::json!("ID"));
+        assert_eq!(merge_settings_layers(None, None), serde_json::json!({}));
+        // A malformed / non-object env value must not blank every setting.
+        assert_eq!(
+            merge_settings_layers(Some(serde_json::json!("nope")), None),
+            serde_json::json!({})
         );
     }
 

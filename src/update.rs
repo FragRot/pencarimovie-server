@@ -21,6 +21,12 @@ const API_LATEST: &str = "https://api.github.com/repos/aiskendi/pencarimovie-ser
 
 /// `linux-x86_64`, `windows-x86_64`, `macos-aarch64` — the artifact suffix the
 /// release workflow publishes. `None` on a platform we do not build for.
+/// The public release page, for the places that can only LINK to an update
+/// (the streams-list notice, a container, a bare build).
+pub fn releases_url() -> String {
+    format!("https://github.com/{REPO}/releases/latest")
+}
+
 pub fn platform_key() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Some("linux-x86_64"),
@@ -93,6 +99,51 @@ fn app_managed_for(client: &str) -> bool {
     cfg!(target_os = "android") || !client.trim().is_empty()
 }
 
+/// Environment / filesystem markers that mean "this process runs in a container".
+///
+/// A container's writable layer is thrown away by the next `docker compose up`
+/// and the published IMAGE is what carries the new build, so replacing the
+/// binary inside the running container is not an update — it is a change that
+/// disappears on restart. `PORT` is deliberately not a marker (the PHP launchers
+/// export it on a desktop).
+const CONTAINER_MARKERS: [&str; 8] = [
+    "DYNO",                // Heroku
+    "RENDER",              // Render
+    "FLY_APP_NAME",        // Fly.io
+    "RAILWAY_ENVIRONMENT", // Railway
+    "K_SERVICE",           // Google Cloud Run
+    "WEBSITE_SITE_NAME",   // Azure App Service
+    "KUBERNETES_SERVICE_HOST",
+    "PM_PAAS", // explicit opt-in for any other container host
+];
+
+/// Pure so it can be tested without touching the filesystem or the environment.
+pub fn container_predicate(get: impl Fn(&str) -> bool, container_file: bool) -> bool {
+    container_file || CONTAINER_MARKERS.iter().any(|k| get(k))
+}
+
+pub fn runs_in_container() -> bool {
+    let files = std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists();
+    container_predicate(|k| crate::storage::env(k).is_some(), files)
+}
+
+/// Why the button may not self-update on this host. Empty = it may.
+fn apply_blocked_reason(asset: Option<&str>) -> &'static str {
+    if runs_in_container() {
+        "container"
+    } else if asset.is_none() {
+        "no_asset"
+    } else if !apply_script().is_file() {
+        "no_script"
+    } else {
+        ""
+    }
+}
+
+const CONTAINER_HINT: &str =
+    "This server runs in a container, so it updates by pulling a new image — run `docker compose pull && docker compose up -d` (or redeploy the service) instead of replacing the binary.";
+
 /// `GET /api/update/check` — never downloads anything.
 pub async fn check() -> Value {
     let current = config::app_version();
@@ -109,6 +160,20 @@ pub async fn check() -> Value {
     }
     let release = latest_release().await;
     if release.is_null() {
+        // In a container the actionable answer does not depend on the feed: the
+        // image is the unit of update, so say that instead of "check your network".
+        if runs_in_container() {
+            return serde_json::json!({
+                "ok": false,
+                "container": true,
+                "current": current,
+                "build": config::build_id(),
+                "apply_blocked_reason": "container",
+                "apply_hint": CONTAINER_HINT,
+                "releases_url": releases_url(),
+                "error": CONTAINER_HINT,
+            });
+        }
         return serde_json::json!({
             "ok": false,
             "current": current,
@@ -131,6 +196,10 @@ pub async fn check() -> Value {
         });
     };
     let asset = asset_of(&release, &format!("pencarimovie-server-{key}.tar.gz"));
+    // `can_apply` is what the update bar acts on: a container, a release with no
+    // artifact for THIS arch, and a bare build with no apply script can all SEE
+    // the update but must not offer a button that cannot work.
+    let reason = apply_blocked_reason(asset.as_deref());
     serde_json::json!({
         "ok": true,
         "current": current,
@@ -143,7 +212,11 @@ pub async fn check() -> Value {
         "latest": latest,
         "update_available": is_newer(&latest, &current),
         "asset": asset,
+        "can_apply": reason.is_empty(),
+        "apply_blocked_reason": reason,
+        "apply_hint": if reason == "container" { CONTAINER_HINT } else { "" },
         "notes_url": release.get("html_url").and_then(|v| v.as_str()).unwrap_or(""),
+        "releases_url": releases_url(),
     })
 }
 
@@ -177,6 +250,19 @@ pub async fn apply() -> Value {
             "error": "This engine runs inside an app that updates itself. Use the app's own update banner.",
         });
     }
+    // Downloading a tarball inside a container replaces the binary in a layer
+    // that the next container start throws away — and `process::exit(0)` below
+    // would bounce the container back onto the OLD image. Refuse before the
+    // download, with the command that actually works.
+    if runs_in_container() {
+        return serde_json::json!({
+            "ok": false,
+            "container": true,
+            "apply_blocked_reason": "container",
+            "current": config::app_version(),
+            "error": CONTAINER_HINT,
+        });
+    }
     let info = check().await;
     if info.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return info;
@@ -205,7 +291,7 @@ pub async fn apply() -> Value {
             "ok": false,
             "manual": true,
             "asset": asset,
-            "releases_url": format!("https://github.com/{REPO}/releases/latest"),
+            "releases_url": releases_url(),
             "error": format!(
                 "This build has no {} next to the binary, so it cannot replace itself. Download the release and extract it over this folder.",
                 script.file_name().unwrap_or_default().to_string_lossy()
@@ -297,10 +383,54 @@ mod tests {
     }
 
     #[test]
+    fn container_markers_block_self_update() {
+        // A desktop has none of these markers and no `/.dockerenv`.
+        assert!(!container_predicate(|_| false, false));
+        // Docker / Podman marker file, and every PaaS marker, mean "update the
+        // image", not "replace the binary".
+        assert!(container_predicate(|_| false, true));
+        assert!(container_predicate(|k| k == "RENDER", false));
+        assert!(container_predicate(|k| k == "KUBERNETES_SERVICE_HOST", false));
+        assert!(container_predicate(|k| k == "PM_PAAS", false));
+        // `PORT` is exported by the desktop launchers too — never a marker.
+        assert!(!container_predicate(|k| k == "PORT", false));
+    }
+
+    #[test]
     fn platform_keys_are_the_published_names() {
         // The keys must match the artifact suffixes release.yml uploads.
         let key = platform_key().expect("this test runs on a supported platform");
         let published = ["linux-x86_64", "linux-aarch64", "windows-x86_64", "macos-aarch64", "macos-x86_64"];
         assert!(published.contains(&key), "{key}");
+    }
+
+    #[test]
+    fn each_arch_picks_its_own_artifact() {
+        // Multi-arch release: every platform key must select exactly its own
+        // tarball, never a sibling's (a Pi must not get the x86_64 build).
+        let names = [
+            "linux-x86_64",
+            "linux-aarch64",
+            "windows-x86_64",
+            "macos-aarch64",
+            "macos-x86_64",
+        ];
+        let assets: Vec<Value> = names
+            .iter()
+            .flat_map(|k| {
+                [
+                    serde_json::json!({ "name": format!("pencarimovie-server-{k}.tar.gz") }),
+                    serde_json::json!({ "name": format!("pencarimovie-server-{k}.tar.gz.sha256") }),
+                ]
+            })
+            .collect();
+        let release = serde_json::json!({ "assets": assets });
+        for k in names {
+            let want = format!("pencarimovie-server-{k}.tar.gz");
+            assert_eq!(asset_of(&release, &want).as_deref(), Some(want.as_str()), "{k}");
+        }
+        // An arch with no published artifact gets None (the caller then reports
+        // `no_asset` instead of downloading the wrong binary).
+        assert!(asset_of(&release, "pencarimovie-server-linux-armv7.tar.gz").is_none());
     }
 }

@@ -9,8 +9,10 @@
 //! ported — the port writes locally and reports `ok: 0` for a send, which is
 //! listed in PARITY.md as a gap rather than faked.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use rand::RngCore;
 use serde_json::Value;
@@ -138,6 +140,95 @@ fn android_model_and_version() -> (String, String) {
     (model, version)
 }
 
+/// Free space on the volume holding the app root, in MiB.
+///
+/// No `sysinfo`/`fs2` dependency: Windows asks kernel32 directly, Unix shells
+/// out to `df -kP`. Both are cached by the caller, so `/api/diagnostics` (which
+/// the Android service polls every 3 s) never spawns a process repeatedly.
+#[cfg(windows)]
+fn disk_free_mb_uncached() -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free_bytes_available: *mut u64,
+            total_bytes: *mut u64,
+            total_free_bytes: *mut u64,
+        ) -> i32;
+    }
+    let mut wide: Vec<u16> = crate::storage::app_root().as_os_str().encode_wide().collect();
+    wide.push(0);
+    let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) };
+    if ok == 0 { None } else { Some(avail / (1024 * 1024)) }
+}
+
+#[cfg(not(windows))]
+fn disk_free_mb_uncached() -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-kP")
+        .arg(crate::storage::app_root())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(kb / 1024)
+}
+
+fn disk_free_mb() -> Option<u64> {
+    static CACHE: OnceLock<Mutex<(i64, Option<u64>)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((0, None)));
+    let now_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(_) => return disk_free_mb_uncached(),
+    };
+    if now_s - guard.0 > 60 {
+        *guard = (now_s, disk_free_mb_uncached());
+    }
+    guard.1
+}
+
+/// Human OS string for the support report. Windows used to read
+/// `/proc/sys/kernel/osrelease`, which does not exist there, so the dashboard
+/// showed `OS: ?`.
+fn os_version_string() -> String {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if cfg!(target_os = "android") {
+                let (_, v) = android_model_and_version();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Ok(o) = std::process::Command::new("cmd").args(["/c", "ver"]).output() {
+                    let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !t.is_empty() {
+                        return t;
+                    }
+                }
+                return "Windows".to_string();
+            }
+            #[cfg(not(windows))]
+            {
+                let release = read_first_line("/proc/sys/kernel/osrelease");
+                if release.is_empty() {
+                    std::env::consts::OS.to_string()
+                } else {
+                    format!("{} {}", std::env::consts::OS, release)
+                }
+            }
+        })
+        .clone()
+}
+
 fn proc_value(path: &str, key: &str) -> u64 {
     let text = fs::read_to_string(path).unwrap_or_default();
     for line in text.lines() {
@@ -165,22 +256,37 @@ pub fn device_info() -> Value {
         raw.split('.').next().unwrap_or("0").parse::<u64>().unwrap_or(0)
     };
     let fd_count = fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0);
-    let (model, os_version) = if cfg!(target_os = "android") {
-        android_model_and_version()
+    let hostname = {
+        let h = read_first_line("/proc/sys/kernel/hostname");
+        if h.is_empty() {
+            std::env::var("COMPUTERNAME")
+                .or_else(|_| std::env::var("HOSTNAME"))
+                .unwrap_or_default()
+        } else {
+            h
+        }
+    };
+    let model = if cfg!(target_os = "android") {
+        android_model_and_version().0
+    } else if hostname.is_empty() {
+        // A desktop has no "model"; the hostname is the useful identifier and
+        // beats the literal "?" the panel used to print.
+        std::env::consts::ARCH.to_string()
     } else {
-        (
-            read_first_line("/proc/sys/kernel/osrelease"),
-            read_first_line("/proc/version"),
-        )
+        hostname.clone()
     };
     serde_json::json!({
         "device_id": get_device_id(),
         "platform": std::env::consts::OS,
         "model": model,
         "brand": std::env::consts::ARCH,
-        "os_version": os_version,
-        "app_version": app_version(),
-        "hostname": read_first_line("/proc/sys/kernel/hostname"),
+        "os_version": os_version_string(),
+        // `2.9.2-10-g5c61011-dirty` is support info, not a version a user should
+        // read in the diagnostics panel.
+        "app_version": crate::config::clean_version(&app_version()),
+        "auto_report": auto_report_enabled(),
+        "disk_free_mb": disk_free_mb(),
+        "hostname": hostname,
         "total_memory_mb": mem_total_kb / 1024,
         "free_memory_mb": mem_avail_kb / 1024,
         "process_rss_mb": rss_kb / 1024,
@@ -256,6 +362,56 @@ pub fn record(
     }
     let _ = fs::write(&file, serde_json::to_string_pretty(&payload).unwrap_or_default());
     file
+}
+
+/// Debounce window for [`record_throttled`].
+pub const THROTTLE_WINDOW_S: i64 = 300;
+
+static THROTTLE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+/// `record()` at most once per [`THROTTLE_WINDOW_S`] for an identical
+/// `(report_type, reason, short_code, http_status)` signature.
+///
+/// A URL that cannot play is re-requested on EVERY range and every player
+/// reopen — the 52 `CLIENT_ABORTED` rows in `server_reports_idx` are that shape
+/// — and [`prune`] keeps only 10 files per type, so an unthrottled failure
+/// record buries every real incident instead of adding signal. Keyed on the
+/// signature (never on the file), so two different titles failing the same way
+/// both land.
+///
+/// ponytail: signatures with an empty `short_code` collapse into one report.
+/// Add a per-`item_id` key when a refusal without a short code becomes common.
+pub fn record_throttled(
+    report_type: &str,
+    title: &str,
+    message: &str,
+    reason: &str,
+    short_code: &str,
+    extra: Value,
+) -> Option<PathBuf> {
+    let status = extra.get("http_status").and_then(|v| v.as_u64()).unwrap_or(0);
+    let key = format!("{report_type}|{reason}|{short_code}|{status}");
+    let mut seen = THROTTLE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !take_slot(&mut seen, &key, now(), THROTTLE_WINDOW_S) {
+        return None;
+    }
+    drop(seen);
+    Some(record(report_type, title, message, "", reason, short_code, "", extra))
+}
+
+/// One slot per `key` per `window_s`. Expired signatures are forgotten on every
+/// call, so the map is bounded by "signatures seen in the last window" instead
+/// of growing with every short_code ever requested.
+fn take_slot(seen: &mut HashMap<String, i64>, key: &str, t: i64, window_s: i64) -> bool {
+    seen.retain(|_, v| t - *v < window_s);
+    if seen.contains_key(key) {
+        return false;
+    }
+    seen.insert(key.to_string(), t);
+    true
 }
 
 pub fn list() -> Vec<Value> {
@@ -442,5 +598,21 @@ ro.build.description=generic_x86-user 5.1.1 LMY48Z 30 test-keys
         assert_eq!(info["runtime"], "pencarimovie-server");
         assert_eq!(info["platform"], std::env::consts::OS);
         assert!(info["device_id"].as_str().unwrap_or("").len() >= 6);
+    }
+    
+    /// The debounce is what keeps a failing stream URL (re-requested on every
+    /// range and every player reopen) from burying every other incident.
+    #[test]
+    fn refusal_throttle_is_once_per_window_per_signature() {
+        let mut seen = std::collections::HashMap::new();
+        assert!(take_slot(&mut seen, "a", 1000, 300), "first report is written");
+        assert!(!take_slot(&mut seen, "a", 1299, 300), "same signature inside the window is dropped");
+        assert!(take_slot(&mut seen, "b", 1299, 300), "a different signature is independent");
+        assert!(take_slot(&mut seen, "a", 1300, 300), "window elapsed -> reportable again");
+        assert_eq!(seen.len(), 2);
+
+        // Expired signatures are forgotten, so the map cannot grow forever.
+        assert!(take_slot(&mut seen, "c", 99_999, 300));
+        assert_eq!(seen.len(), 1);
     }
 }

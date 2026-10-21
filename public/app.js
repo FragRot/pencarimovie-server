@@ -383,9 +383,14 @@ class PencariMovieApp {
       reportBtn.addEventListener("click", () => {
         setStatus("Sending…");
         fetch(base + "/api/reports").then(r => r.json()).then(list => {
-          const pending = (list.reports || []).filter(r => !r.sent).map(r => r.file).filter(Boolean);
+          const all = list.reports || [];
+          const pending = all.filter(r => !r.sent).map(r => r.file).filter(Boolean);
           if (!pending.length) {
-            setStatus("Nothing to send — no unsent reports.");
+            // Explain WHY: an upload inserts a new row on the server, so
+            // "already sent" must not silently look like "there is nothing here".
+            setStatus(all.length
+              ? "Nothing to send — all " + all.length + " report(s) were already sent."
+              : "No reports recorded yet.");
             return;
           }
           const sends = pending.map(f => fetch(base + "/api/reports?send=" + encodeURIComponent(f)).then(r => r.json()).then(j => j && j.ok ? 1 : 0).catch(() => 0));
@@ -408,7 +413,7 @@ class PencariMovieApp {
             "Device: " + (d.device_id || "?") + " · " + (d.platform || "?") + " " + (d.app_version || ""),
             "OS: " + (d.os_version || "?"),
             "Model: " + (d.model || "?") + " / " + (d.brand || "?"),
-            "Disk free: " + (d.disk_free_mb === undefined ? "?" : d.disk_free_mb) + " MB",
+            "Disk free: " + (d.disk_free_mb == null ? "?" : d.disk_free_mb) + " MB",
             "Reports: " + (reportLine || "none"),
             "Auto-send: " + (d.auto_report ? "on" : "off")
           ].join("\n"));
@@ -924,6 +929,7 @@ class PencariMovieApp {
           updateCatalogModeUI();
           renderCatalogOptions();
           renderUpstreamAddons();
+          fillSettingsJson();
         }
       } catch (err) {
         console.warn("Failed to load catalog settings:", err);
@@ -1076,6 +1082,7 @@ class PencariMovieApp {
           const resData = yield res.json().catch(() => null);
           if (res.ok && (resData == null ? void 0 : resData.ok)) {
             catalogSettingsState = resData.settings || payload;
+            fillSettingsJson();
             updateCatalogModeUI();
             this.loadInitialData().catch(e => console.warn("Failed to refresh data after catalog save:", e));
             if (catSaveStatus) {
@@ -1107,6 +1114,76 @@ class PencariMovieApp {
         }
       }));
     }
+    /* ── Settings JSON: back this panel up / apply it on another install ──
+       One line of JSON, so the same text works in the #addon box on a new
+       install (Arch, Windows, Android) AND as PM_CATALOG_SETTINGS on a host
+       with an ephemeral disk (Render, Docker without a volume). */
+    const catSettingsJsonEl = this.$("#catSettingsJson");
+    const catCopySettingsBtn = this.$("#catCopySettingsBtn");
+    const catApplySettingsBtn = this.$("#catApplySettingsBtn");
+    const catSettingsIoStatus = this.$("#catSettingsIoStatus");
+    let catSettingsIoStatusTimer = null;
+    // Hoisted so loadCatalogSettings() (above) and the save handler both refresh
+    // the box once the server has confirmed the new state.
+    function fillSettingsJson() {
+      if (catSettingsJsonEl) catSettingsJsonEl.value = JSON.stringify(catalogSettingsState);
+    }
+    const showSettingsIoStatus = (msg, ok = true) => {
+      if (!catSettingsIoStatus) return;
+      catSettingsIoStatus.textContent = msg;
+      catSettingsIoStatus.style.color = ok ? "#00d26a" : "#ff5c5c";
+      if (catSettingsIoStatusTimer) clearTimeout(catSettingsIoStatusTimer);
+      catSettingsIoStatusTimer = setTimeout(() => {
+        catSettingsIoStatus.textContent = "";
+      }, 5e3);
+    };
+    if (catCopySettingsBtn) {
+      catCopySettingsBtn.addEventListener("click", () => __async(this, null, function* () {
+        const text = catSettingsJsonEl ? catSettingsJsonEl.value : JSON.stringify(catalogSettingsState);
+        const ok = yield this.copyToClipboard(text, catSettingsJsonEl);
+        showSettingsIoStatus(ok ? "\u2713 Copied \u2014 paste it into the new install, or into PM_CATALOG_SETTINGS" : "\u2715 Copy failed \u2014 select the text and copy it manually", ok);
+      }));
+    }
+    if (catApplySettingsBtn) {
+      catApplySettingsBtn.addEventListener("click", () => __async(this, null, function* () {
+        let parsed = null;
+        try {
+          parsed = JSON.parse((catSettingsJsonEl && catSettingsJsonEl.value || "").trim());
+        } catch (e) {
+          return showSettingsIoStatus("\u2715 That is not valid JSON", false);
+        }
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          return showSettingsIoStatus("\u2715 Expected a JSON object", false);
+        }
+        catApplySettingsBtn.disabled = true;
+        const origText = catApplySettingsBtn.textContent;
+        catApplySettingsBtn.textContent = "Applying...";
+        try {
+          const res = yield fetch("".concat(this.localApiBase, "/api/catalog-settings"), {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            },
+            body: JSON.stringify(parsed)
+          });
+          const resData = yield res.json().catch(() => null);
+          if (!(res.ok && (resData == null ? void 0 : resData.ok))) {
+            throw new Error((resData == null ? void 0 : resData.error) || (resData == null ? void 0 : resData.message) || "Failed to apply settings");
+          }
+          catalogSettingsState = resData.settings || catalogSettingsState;
+          yield loadCatalogSettings();
+          fillSettingsJson();
+          this.loadInitialData().catch(e => console.warn("Failed to refresh data after JSON apply:", e));
+          showSettingsIoStatus("\u2713 Applied");
+        } catch (err) {
+          showSettingsIoStatus("\u2715 ".concat(err.message || "Failed to apply settings"), false);
+        } finally {
+          catApplySettingsBtn.disabled = false;
+          catApplySettingsBtn.textContent = origText;
+        }
+      }));
+    }
+    fillSettingsJson();
     const isUsableLanHost = host => {
       const value = String(host || "").trim();
       if (!value || value === "localhost" || value === "::1") {
@@ -5599,10 +5676,14 @@ class PencariMovieApp {
         if (data && data.update_needed && !appShell) {
           // A NOTIFICATION, not a wall: the server no longer refuses requests from
           // an older build, so show what is available in #settings / #addon.
+          // `canApply: false` — this is the WordPress MINIMUM-version notice, not
+          // a GitHub artifact, so the button opens `update_url` instead of asking
+          // the engine to replace itself.
           this.renderUpdateNotice({
             current: this._plainVersion(data.client_version) || this._plainVersion(data.current_version),
             latest: this._plainVersion(data.minimum_version),
-            url: data.update_url
+            url: data.update_url,
+            canApply: false
           });
           return null;
         }
@@ -5680,10 +5761,16 @@ class PencariMovieApp {
         if (!resp.ok) return;
         const info = yield resp.json();
         if (info && info.ok && info.update_available) {
+          // `can_apply` is false on hosts that cannot replace their own binary:
+          // a container (update the IMAGE), a release with no artifact for this
+          // CPU (multi-arch), or a bare build with no apply script.
           this.renderUpdateNotice({
             current: info.current_display || info.current,
             latest: info.latest_display || info.latest,
-            build: info.build
+            build: info.build,
+            canApply: info.can_apply !== false,
+            hint: info.apply_hint || "",
+            url: info.notes_url || info.releases_url || ""
           });
         }
       } catch (e) {}
@@ -5705,21 +5792,39 @@ class PencariMovieApp {
       if (!bar) {
         bar = document.createElement("div");
         bar.className = "pm-update-notice";
-        bar.setAttribute("style", "position:relative;z-index:3;margin:0 0 12px;padding:10px 12px;border-radius:8px;background:#2b2110;border:1px solid #ff6b35;color:#ffd8c2;font-size:13px;line-height:1.5;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap");
+        // The bar stops SHORT of the close X (`margin-right` = the 32px button
+        // plus its 12px inset + a gap), so it never sits under or behind it.
+        // `z-index: 3` is below `.settings-gate__close`'s 4 as a second guard.
+        bar.setAttribute("style", "position:relative;z-index:3;margin:0 50px 12px 0;padding:10px 12px;border-radius:8px;background:#2b2110;border:1px solid #ff6b35;color:#ffd8c2;font-size:13px;line-height:1.5;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap");
         host.insertBefore(bar, host.firstChild);
       }
       bar.textContent = "";
       const label = document.createElement("span");
       label.textContent = text;
+      // A host that cannot replace its own binary (container, no artifact for
+      // this CPU, no apply script) gets a link to the release page instead of a
+      // button that can only fail. The server decides via `can_apply`.
+      const canApply = info.canApply !== false;
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.textContent = "Update now";
+      btn.textContent = canApply ? "Update now" : "Release page";
       btn.setAttribute("style", "background:#ff6b35;color:#141414;border:0;border-radius:6px;padding:6px 12px;font-weight:600;cursor:pointer");
       btn.addEventListener("click", () => {
-        this.applyUpdate(btn);
+        if (canApply) {
+          this.applyUpdate(btn);
+          return;
+        }
+        if (info.url) window.open(info.url, "_blank", "noopener");
       });
       bar.appendChild(label);
       bar.appendChild(btn);
+      if (!canApply && info.hint) {
+        const hint = document.createElement("div");
+        hint.className = "pm-update-msg";
+        hint.setAttribute("style", "flex-basis:100%;font-size:12px;color:#ffd8c2;opacity:.85;font-family:monospace");
+        hint.textContent = info.hint;
+        bar.appendChild(hint);
+      }
     });
   }
 

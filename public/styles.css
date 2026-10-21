@@ -206,6 +206,10 @@
   position: absolute;
   top: 12px;
   right: 12px;
+  /* Above `.pm-update-notice` (z-index 3) — the update bar is inserted as the
+     card's first child and used to paint over this button, so the X could not
+     be clicked. */
+  z-index: 4;
   width: 32px;
   height: 32px;
   border: none;
@@ -374,7 +378,10 @@
 .addon-catalog-card__header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  /* `center` put the "Enabled" badge halfway down the whole left column (title
+     + Region row), so it read ~20px below the title instead of on its line. */
+  align-items: flex-start;
+  gap: 8px;
   margin-bottom: 10px;
 }
 
@@ -433,17 +440,24 @@
   padding: 6px 10px;
 }
 
+/* Plain text, no pill: the green background was harder to align than it was
+   worth (the word never looked centred in it). Colour alone carries the state. */
 .addon-catalog-card__badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
   font-size: 0.72rem;
   font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 6px;
-  background: rgba(0, 210, 106, 0.15);
+  background: none;
+  /* A little inset so the word does not sit flush against the card border. */
+  padding: 0 4px;
   color: #00d26a;
+  white-space: nowrap;
 }
 
 .addon-catalog-card__badge.disabled {
-  background: rgba(255, 107, 53, 0.18);
+  background: none;
   color: #ff8a5b;
 }
 
@@ -514,10 +528,20 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
+  /* A narrow modal shrank the label span until it broke after its emoji
+     ("🔗" alone on one line, "Upstream Stremio Addons:" on the next), which
+     reads as mis-aligned text. Keep each label on one line and let the row
+     wrap its quick-links instead. */
+  flex-wrap: wrap;
+  row-gap: 4px;
   font-size: 0.78rem;
   font-weight: 600;
   color: rgba(255, 255, 255, 0.7);
   margin-bottom: 6px;
+}
+
+.addon-catalog-section__label > span {
+  white-space: nowrap;
 }
 
 .addon-catalog-quick-links {
@@ -569,6 +593,12 @@
   height: 13px;
   margin: 0;
   cursor: pointer;
+}
+
+/* "🎬 Movies" must stay one line — the span used to break after the emoji and
+   the pill rendered as three stacked rows (box / emoji / text). */
+.addon-catalog-pill span {
+  white-space: nowrap;
 }
 
 .addon-catalog-list {

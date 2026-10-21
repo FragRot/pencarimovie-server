@@ -12,7 +12,7 @@
     <link rel="icon" type="image/png" href="logo.png?v=20261021b" />
     <link rel="apple-touch-icon" href="logo.png?v=20261021b" />
     <link rel="stylesheet" href="stream-theme.css?v=20261009pm10" />
-    <link rel="stylesheet" href="styles.css?v=20261012tv04" />
+    <link rel="stylesheet" href="styles.css?v=20261021fix5" />
     <link
       rel="stylesheet"
       href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
@@ -1244,6 +1244,67 @@
           </div>
         </div>
 
+        <!-- Settings JSON (backup / restore) -->
+        <div class="addon-catalog-card" id="addonSettingsJsonCard">
+          <div class="addon-catalog-card__header">
+            <span class="addon-catalog-card__title">⚙️ Settings JSON</span>
+          </div>
+          <div
+            style="
+              font-size: 0.72rem;
+              color: #aaa;
+              line-height: 1.5;
+              margin-bottom: 6px;
+            "
+          >
+            Everything in this panel, as one line of JSON. Copy it to set up
+            another install (Arch, Windows, Android) — paste it back here and
+            press <strong>Apply pasted JSON</strong> — or paste it into a
+            <code>PM_CATALOG_SETTINGS</code> environment variable on a host with
+            an ephemeral disk (Render, Docker without a volume).
+          </div>
+          <textarea
+            id="catSettingsJson"
+            rows="3"
+            spellcheck="false"
+            placeholder="Copy to back up — or paste a saved settings JSON here and press Apply pasted JSON."
+            style="
+              width: 100%;
+              box-sizing: border-box;
+              min-height: 52px;
+              max-height: 140px;
+              resize: vertical;
+              font-family: monospace;
+              font-size: 0.68rem;
+              line-height: 1.4;
+              color: #fff;
+              background: rgba(0, 0, 0, 0.4);
+              border: 1px solid rgba(255, 255, 255, 0.15);
+              border-radius: 6px;
+              padding: 8px;
+            "
+          ></textarea>
+          <div class="addon-catalog-save-row" style="margin-top: 8px">
+            <button
+              type="button"
+              id="catCopySettingsBtn"
+              class="settings-gate__btn addon-catalog-save-btn"
+              style="padding: 8px 12px; font-size: 0.82rem"
+            >
+              📋 Copy JSON
+            </button>
+            <button
+              type="button"
+              id="catApplySettingsBtn"
+              class="settings-gate__btn addon-catalog-save-btn"
+              style="padding: 8px 12px; font-size: 0.82rem"
+            >
+              ⬆️ Apply pasted JSON
+            </button>
+          </div>
+          <span id="catSettingsIoStatus" class="addon-catalog-status-msg"></span>
+        </div>
+
         <!-- Access Token Card -->
         <div class="addon-catalog-card" id="addonTokenCard">
           <div class="addon-catalog-card__header">
@@ -1753,6 +1814,6 @@
         }
       })();
     </script>
-    <script defer src="app.js?v=20261021ver7"></script>
+    <script defer src="app.js?v=20261021json6"></script>
   </body>
 </html>

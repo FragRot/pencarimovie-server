@@ -58,7 +58,7 @@ jobs:
       tag: ${{ steps.vars.outputs.tag }}
       publish: ${{ steps.vars.outputs.publish }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -148,7 +148,7 @@ jobs:
             extra_target: x86_64-apple-darwin
             bin_dir: target/x86_64-apple-darwin/release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           # `build.rs` stamps `git describe --tags` in as the build version, which
           # needs the tags (a depth-1 clone has none, so it would fall back to a
@@ -271,13 +271,13 @@ jobs:
       # `release-` prefix so `publish` can glob exactly the five tarball
       # artifacts without also pulling the `container-*` ones (whose payload is a
       # bare `pencarimovie-server` and would collide under merge-multiple).
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: release-${{ matrix.artifact }}
           path: dist-rust/*
           if-no-files-found: error
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: matrix.musl_target != ''
         with:
           name: container-${{ matrix.artifact }}
@@ -307,10 +307,10 @@ jobs:
             arch: arm64
             artifact: container-linux-aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download the prebuilt musl binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ${{ matrix.artifact }}
           # Dockerfile.release does `COPY dist-docker/${ARCH}/pencarimovie-server`,
@@ -456,10 +456,10 @@ jobs:
     if: needs.prepare.outputs.publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download every release artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           # Only the tarball artifacts. `container-*` artifacts hold a bare
           # `pencarimovie-server` and would collide under merge-multiple.
@@ -525,7 +525,7 @@ jobs:
     if: always() && !cancelled()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 

@@ -354,8 +354,64 @@ fn jnum(v: &Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/* ── diagnostics ─────────────────────────────────────────────────────────── */
+
+/// Record a request the client is about to see fail.
+///
+/// `http_status` is the number the PLAYER renders verbatim — Nuvio shows
+/// `HTTP 400 Bad Request [ERROR_CODE_IO_BAD_HTTP_STATUS]` and nothing else — so
+/// it is what turns a screenshot back into a request. It is also the field the
+/// old incidents never carried: the two **400** payload refusals below left no
+/// trace at all, which is why "the stream source is blocked or restricted" was
+/// unanswerable. The token is never stored; `token_url` is only a bool.
+fn record_refusal(
+    ctx: &ReqCtx,
+    started: std::time::Instant,
+    status: u16,
+    stage: &str,
+    message: &str,
+    short_code: &str,
+    extra: Value,
+) {
+    let mut info = serde_json::json!({
+        "http_status": status,
+        "stage": stage,
+        "range": ctx.hdr("range"),
+        "user_agent": ctx.hdr("user-agent"),
+        "client_platform": ctx.hdr("x-client-platform"),
+        "token_url": !crate::auth::auth_token_from_request(ctx).is_empty(),
+        "tunneled": !ctx.hdr("cf-ray").is_empty(),
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    });
+    if let (Some(dst), Some(src)) = (info.as_object_mut(), extra.as_object()) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+    crate::diagnostics::record_throttled(
+        "playback_incident",
+        &format!("download refused (HTTP {status})"),
+        message,
+        stage,
+        short_code,
+        info,
+    );
+    log(
+        "download refused",
+        &serde_json::json!({
+            "http_status": status,
+            "stage": stage,
+            "short_code": short_code,
+            "range": ctx.hdr("range"),
+            "user_agent": ctx.hdr("user-agent"),
+        }),
+    );
+}
+
 pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
+    let started = std::time::Instant::now();
     if !is_authenticated(ctx) {
+        record_refusal(ctx, started, 401, "AUTH_REQUIRED", "Server password or token required", "", serde_json::json!({}));
         return json_response(
             401,
             &serde_json::json!({"ok": 0, "message": "Password required", "auth_required": true}),
@@ -595,6 +651,16 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     }
 
     if file_id.is_empty() {
+        record_refusal(
+            ctx, started, 400, "MISSING_FILE_ID",
+            "file_id or valid short_code is required for local browser download.",
+            &short_code,
+            serde_json::json!({
+                "payload_len": encoded.len(),
+                "bot_id": bot_id,
+                "pool_bots": candidates.len(),
+            }),
+        );
         return json_response(
             400,
             &serde_json::json!({
@@ -605,6 +671,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         );
     }
     if file_size == 0 || file_name.is_empty() || file_mime.is_empty() {
+        record_refusal(
+            ctx, started, 400, "MISSING_FILE_META",
+            "For Bot API file_id download, file_size, file_name, and mime are required.",
+            &short_code,
+            serde_json::json!({
+                "has_file_size": file_size > 0,
+                "has_file_name": !file_name.is_empty(),
+                "has_mime": !file_mime.is_empty(),
+                "file_id_len": file_id.len(),
+                "bot_id": bot_id,
+            }),
+        );
         return json_response(
             400,
             &serde_json::json!({
@@ -631,6 +709,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             log(
                 "download refused - max-streams gate saturated",
                 &serde_json::json!({"max_streams": state.max_streams, "short_code": short_code}),
+            );
+            record_refusal(
+                ctx, started, 503, "STREAM_GATE_SATURATED",
+                "Server busy streaming other viewers. Please retry shortly.",
+                &short_code,
+                serde_json::json!({"max_streams": state.max_streams, "retry_after": 1}),
             );
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -687,6 +771,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
     let Some(entry) = entry else {
+        record_refusal(
+            ctx, started, 403, "NO_SESSION",
+            &boot_err.clone().unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
+            &short_code,
+            serde_json::json!({"bots_tried": tried.len(), "boot_error": boot_err.clone().unwrap_or_default()}),
+        );
         return json_response(
             403,
             &serde_json::json!({
@@ -708,6 +798,12 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         parse_range_header(&range_header, file_size)
     };
     if !range_header.is_empty() && range.is_none() {
+        record_refusal(
+            ctx, started, 416, "BAD_RANGE",
+            "The client sent a Range this file cannot satisfy.",
+            &short_code,
+            serde_json::json!({"range_header": range_header, "file_size": file_size}),
+        );
         return Response::builder()
             .status(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{}", file_size))
@@ -732,7 +828,13 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 
     let mut target: DocTarget = match prepare_file_target(&file_id, file_size) {
         Ok(t) => t,
-        Err(e) => return json_response(500, &serde_json::json!({"ok": 0, "message": e})),
+        Err(e) => {
+            record_refusal(
+                ctx, started, 500, "BAD_FILE_ID", &e, &short_code,
+                serde_json::json!({"file_id_len": file_id.len(), "file_size": file_size, "bot_id": bot_id}),
+            );
+            return json_response(500, &serde_json::json!({"ok": 0, "message": e}));
+        }
     };
 
     // ALAC cannot be decoded by Android/Eclipse, so it is decoded here and
@@ -856,6 +958,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                         match prepare_file_target(&file_id, file_size) {
                             Ok(t) => target = t,
                             Err(err) => {
+                                record_refusal(
+                                    ctx, started, 500, "BAD_FILE_ID_AFTER_RESOLVE", &err, &short_code,
+                                    serde_json::json!({"file_size": file_size, "bot_id": bot_id, "attempt": attempt}),
+                                );
                                 return json_response(500, &serde_json::json!({"ok": 0, "message": err}));
                             }
                         }
@@ -961,15 +1067,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         // and never retries (root AGENTS.md: "A rate limit must answer 429").
         if let Some(secs) = err.flood_wait {
             let retry_after = secs.max(1);
-            crate::diagnostics::record(
-                "playback_incident",
-                "download rate limited",
-                &err.message,
-                "",
+            record_refusal(
+                ctx,
+                started,
+                429,
                 "RATE_LIMITED",
+                &err.message,
                 &short_code,
-                "",
-                serde_json::json!({"bot_id": bot_id, "status": 429, "retry_after": retry_after}),
+                serde_json::json!({"bot_id": bot_id, "retry_after": retry_after}),
             );
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
@@ -997,15 +1102,15 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 });
         }
         let status = if err.file_reference { 410 } else { 500 };
-        crate::diagnostics::record(
-            "playback_incident",
-            "download failed",
+        let reason = if err.file_reference { "FILE_REFERENCE_EXPIRED" } else { "DOWNLOAD_FAILED" };
+        record_refusal(
+            ctx,
+            started,
+            status,
+            reason,
             &err.message,
-            "",
-            if err.file_reference { "FILE_REFERENCE_EXPIRED" } else { "DOWNLOAD_FAILED" },
             &short_code,
-            "",
-            serde_json::json!({"bot_id": bot_id, "status": status}),
+            serde_json::json!({"bot_id": bot_id, "flood_wait": err.flood_wait}),
         );
         return json_response(
             status,
@@ -1027,6 +1132,17 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     let bot_for_task = bot_id.clone();
     let file_size_for_task = file_size;
     let persist_id = file_id.clone();
+    // Captured BEFORE the spawn: the streaming task cannot borrow `ctx`, and a
+    // mid-body failure is only diagnosable with the Range it was serving.
+    let status_code: u16 = if range.is_some() { 206 } else { 200 };
+    let client_ctx = serde_json::json!({
+        "http_status": status_code,
+        "range": range_header,
+        "user_agent": ctx.hdr("user-agent"),
+        "client_platform": ctx.hdr("x-client-platform"),
+        "file_size": file_size,
+        "mime": file_mime,
+    });
     tokio::spawn(async move {
         // Held for the whole body, so `--max-streams` covers the live stream and
         // is released when this task ends (completed, aborted, or client gone).
@@ -1133,19 +1249,25 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let data = match result {
                 Ok(d) => d,
                 Err(e) => {
+                        let mut info = client_ctx.clone();
+                        info["bytes_sent"] = serde_json::json!(total.saturating_sub(remaining));
+                        info["bytes_total"] = serde_json::json!(total);
+                        info["bot_id"] = serde_json::json!(bot_for_task);
                         log(
                             "download stream aborted mid-body",
-                            &serde_json::json!({"error": e.message, "short_code": short_code_for_task}),
+                            &serde_json::json!({
+                                "error": e.message,
+                                "short_code": short_code_for_task,
+                                "bytes_sent": total.saturating_sub(remaining),
+                            }),
                         );
-                        crate::diagnostics::record(
+                        crate::diagnostics::record_throttled(
                             "playback_incident",
                             "stream aborted",
                             &e.message,
-                            "",
                             "DOWNLOAD_FAILED",
                             &short_code_for_task,
-                            "",
-                            serde_json::json!({"bot_id": bot_for_task}),
+                            info,
                         );
                         return;
                     }
@@ -1181,9 +1303,8 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     });
 
-    let status = if range.is_some() { 206 } else { 200 };
     let mut builder = Response::builder()
-        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+        .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK))
         .header(header::CONTENT_TYPE, if file_mime.is_empty() { "application/octet-stream" } else { &file_mime })
         .header(header::CONTENT_LENGTH, total.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
