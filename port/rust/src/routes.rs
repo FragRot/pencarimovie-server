@@ -3237,12 +3237,39 @@ fn lan_ip() -> String {
 /// PHP `fd_load_catalog_settings()` defaults. The `stream_config` keys are the
 /// ones the AIOStreams filter block reads, so an absent file must still produce
 /// them (`exclude_unplayable` / `exclude_part_title` default to ON).
+/// The seeded `enabled_catalogs` map.
+///
+/// `backend.php:11964-11967` seeds **every** option from its own `default` flag:
+///
+/// ```php
+/// foreach ($catalogOptions as $id => $info) {
+///     $defaults['enabled_catalogs'][$id] = !empty($info['default']);
+/// }
+/// ```
+///
+/// which is what makes a fresh install come up with Korea / Japan / Thailand /
+/// Philippines (movie AND series) UNCHECKED and everything else checked. The port
+/// shipped `{}` and relied on the "a missing key means enabled" rule, so every row
+/// including those four came up CHECKED — the four `"default": false` flags in
+/// [`default_catalog_options()`] were dead weight. Seed the map explicitly; the
+/// stored file is applied over it in [`load_catalog_settings_merged()`].
+fn default_enabled_catalogs() -> Value {
+    let mut map = serde_json::Map::new();
+    if let Some(opts) = default_catalog_options().as_object() {
+        for (id, info) in opts {
+            let on = info.get("default").and_then(|v| v.as_bool()).unwrap_or(false);
+            map.insert(id.clone(), Value::Bool(on));
+        }
+    }
+    Value::Object(map)
+}
+
 fn default_catalog_settings() -> Value {
     serde_json::json!({
         "catalogs_enabled": true,
         "country": "",
         "enabled_types": {"movie": true, "series": true, "other": true},
-        "enabled_catalogs": {},
+        "enabled_catalogs": default_enabled_catalogs(),
         "upstream_enabled": true,
         // Fresh installs ship with the PHP's two defaults (AIOMetadata for
         // catalog/meta, OpenSubtitles v3 for subtitles). `upstream_enabled` is
@@ -3385,8 +3412,12 @@ fn default_catalog_options() -> Value {
 }
 
 /// One checkbox in `enabled_catalogs`. A missing key means ENABLED (the PHP's
-/// `!isset($map[$id]) || !empty($map[$id])` rule), which is what makes every row
-/// appear on a fresh install.
+/// `!isset($map[$id]) || !empty($map[$id])` rule).
+///
+/// This fallback is for a settings file written BEFORE a row existed — it is NOT
+/// what decides a fresh install. [`default_catalog_settings()`] seeds every option
+/// from its own `default` flag (backend.php:11964), so the four rows the PHP ships
+/// as `default: false` arrive here as an explicit `false` and stay unchecked.
 fn catalog_switch(settings: &Value, id: &str) -> bool {
     match settings.get("enabled_catalogs").and_then(|m| m.get(id)) {
         Some(v) => v.as_bool().unwrap_or(true),
@@ -5511,6 +5542,60 @@ mod tests {
         }
     }
 
+    /// A fresh install must NOT come up all-checked.
+    ///
+    /// backend.php:11964-11967 seeds `enabled_catalogs[$id] = !empty($info['default'])`
+    /// for every option, so Korea / Japan / Thailand / Philippines (movie AND
+    /// series) start UNCHECKED. The port used to ship `enabled_catalogs: {}` and
+    /// lean on the "missing key means enabled" rule, which checked all of them.
+    #[test]
+    fn fresh_install_seeds_every_catalog_switch_from_its_default() {
+        let settings = default_catalog_settings();
+        let seeded = settings["enabled_catalogs"]
+            .as_object()
+            .expect("enabled_catalogs must be a seeded map, not {}");
+        let opts = default_catalog_options();
+        let opts = opts.as_object().expect("options map");
+
+        // Every option is seeded explicitly — no gaps for the fallback rule.
+        for id in opts.keys() {
+            assert!(seeded.contains_key(id), "{id} was not seeded");
+        }
+
+        let off = [
+            "pm_movies_korean",
+            "pm_movies_japan",
+            "pm_movies_thai",
+            "pm_movies_philippines",
+            "pm_series_japan",
+            "pm_series_thai",
+            "pm_series_philippines",
+        ];
+        for id in off {
+            assert_eq!(
+                seeded[id].as_bool(),
+                Some(false),
+                "{id} must start unchecked (default: false in the PHP)"
+            );
+        }
+        for id in [
+            "top",
+            "pm_series_top",
+            "pm_files_year",
+            "pm_movies_malay",
+            "pm_movies_english",
+            "pm_series_kdrama",
+        ] {
+            assert_eq!(seeded[id].as_bool(), Some(true), "{id} must start checked");
+        }
+
+        // …and the gate honours it: those four rows are not advertised on a
+        // fresh install, while a default-on row is.
+        assert!(!catalog_advertised(&settings, &row("movie", "pm_movies_korean")));
+        assert!(!catalog_advertised(&settings, &row("series", "pm_series_thai")));
+        assert!(catalog_advertised(&settings, &row("movie", "pm_movies_malay")));
+    }
+
     fn catalog_rows() -> Vec<Value> {
         pm_catalogs().as_array().cloned().unwrap_or_default()
     }
@@ -5524,14 +5609,22 @@ mod tests {
 
     #[test]
     fn catalog_gate_matches_the_php_remaps() {
-        // Fresh install: every row is advertised.
+        // Fresh install: every row is advertised EXCEPT the ones the PHP ships
+        // as `default: false` (backend.php:11764-11779 — Korea / Japan / Thailand
+        // / Philippines, movie and series). This used to assert "every row",
+        // which only held because `enabled_catalogs` was `{}` and a missing key
+        // meant enabled; that is the bug this pins.
         let fresh = default_catalog_settings();
+        let opts = default_catalog_options();
         for c in catalog_rows() {
-            assert!(
+            let id = c["id"].as_str().unwrap_or("");
+            let want = opts[id]["default"].as_bool().unwrap_or(true);
+            assert_eq!(
                 catalog_advertised(&fresh, &c),
-                "a fresh install must advertise {} {}",
+                want,
+                "fresh-install gate for {} {} must match its `default` flag",
                 c["type"],
-                c["id"]
+                id
             );
         }
         // A media type switched off hides only its own rows.
