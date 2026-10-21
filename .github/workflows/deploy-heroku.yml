@@ -77,12 +77,23 @@ jobs:
           set -euo pipefail
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+      # Heroku CLI, not a raw registry login: `container:release` is the
+      # supported release path and it also does the registry login. The previous
+      # `PATCH /formation` returned HTTP 200 yet the dyno kept running the old
+      # image (`build: 0.1.0`) — green deploy, stale app, twice.
+      - name: Install the Heroku CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://cli-assets.heroku.com/install.sh | sh
+          heroku --version
+
       - name: Log in to the Heroku registry
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
         run: |
           set -euo pipefail
           echo "$HEROKU_API_KEY" | docker login --username=_ --password-stdin registry.heroku.com
+          heroku container:login 2>&1 | tail -n 2 || true
 
       # ── resolve the exact image for THIS commit ─────────────────────────────
       - name: Find (or trigger) this commit's image
@@ -137,26 +148,12 @@ jobs:
           docker tag "$REF" "registry.heroku.com/${HEROKU_APP}/web"
           docker push "registry.heroku.com/${HEROKU_APP}/web"
 
-          # Same effect as `heroku container:release web`.
-          #
-          # `-f` matters: without it curl reports success on 4xx/5xx, so a
-          # rejected release still printed "Promoted" and the fallback below
-          # never ran. Write the body to a file (not `head`) so a non-fatal
-          # diagnostic cannot SIGPIPE curl into a false failure, and fail the
-          # step explicitly on a non-2xx status.
-          CODE="$(curl -sS -f -o /tmp/formation.json -w '%{http_code}' \
-            -X PATCH \
-            -H "Accept: application/vnd.heroku+json; version=3" \
-            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"updates":[{"type":"web"}]}' \
-            "https://api.heroku.com/apps/${HEROKU_APP}/formation")" || true
-          if [ "$CODE" != "200" ]; then
-            echo "::error::Heroku formation release failed (HTTP ${CODE})"
-            cat /tmp/formation.json || true
-            exit 1
-          fi
-          echo "Promoted ${REF} to ${HEROKU_APP} (formation released, HTTP ${CODE})."
+          # The real release. A bare `PATCH /formation` answered 200 without
+          # rolling the dyno (the app kept serving the old build), so this uses
+          # the CLI, which fails loudly when it cannot release.
+          heroku container:release web -a "$HEROKU_APP"
+          echo "--- recent releases"
+          heroku releases -a "$HEROKU_APP" --num 3 || true
 
       # Fallback: no image for this commit (release.yml failed, or the registry
       # push was rejected) -> let Heroku build from the commit, which is the slow
