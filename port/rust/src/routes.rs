@@ -3519,14 +3519,51 @@ fn country_list() -> Value {
     ])
 }
 
-fn detect_country(ctx: &ReqCtx) -> String {
-    for h in ["cf-ipcountry", "x-country-code"] {
-        let v = ctx.hdr(h).trim().to_ascii_uppercase();
-        if v.len() == 2 && v.chars().all(|c| c.is_ascii_alphabetic()) && v != "XX" {
-            return v;
+fn country_name(code: &str) -> String {
+    country_list()
+        .as_array()
+        .and_then(|a| a.iter().find(|c| jstr(c, "code") == code))
+        .map(|c| jstr(c, "name"))
+        .filter(|n| !n.is_empty() && n != "Auto (Detected)")
+        .unwrap_or_else(|| code.to_string())
+}
+
+/// Port of `fd_detect_country()` (backend.php:12139).
+///
+/// Returns the OBJECT `{country_code, country_name, source}`, not a bare code:
+/// the dashboard reads `res.country.country_code` / `.country_name`, so a string
+/// made the "Auto (…)" label read `undefined` and left detection looking broken.
+///
+/// Order is the PHP's: the user's configured country wins, then Cloudflare's
+/// `cf-ipcountry` (or `x-country-code`), and when neither exists — which is
+/// EVERY localhost/LAN/Android install, since there is no Cloudflare in front —
+/// it falls back to `MY` with `source: "default"` instead of an empty string.
+fn detect_country(ctx: &ReqCtx) -> Value {
+    let settings = load_catalog_settings_merged();
+    let configured = jstr(&settings, "country").trim().to_ascii_uppercase();
+    let (mut code, mut source) = if !configured.is_empty() {
+        (configured, "configured")
+    } else {
+        let mut found = String::new();
+        for h in ["cf-ipcountry", "x-country-code"] {
+            let v = ctx.hdr(h).trim().to_ascii_uppercase();
+            if !v.is_empty() {
+                found = v;
+                break;
+            }
         }
+        (found, "cf-header")
+    };
+    // `XX` = Cloudflare "unknown", `T1` = Tor: both mean "not a real country".
+    if code.len() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()) || code == "XX" || code == "T1" {
+        code = "MY".to_string();
+        source = "default";
     }
-    String::new()
+    serde_json::json!({
+        "country_code": code,
+        "country_name": country_name(&code),
+        "source": source,
+    })
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -4988,7 +5025,15 @@ async fn manifest(base_url: &str) -> Value {
         // Nuvio's app icon and `nuviotv.png` their wordmark (both removed).
         "logo": format!("{}/logo.png", rtrim(base_url)),
         "background": format!("{}/logo.png", rtrim(base_url)),
-        "behaviorHints": {},
+        // Stremio only renders the CONFIGURE gear when `configurable` is true —
+        // the PHP declares all four keys (backend.php manifest builder), so an
+        // empty object here meant the addon had no Configure button at all.
+        "behaviorHints": {
+            "configurable": true,
+            "configurationRequired": false,
+            "adult": false,
+            "p2p": false,
+        },
     });
     upstream::fit_descriptor(doc, local_count)
 }
