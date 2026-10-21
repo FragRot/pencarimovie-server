@@ -59,20 +59,19 @@ pub fn client_version() -> String {
 /// BUILT from (`git describe`). The old hardcoded "2.7.9" made every native
 /// build — whatever commit it came from — report the same number.
 pub fn app_version() -> String {
-    use std::fs;
     // The app shell's own versionName wins when it told us (`--app-version`).
-    // On Android `.release-tag` can be a leftover from the OLD PHP install — it
-    // is why a 1.0.5x APK reported `app_version: "2.7.9"` in every diagnostic.
     let client = client_version();
     if !client.is_empty() {
         return client;
     }
-    if let Ok(tag) = fs::read_to_string(app_root().join(".release-tag")) {
-        let t = tag.trim();
-        if !t.is_empty() {
-            return t.trim_start_matches('v').to_string();
-        }
-    }
+    // `build_id()` is authoritative: `build.rs` stamps `git describe --tags`
+    // into the binary, and a CI build runs on the tagged commit, so a release
+    // binary reports exactly its tag.
+    //
+    // `.release-tag` is deliberately NOT read any more. The only thing that
+    // ever wrote it was the retired PHP OTA updater, so a native install that
+    // replaced a PHP one still has that file — it made `pms --version` claim
+    // `2.7.9` (and, on one machine, `1.0.0`) for a binary built from 2.8.9.
     build_id().to_string()
 }
 

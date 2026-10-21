@@ -378,11 +378,19 @@ fn open_browser(url: &str) {
 /// The first field is what this install reports (`/api/version` → `current_version`);
 /// the second is the git state the binary was compiled from.
 fn version_line() -> String {
+    // `rustc` is only reported when it can actually be detected: a packaged
+    // build has no toolchain on PATH, and "rustc unknown" is noise.
+    let rustc = rustc_version();
+    let compiler = if rustc.is_empty() || rustc == "unknown" {
+        String::new()
+    } else {
+        format!("rustc {}, ", rustc)
+    };
     format!(
-        "pencarimovie-server {} (build {}, rustc {}, {}-{})",
+        "pencarimovie-server {} (build {}, {}{}-{})",
         config::app_version(),
         config::build_id(),
-        rustc_version(),
+        compiler,
         std::env::consts::ARCH,
         std::env::consts::OS
     )

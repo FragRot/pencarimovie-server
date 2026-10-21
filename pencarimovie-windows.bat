@@ -32,6 +32,17 @@ rem The native package is ONE file: pencarimovie-server.exe with the dashboard
 rem embedded (no backend.php, no bin\, no vendor\). The same `pms` commands drive
 rem it: start / stop / restart / tunnel / autostart / uninstall. Detected by the
 rem exe, so one CLI can serve either build.
+rem A per-user NATIVE install wins even when this script is run from a git
+rem checkout: the checkout has no exe, so `pms` used to fall through to the
+rem retired PHP updater and download `pencarimovie-downloader-windows-x86_64.zip`
+rem (v2.9.0) - a build that does not exist any more.
+if not exist "%~dp0pencarimovie-server.exe" (
+    if exist "%USERPROFILE%\pencarimovie-server\pencarimovie-server.exe" (
+        set "APP_DIR=%USERPROFILE%\pencarimovie-server"
+        set "NATIVE=1"
+        set "IN_PLACE=1"
+    )
+)
 if exist "%~dp0pencarimovie-server.exe" (
     set "APP_DIR=%~dp0."
     set "NATIVE=1"
