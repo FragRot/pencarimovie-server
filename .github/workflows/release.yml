@@ -167,16 +167,14 @@ jobs:
           set -euo pipefail
           php scripts/verify-madeline-patch.php
 
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry (GHCR)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # NOTE: the Docker image is NO LONGER built here. It used to be a single
+      # `docker/build-push-action` with `platforms: linux/amd64,linux/arm64` on an
+      # x86 runner, so BuildKit ran the Dockerfile's `FROM rust:1-alpine` stage
+      # twice and the arm64 half compiled ~450 crates under QEMU emulation — the
+      # ~45 minutes that dominated every release. The container now packages a
+      # PREBUILT binary (see `docker-amd64` / `docker-arm64` / `docker-manifest`
+      # below), each built natively on its own architecture runner. This job is
+      # back to being PHP-product-only: tarballs + the shared-hosting ZIP.
       - name: Fetch official FrankenPHP release binaries
         run: |
           mkdir -p bin dist
@@ -282,25 +280,6 @@ jobs:
           echo "Release archives in dist/:"
           ls -lh dist/
 
-      - name: Build and push multi-arch Docker image to GHCR
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          # Multi-arch: amd64 for Heroku/Render, arm64 for Raspberry Pi / ARM VPS.
-          # arm64 is EMULATED (QEMU) on an x86 runner, so it compiles the whole Rust
-          # dependency tree in emulation — that is why this job is slow. The
-          # Dockerfile keeps the cargo registry + target dirs in BuildKit cache
-          # mounts and this step uses the gha layer cache, so only the first
-          # arm64 build pays the full price.
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ env.TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         # Only when a tag was supplied. Without one this run is a Docker-only
@@ -351,13 +330,24 @@ jobs:
             if ($published) {
                 $summary .= "- **Published Release Tag**: \`" . $tag . "\`\n";
                 $summary .= "- **Next Version To Use**: \`" . $next . "\` 🎉\n";
-                $summary .= "- **Docker Image**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":" . $tag . "\`\n\n";
+                $summary .= "- **Docker Image (multi-arch)**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":" . $tag . "\`\n\n";
                 $summary .= "> 💡 **Next time you run this workflow, supply \`" . $next . "\` in the tag input.**\n";
             } else {
-                $summary .= "- **Docker Image**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":latest\`\n";
+                $summary .= "- **Docker Image (multi-arch)**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":latest\`\n";
                 $summary .= "- **Next Version To Use (when cutting a release)**: \`" . $next . "\`\n\n";
                 $summary .= "> ℹ️ *No release tag was provided; built and published Docker image only.*\n";
             }
+
+            $summary .= "\n## Artifacts\n\n";
+            $summary .= "| target | how it is built |\n| --- | --- |\n";
+            $summary .= "| \`linux-x86_64\` | ubuntu-latest (native, gnu) |\n";
+            $summary .= "| \`linux-aarch64\` | ubuntu-24.04-arm (native, gnu) |\n";
+            $summary .= "| \`windows-x86_64\` | windows-latest |\n";
+            $summary .= "| \`macos-aarch64\` | macos-14 |\n";
+            $summary .= "| \`macos-x86_64\` | macos-13 |\n";
+            $summary .= "| container \`linux/amd64\` | ubuntu-latest musl |\n";
+            $summary .= "| container \`linux/arm64\` | ubuntu-24.04-arm musl |\n";
+            $summary .= "\n> No QEMU anywhere: every compile runs on its own architecture.";
 
             file_put_contents(getenv("GITHUB_STEP_SUMMARY"), $summary, FILE_APPEND);
           '
@@ -372,12 +362,57 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ── the five targets the PRODUCT actually asks for ──────────────────
+          # These names must match `platform_key()` in port/rust/src/update.rs
+          # and `detect_target()` in pencarimovie-linux.sh EXACTLY. Before this
+          # matrix carried only three of them, so linux-aarch64 (Raspberry Pi /
+          # ARM VPS) and macos-x86_64 (Intel Mac) were requested by the code and
+          # never published: the Linux installer 404'd and silently fell back to
+          # `pencarimovie-server.tar.gz`, which is the PHP/FrankenPHP product.
+          #
+          # `musl_target` is set ONLY on the Linux legs: those additionally build
+          # a static binary for the alpine container image (see the docker jobs).
+          #
+          # `extra_target` is the ADDITIONAL rustup target a leg cross-builds
+          # natively (Apple only). It is deliberately a cross-COMPILE, not an
+          # emulated one: the macOS SDK ships both slices and clang links either
+          # one directly on either host, which is why both macOS artifacts build
+          # on one arm64 runner. Encoding macos-x86_64 as its own runner
+          # (macos-13) was tried and dropped — GitHub has retired its Intel
+          # images, so that leg failed at SCHEDULING, which reads like a YAML bug.
           - os: ubuntu-latest
             artifact: linux-x86_64
+            musl_target: x86_64-unknown-linux-musl
+            container_arch: amd64
+            extra_target: ""
+            bin_dir: target/release
+          - os: ubuntu-24.04-arm
+            artifact: linux-aarch64
+            musl_target: aarch64-unknown-linux-musl
+            container_arch: arm64
+            extra_target: ""
+            bin_dir: target/release
           - os: windows-latest
             artifact: windows-x86_64
-          - os: macos-latest
+            musl_target: ""
+            container_arch: ""
+            extra_target: ""
+            bin_dir: target/release
+          # macos-14 is arm64. Pinned (not macos-latest) so the two macOS legs
+          # cannot collapse onto the same architecture when GitHub advances
+          # `latest` — that would silently mislabel both artifacts.
+          - os: macos-14
             artifact: macos-aarch64
+            musl_target: ""
+            container_arch: ""
+            extra_target: ""
+            bin_dir: target/release
+          - os: macos-14
+            artifact: macos-x86_64
+            musl_target: ""
+            container_arch: ""
+            extra_target: x86_64-apple-darwin
+            bin_dir: target/x86_64-apple-darwin/release
     steps:
       - uses: actions/checkout@v4
         with:
@@ -388,16 +423,83 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Skipped on the macOS Intel leg, which produces its binary via the cross
+      # target below — building the host arch there too would compile the crate
+      # twice for nothing (the arm64 output is not packaged).
       - name: Build (dashboard embedded)
+        if: matrix.extra_target == ''
         working-directory: port/rust
         run: cargo build --release --locked
+
+      # macOS Intel artifact: a native cross-link on the same arm64 runner.
+      # No emulation is involved — the SDK carries both slices and clang links
+      # either one — and both macOS legs still compile `public/` themselves.
+      - name: Add the macOS cross target
+        if: matrix.extra_target != ''
+        shell: bash
+        run: rustup target add "${{ matrix.extra_target }}"
+
+      - name: Build cross target (macOS Intel)
+        if: matrix.extra_target != ''
+        working-directory: port/rust
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.extra_target }}"
+
+      # ── Linux only: a SECOND, statically-linked build for the container ────
+      # The published image is alpine (musl). A gnu binary copied into it dies at
+      # exec with `not found` because /lib/ld-linux-*.so.1 does not exist there,
+      # so the container binary must be the musl target. This is native on both
+      # runners (ubuntu-latest is x86_64, ubuntu-24.04-arm is aarch64) — there is
+      # no QEMU anywhere in this workflow.
+      - name: Add musl target (Linux container binary)
+        if: matrix.musl_target != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # `ring` (pulled in by reqwest/rustls) compiles C, so a musl libc
+          # compiler is required even though the rest of the tree is pure Rust.
+          sudo apt-get install -y -qq musl-tools
+          rustup target add "${{ matrix.musl_target }}"
+
+      - name: Build static musl binary (Linux container binary)
+        if: matrix.musl_target != ''
+        working-directory: port/rust
+        shell: bash
+        env:
+          MUSL_TARGET: ${{ matrix.musl_target }}
+        run: |
+          set -euo pipefail
+          UPPER="$(printf '%s' "$MUSL_TARGET" | tr 'a-z-' 'A-Z_')"
+          export "CARGO_TARGET_${UPPER}_LINKER=musl-gcc"
+          export "CC_${MUSL_TARGET//-/_}=musl-gcc"
+          cargo build --release --locked --target "$MUSL_TARGET"
+
+          BIN="target/$MUSL_TARGET/release/pencarimovie-server"
+          [ -f "$BIN" ] || { echo "::error::missing $BIN"; exit 1; }
+          file "$BIN"
+
+          # Guard the #1 way this change breaks a release: a glibc binary in an
+          # alpine image. Fail here, loudly, instead of at `docker run`.
+          if file "$BIN" | grep -qi "dynamically linked"; then
+            echo "::error::$BIN is dynamically linked — it cannot run in alpine"
+            exit 1
+          fi
+          echo "Verified: $BIN is statically linked"
+
+          mkdir -p "dist-container/${{ matrix.container_arch }}"
+          cp "$BIN" "dist-container/${{ matrix.container_arch }}/pencarimovie-server"
+          chmod +x "dist-container/${{ matrix.container_arch }}/pencarimovie-server"
+          ls -lh "dist-container/${{ matrix.container_arch }}/"
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           NAME="pencarimovie-server-${{ matrix.artifact }}"
-          BIN="port/rust/target/release/pencarimovie-server"
+          # bin_dir is per-matrix-entry: a cross-built leg puts its output under
+          # `target/<triple>/release`, not `target/release`.
+          BIN="port/rust/${{ matrix.bin_dir }}/pencarimovie-server"
           [ -f "$BIN" ] || BIN="$BIN.exe"
           echo "binary: $BIN"
           "$BIN" --version
@@ -435,6 +537,15 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist-rust/*
 
+      # The container binary travels as its own artifact so the docker jobs can
+      # `needs: native-build` and just download it.
+      - uses: actions/upload-artifact@v4
+        if: matrix.musl_target != ''
+        with:
+          name: container-${{ matrix.artifact }}
+          path: dist-container/${{ matrix.container_arch }}/pencarimovie-server
+          if-no-files-found: error
+
       - name: Attach to the release
         if: ${{ github.event.inputs.tag != '' }}
         shell: bash
@@ -456,20 +567,50 @@ jobs:
           done
           gh release upload "$TAG" dist-rust/* --clobber
 
-  # ── Alpine (musl) image: the deployable form for Docker / Heroku ───────────
-  # Built and smoke-tested here because the dev machine has no Docker: the image
-  # must answer /api/version and serve the embedded dashboard before it is
-  # published.
-  native-docker:
-    runs-on: ubuntu-latest
+  # ── the deployable container, one arch per native runner ───────────────────
+  # Replaces the old `native-docker` job, which re-compiled the whole crate on
+  # x86 and then pushed a single-arch image. Each leg here DOWNLOADS an
+  # already-built musl binary and only COPYs it (Dockerfile.release), so a leg
+  # costs seconds instead of the ~45 min arm64/QEMU build it used to.
+  # `ubuntu-24.04-arm` is a public runner; if it were ever unavailable the job
+  # fails at SCHEDULING with a message that reads like a YAML error, so check the
+  # runner label first before suspecting this file.
+  docker:
     needs: native-build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            artifact: container-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            artifact: container-linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build image
-        run: docker build -f Dockerfile -t pencarimovie-server:native .
+      - name: Download the prebuilt musl binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          # Dockerfile.release does `COPY dist-docker/${ARCH}/pencarimovie-server`,
+          # so the artifact must land at exactly that path.
+          path: dist-docker/${{ matrix.arch }}
 
-      - name: Smoke test (version + dashboard)
+      - name: Build image (COPY only — no toolchain, no source)
+        run: |
+          set -euo pipefail
+          chmod +x "dist-docker/${{ matrix.arch }}/pencarimovie-server"
+          docker build \
+            -f Dockerfile.release \
+            --build-arg ARCH=${{ matrix.arch }} \
+            --platform linux/${{ matrix.arch }} \
+            -t pencarimovie-server:native .
+
+      # Both architectures are verified now; previously only amd64 ever was.
+      - name: Smoke test (version + dashboard + addon manifest)
         run: |
           set -euo pipefail
           docker run -d --name pm -p 18088:8088 pencarimovie-server:native
@@ -480,18 +621,75 @@ jobs:
           echo "--- /api/version"; curl -fsS http://127.0.0.1:18088/api/version; echo
           echo "--- /"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/
           echo "--- /manifest.json"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/manifest.json
+          echo "--- /eclipse/manifest.json"; curl -fsS -o /dev/null -w '%{http_code} %{size_download} bytes\n' http://127.0.0.1:18088/eclipse/manifest.json || true
           docker logs pm | tail -n 20
           docker rm -f pm
 
-      - name: Push to GHCR
+      - name: Log in to GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Push an arch-suffixed tag only. `docker-manifest` assembles these into
+      # the multi-arch `:latest` / `:native` / `:$TAG` tags.
+      - name: Push the per-architecture image
         run: |
           set -euo pipefail
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
           IMG="ghcr.io/${{ github.repository }}"
-          docker tag pencarimovie-server:native "$IMG:native"
-          docker push "$IMG:native"
+          docker tag pencarimovie-server:native "$IMG:native-${{ matrix.arch }}"
+          docker push "$IMG:native-${{ matrix.arch }}"
           if [ -n "$TAG" ]; then
-            docker tag pencarimovie-server:native "$IMG:native-$TAG"
-            docker push "$IMG:native-$TAG"
+            docker tag pencarimovie-server:native "$IMG:${TAG}-${{ matrix.arch }}"
+            docker push "$IMG:${TAG}-${{ matrix.arch }}"
           fi
+
+  # ── assemble the multi-arch manifest list from the two native images ───────
+  # No QEMU: `imagetools create` only rewrites the manifest, it never executes
+  # any layer. `:native` MUST be published — render.yaml pins
+  # `ghcr.io/aiskendi/pencarimovie-server:native` as `runtime: image`, and it
+  # simply becomes a manifest list instead of a single amd64 image.
+  docker-manifest:
+    needs: [docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create and push the multi-arch manifest
+        run: |
+          set -euo pipefail
+          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
+          IMG="ghcr.io/${{ github.repository }}"
+
+          AMD64="$IMG:native-amd64"
+          ARM64="$IMG:native-arm64"
+
+          TAGS=(-t "$IMG:latest" -t "$IMG:native")
+          if [ -n "$TAG" ]; then
+            TAGS+=(-t "$IMG:$TAG" -t "$IMG:native-$TAG")
+          fi
+
+          docker buildx imagetools create "${TAGS[@]}" "$AMD64" "$ARM64"
+
+          echo "=== published manifest ==="
+          docker buildx imagetools inspect "$IMG:native"
+
+      # Fail the release if the arm64 half is missing: that is the exact failure
+      # mode this whole restructure exists to remove.
+      - name: Verify both architectures are present
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${{ github.repository }}"
+          OUT="$(docker buildx imagetools inspect "$IMG:native")"
+          echo "$OUT"
+          for want in linux/amd64 linux/arm64; do
+            if ! printf '%s' "$OUT" | grep -q "$want"; then
+              echo "::error::$IMG:native is missing $want"
+              exit 1
+            fi
+          done
+          echo "Verified: $IMG:native carries linux/amd64 AND linux/arm64"

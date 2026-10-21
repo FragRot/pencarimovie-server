@@ -1,9 +1,21 @@
-dist/*
-!dist/pencarimovie-downloader-linux-*.tar.gz
+dist/_
+!dist/pencarimovie-downloader-linux-_.tar.gz
+
+# Dockerfile.release COPYs the PREBUILT musl binary from here. It must stay in the
+
+# build context: `dist/*` does not match `dist-docker/`, but an over-broad ignore
+
+# would break the image build with a confusing "COPY failed: no source files".
+
+!dist-docker/
+!dist-docker/\*\*/pencarimovie-server
 pkgroot/
 target/
+
 # The native build keeps live state (sessions, auth.json, api_secret.key) and
+
 # local build output inside the crate; never ship any of it into an image.
+
 port/rust/storage/
 port/rust/dist/
 port/rust/dist-native/
@@ -16,8 +28,8 @@ termux-packages/
 libtalloc_extract/
 php_extract/
 proot/
-storage/*
+storage/_
 !storage/.gitkeep
-*.zip
-*.deb
-*.apk
+_.zip
+_.deb
+_.apk
