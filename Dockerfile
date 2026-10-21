@@ -17,6 +17,15 @@
 FROM rust:1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
+# Stamped into the binary by `build.rs`. The build context deliberately has no
+# `.git` and no tags, so `git describe` always fails there and the server falls
+# back to `CARGO_PKG_VERSION` — which is `0.1.0`, i.e. BELOW the origin's
+# `min_version` (2.7.9), so every client showed "Update available (installed
+# 0.1.0)" on a build that was in fact current. Builds must pass the real
+# version: `--build-arg PM_BUILD_VERSION=$(git describe --tags --always)`.
+# Empty is ignored by build.rs, so a plain `docker build` still works.
+ARG PM_BUILD_VERSION=
+ENV PM_BUILD_VERSION=${PM_BUILD_VERSION}
 # The crate IS the repo root: `src/assets.rs` embeds `public/` with include_dir!,
 # so the build context only needs the manifest, the sources and the dashboard.
 COPY Cargo.toml Cargo.lock build.rs ./

@@ -416,7 +416,13 @@ jobs:
           # TAG=v<latest release> filled by `prepare`, which silently repointed
           # `:latest` at a build with no release behind it (observed: a
           # Docker-only dispatch moved `:latest` and `:v2.9.2`).
-          TAGS=(-t "$IMAGE:native")
+          # `sha-<short>` is IMMUTABLE and published by every run, tagged or not.
+          # It is what `deploy-heroku.yml` pins to: that workflow used to promote
+          # `:native`, a moving tag nothing rebuilds on push (this workflow is
+          # workflow_dispatch-only), so Heroku silently received whatever image
+          # happened to be there — the deploy was green and the app was stale.
+          SHA_TAG="sha-$(printf '%s' "$GITHUB_SHA" | cut -c1-7)"
+          TAGS=(-t "$IMAGE:native" -t "$IMAGE:$SHA_TAG")
           if [ "$PUBLISH" = "true" ] && [ -n "${TAG:-}" ]; then
             TAGS+=(-t "$IMAGE:latest" -t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
           else

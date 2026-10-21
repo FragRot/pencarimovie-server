@@ -4,9 +4,21 @@ name: Deploy to Heroku
 #
 # Why this workflow instead of Heroku's own GitHub integration: this app is on
 # the **container** stack (`heroku.yml` -> `Dockerfile`), and the dashboard
-# "Automatic deploys" toggle is only offered for buildpack apps. Pushing the git
-# ref to Heroku is the supported path for container stacks, so CI does exactly
-# what a manual `git push heroku main` does.
+# "Automatic deploys" toggle is only offered for buildpack apps. Pushing an
+# image to `registry.heroku.com/<app>/web` is the supported path for container
+# stacks.
+#
+# ── WHAT WAS BROKEN ──────────────────────────────────────────────────────────
+# It promoted `ghcr.io/<repo>:native`. That is a MOVING tag and nothing
+# rebuilds it on a push — `release.yml` is workflow_dispatch-only — so the job
+# was green while Heroku kept running an older binary (observed: the live app
+# answered `build: "0.1.0"`, i.e. an image built without `.git`, so `build.rs`
+# fell back to `CARGO_PKG_VERSION` and every client showed "Update available").
+#
+# Now the deploy is PINNED to an immutable per-commit tag, `:sha-<7>`, which
+# `release.yml`'s docker-manifest job publishes on every run. If that tag does
+# not exist yet, this job dispatches `release.yml` (Docker-only) and waits for
+# the image instead of deploying something else. Nothing is built here.
 #
 # Required repository secret: HEROKU_API_KEY
 #   Get it with `heroku authorizations:create -d "github-actions pm-server"`
@@ -26,19 +38,28 @@ concurrency:
 
 permissions:
   contents: read
-  # Pull the native image that `release.yml` publishes as :native.
+  # Pull this repository's own published image.
   packages: read
+  # Dispatch `release.yml` when the pinned image does not exist yet.
+  actions: write
+
+env:
+  HEROKU_APP: pm-server
+  IMAGE: ghcr.io/${{ github.repository }}
+  # How long to wait for `release.yml` to publish `:sha-<short>`.
+  IMAGE_WAIT_SECONDS: "1500"
 
 jobs:
   deploy:
-    name: Promote the native image to Heroku
+    name: Release this commit's image to Heroku
     runs-on: ubuntu-latest
+    timeout-minutes: 40
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Heroku needs a non-shallow clone to accept the git fallback below.
+          # The Heroku git fallback below needs a full clone.
           fetch-depth: 0
 
       # Fail fast with a clear message instead of a confusing auth error.
@@ -51,29 +72,69 @@ jobs:
             exit 1
           fi
 
-      # Fast path: Heroku's container stack CANNOT pull an external registry image
-      # through `heroku.yml` (that always builds a Dockerfile), but the container
-      # registry accepts a prebuilt one: pull the CI-built native image (GHCR),
-      # retag it for registry.heroku.com and release it. No Rust rebuild per push.
-      - name: Deploy the prebuilt image (no rebuild)
+      - name: Log in to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Log in to the Heroku registry
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$HEROKU_API_KEY" | docker login --username=_ --password-stdin registry.heroku.com
+
+      # ── resolve the exact image for THIS commit ─────────────────────────────
+      - name: Find (or trigger) this commit's image
+        id: img
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA7: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHA7="$(printf '%s' "$SHA7" | cut -c1-7)"
+          REF="${IMAGE}:sha-${SHA7}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Pinned image: ${REF}"
+
+          # Already published by an earlier `release.yml` run for this commit?
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
+            echo "::notice::Using the already-published image ${REF}"
+            exit 0
+          fi
+
+          # Not yet: ask `release.yml` for a Docker-only build of this commit and
+          # WAIT for the tag. Waiting on the registry (not on a run id) keeps the
+          # logic simple and is immune to the dispatch/list race.
+          echo "::notice::${REF} is not published yet - dispatching release.yml (Docker-only)"
+          gh workflow run release.yml --ref main -f tag="" || {
+            echo "::error::Could not dispatch release.yml"
+            exit 1
+          }
+
+          deadline=$(( $(date +%s) + IMAGE_WAIT_SECONDS ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if docker manifest inspect "$REF" >/dev/null 2>&1; then
+              echo "::notice::${REF} published"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::Timed out after ${IMAGE_WAIT_SECONDS}s waiting for ${REF}."
+          echo "Check the latest 'Release Builder & Docker Publish' run."
+          exit 1
+
+      # ── promote it (no rebuild, no source in the image) ─────────────────────
+      - name: Deploy the pinned image
         id: image
         continue-on-error: true
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP: pm-server
+          REF: ${{ steps.img.outputs.ref }}
         run: |
           set -euo pipefail
-          IMG="ghcr.io/${{ github.repository }}:native"
-
-          # Public package: no login needed. Private: the workflow token can read
-          # this repository's own packages.
-          if ! docker pull "$IMG" 2>/dev/null; then
-            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-            docker pull "$IMG"
-          fi
-
-          echo "$HEROKU_API_KEY" | docker login --username=_ --password-stdin registry.heroku.com
-          docker tag "$IMG" "registry.heroku.com/${HEROKU_APP}/web"
+          docker pull "$REF"
+          docker tag "$REF" "registry.heroku.com/${HEROKU_APP}/web"
           docker push "registry.heroku.com/${HEROKU_APP}/web"
 
           # Same effect as `heroku container:release web`.
@@ -95,18 +156,18 @@ jobs:
             cat /tmp/formation.json || true
             exit 1
           fi
-          echo "Promoted ${IMG} to ${HEROKU_APP} (formation released, HTTP ${CODE})."
+          echo "Promoted ${REF} to ${HEROKU_APP} (formation released, HTTP ${CODE})."
 
-      # Fallback: no GHCR image yet (or the pull failed) -> build on Heroku from
-      # the commit, which is the slow path this job exists to avoid but must keep
-      # working so a push is never a red deploy.
+      # Fallback: no image for this commit (release.yml failed, or the registry
+      # push was rejected) -> let Heroku build from the commit, which is the slow
+      # path this job exists to avoid but must keep working so a push is never a
+      # red deploy.
       - name: Deploy by building on Heroku (fallback)
         if: steps.image.outcome != 'success'
         env:
           HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
-          HEROKU_APP: pm-server
         run: |
-          echo "::notice::No prebuilt image; building on Heroku instead."
+          echo "::notice::No pinned image; building on Heroku instead."
           set -euo pipefail
 
           # Heroku authenticates with the API key as the password and any
@@ -117,20 +178,43 @@ jobs:
           # Deploy the exact commit CI checked out.
           git push --force heroku "HEAD:refs/heads/main"
 
-          # Report the release that was just created, so the run is
-          # self-verifying. Write to a file first: piping curl straight into
-          # `head -c` closes the pipe early, curl then exits 23 (SIGPIPE write
-          # error) and `set -o pipefail` turns a successful deploy into a red
-          # run. Non-fatal anyway - the push above already printed
-          # "Verifying deploy... done."
           if curl -sS --max-time 30 \
                -H "Accept: application/vnd.heroku+json; version=3" \
                -H "Authorization: Bearer ${HEROKU_API_KEY}" \
                "https://api.heroku.com/apps/${HEROKU_APP}/releases" \
                -o /tmp/releases.json; then
-            # `head` still truncates, but it is no longer curl's stdout.
             grep -o '"version":[0-9]*' /tmp/releases.json | head -n 1 || true
           else
             echo "Deploy succeeded; release lookup was skipped."
           fi
           echo "Deployed ${HEROKU_APP} at commit ${GITHUB_SHA}."
+
+      # ── prove what is actually running ─────────────────────────────────────
+      # The whole point of this workflow is "the commit reached production", so
+      # read it back from the app instead of trusting the push. A `build` of
+      # "0.1.0" means the binary was compiled without `.git` (no `git describe`),
+      # i.e. the stale/Heroku-built image is live again.
+      - name: Verify the deployed build
+        if: always() && steps.image.outcome == 'success'
+        env:
+          HEROKU_API_KEY: ${{ secrets.HEROKU_API_KEY }}
+        run: |
+          set -uo pipefail
+          URL="$(curl -sS -H 'Accept: application/vnd.heroku+json; version=3' \
+            -H "Authorization: Bearer ${HEROKU_API_KEY}" \
+            "https://api.heroku.com/apps/${HEROKU_APP}" \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin).get("web_url",""))')"
+          [ -n "$URL" ] || URL="https://stream.pencarimovie.com"
+          echo "Probing ${URL}/api/version"
+
+          for i in $(seq 1 30); do
+            BODY="$(curl -sS -m 20 "${URL}/api/version" || true)"
+            if printf '%s' "$BODY" | grep -q '"build"'; then break; fi
+            sleep 4
+          done
+          echo "$BODY"
+          BUILD="$(printf '%s' "$BODY" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("build",""))' 2>/dev/null || true)"
+          echo "build=${BUILD}"
+          if [ "$BUILD" = "0.1.0" ]; then
+            echo "::warning::The live binary reports build 0.1.0 - it was compiled without .git/tags, so it is NOT this commit's image."
+          fi
