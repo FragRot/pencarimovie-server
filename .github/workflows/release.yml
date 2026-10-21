@@ -322,6 +322,7 @@ jobs:
       - name: Build image (COPY only — no toolchain, no source)
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
         run: |
           set -euo pipefail
           BIN="dist-docker/${{ matrix.arch }}/pencarimovie-server"
@@ -362,14 +363,20 @@ jobs:
 
       # Push an arch-suffixed tag only. `docker-manifest` assembles these into
       # the multi-arch `:latest` / `:native` / `:$TAG` tags.
+      # Gate on `publish`, NOT on a non-empty TAG. `prepare` fills `tag` with the
+      # latest git tag even for a Docker-only run (so the summary can suggest the
+      # next version), so `[ -n "$TAG" ]` is ALWAYS true and used to publish
+      # `:v<latest release>` from an untagged build — the exact thing the
+      # `:latest` contract in `docker-manifest` exists to prevent.
       - name: Push the per-architecture image
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
         run: |
           set -euo pipefail
           docker tag pencarimovie-server:native "$IMAGE:native-${{ matrix.arch }}"
           docker push "$IMAGE:native-${{ matrix.arch }}"
-          if [ -n "${TAG:-}" ]; then
+          if [ "$PUBLISH" = "true" ] && [ -n "${TAG:-}" ]; then
             docker tag pencarimovie-server:native "$IMAGE:${TAG}-${{ matrix.arch }}"
             docker push "$IMAGE:${TAG}-${{ matrix.arch }}"
           fi
@@ -393,6 +400,7 @@ jobs:
       - name: Create and push the multi-arch manifest
         env:
           TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISH: ${{ needs.prepare.outputs.publish }}
         run: |
           set -euo pipefail
           # `:preview` (not `:latest`) is what the UNTAGGED / Docker-only run
@@ -405,8 +413,13 @@ jobs:
           #   :latest  -> only ever a TAGGED release
           #   :native  -> mirrored continuously (render.yaml / heroku.yml pin it)
           #   :preview -> untagged builds, never handed to end users
+          # Gate on `publish`, NOT on a non-empty TAG — see the note on the
+          # per-architecture push above. An untagged run arrives here with
+          # TAG=v<latest release> filled by `prepare`, which silently repointed
+          # `:latest` at a build with no release behind it (observed: a
+          # Docker-only dispatch moved `:latest` and `:v2.9.2`).
           TAGS=(-t "$IMAGE:native")
-          if [ -n "${TAG:-}" ]; then
+          if [ "$PUBLISH" = "true" ] && [ -n "${TAG:-}" ]; then
             TAGS+=(-t "$IMAGE:latest" -t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
           else
             TAGS+=(-t "$IMAGE:preview")
