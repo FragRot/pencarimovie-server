@@ -19,22 +19,24 @@ backfill-ids.bat
 # Superseded by pencarimovie-termux.sh.
 pencarimovie-termux-test.sh
 
-# Bundled native runtime binaries (distributed via GitHub releases, not committed directly)
-bin/*.exe
-bin/*.dll
-bin/*.lib
-bin/*.so*
-bin/dev/
-bin/ext/
-bin/extras/
-bin/lib/
-bin/proot-*
-bin/snapshot.txt
-bin/news.txt
-bin/license.txt
-bin/readme-redist-bins.txt
-bin/deplister.exe
-bin/pharcommand.phar
+# Bundled native runtime binaries (distributed via GitHub releases, not committed
+# directly). These belong to the ARCHIVED PHP tree's FrankenPHP runtime, which
+# lives in legacy/php/bin/ now.
+legacy/php/bin/*.exe
+legacy/php/bin/*.dll
+legacy/php/bin/*.lib
+legacy/php/bin/*.so*
+legacy/php/bin/dev/
+legacy/php/bin/ext/
+legacy/php/bin/extras/
+legacy/php/bin/lib/
+legacy/php/bin/proot-*
+legacy/php/bin/snapshot.txt
+legacy/php/bin/news.txt
+legacy/php/bin/license.txt
+legacy/php/bin/readme-redist-bins.txt
+legacy/php/bin/deplister.exe
+legacy/php/bin/pharcommand.phar
 
 # Local secrets and runtime state.
 .release-tag
@@ -89,7 +91,7 @@ clean-posts-*.php
 clean-posts-*.sh
 find_unused.php
 start-clean.sh
-bin/su
+legacy/php/bin/su
 .bun-cache/
 stremio_kb.txt
 errors_db.txt
@@ -150,19 +152,13 @@ references/
 # Internal plans & development notes
 plans/
 
-# Internal release build scripts
+# Internal release build scripts. The PHP packagers moved to
+# legacy/php/scripts/ (already tracked, so no negation is needed for them).
+# `scripts/` now holds only local build tooling - the Rust distribution build
+# (build-rust-android.sh) and the APK driver (build-rust-apk.bat) - which is
+# deliberately NOT committed: it is machine-specific glue (hardcoded cargo/JAVA_HOME
+# paths) and the CI workflow builds the same artifacts from `server/` directly.
 scripts/*
-!scripts/build-release.bat
-!scripts/build-release.sh
-!scripts/package-unix.sh
-!scripts/package-windows.bat
-!scripts/download-frankenphp.ps1
-!scripts/release-apk.bat
-# Tracked: the release workflow runs this checker after applying the vendor
-# patch. Without the negation `scripts/*` swallows it, CI fails with
-# "Could not open input file: scripts/verify-madeline-patch.php", and the
-# release ships an unverifiable vendor/.
-!scripts/verify-madeline-patch.php
 
 # Cloudflare infrastructure / internal deploy files
 cloudflare-worker*.js
@@ -328,3 +324,19 @@ port/rust/_*.log
 _pmdeploy.tgz
 _heroku*.txt
 _apk*.txt
+
+# ---------------------------------------------------------------------------
+# legacy/ - superseded implementations.
+#
+# `legacy/php/` IS tracked: it is the behavioural reference the Rust port is
+# verified against (server/PARITY.md, server/PORT_GAPS.md), so it stays in the
+# history. `legacy/ts/` is a dead TypeScript attempt that never reached parity and
+# carries a node_modules tree; it is kept on disk for reference only, never
+# committed. Same for the port's scratch archives.
+# ---------------------------------------------------------------------------
+legacy/ts/
+# The ledger generator for the archived tree's port audit; the generated
+# COVERAGE.md / ledger.json are what we keep.
+legacy/php/tools/
+port/*.tgz
+port/rust.tgz

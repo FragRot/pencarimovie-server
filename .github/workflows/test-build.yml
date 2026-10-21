@@ -1,5 +1,18 @@
 name: Test Release Build & Installers
 
+# Scope note: the SERVED product is the Rust binary (`server/`, built and released
+# by release.yml), so this workflow does not build it. What it does guard is the
+# two things a layout change can silently break:
+#
+#   * the user-facing installers at the repo root (their URLs are a public
+#     contract - `curl -fsSL telegra.my/linux | bash`), and
+#   * the ARCHIVED PHP tree under `legacy/php/`, which is still the behavioural
+#     reference for the port, so a stray edit that breaks its syntax should be
+#     caught here rather than discovered later.
+#
+# The PHP boot smoke test runs from `legacy/php/` because that is where
+# `router.php`/`backend.php` live now.
+
 on:
   workflow_dispatch:
   push:
@@ -7,7 +20,7 @@ on:
     paths:
       - "pencarimovie-linux.sh"
       - "pencarimovie-termux.sh"
-      - "backend.php"
+      - "legacy/php/**"
       - "scripts/**"
       - ".github/workflows/test-build.yml"
 
@@ -23,11 +36,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y php-cli php-curl php-mbstring
 
-      - name: Validate PHP syntax
+      - name: Validate PHP syntax (archived tree)
         run: |
-          php -l backend.php
-          php -l router.php
-          php -l index.php
+          php -l legacy/php/backend.php
+          php -l legacy/php/router.php
+          php -l legacy/php/index.php
 
       - name: Test Linux Shell Installer Syntax & Target Detection
         run: |
@@ -41,7 +54,13 @@ jobs:
           chmod +x pencarimovie-termux.sh
           bash -n pencarimovie-termux.sh
 
-      - name: Test Server Boot & Manifest Response (Native PHP Mode)
+      # `router.php`/`backend.php` moved to legacy/php, so the server has to be
+      # booted from there. NOTE: this asserts the archived tree still RESPONDS; it
+      # does not assert the dashboard. `backend.php` resolves `public/`, `storage/`
+      # and `vendor/` relative to its own __DIR__, and only `bin/` moved with it -
+      # see legacy/php/README.md, "Known limitation".
+      - name: Test Server Boot & Manifest Response (archived PHP tree)
+        working-directory: legacy/php
         run: |
           PORT=8099 php -S 127.0.0.1:8099 router.php > /tmp/server.log 2>&1 &
           SERVER_PID=$!
