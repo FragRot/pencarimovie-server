@@ -395,14 +395,30 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          TAGS=(-t "$IMAGE:latest" -t "$IMAGE:native")
+          # `:preview` (not `:latest`) is what the UNTAGGED / Docker-only run
+          # refreshes. Reason, and it cost a real round-trip: telegra.my's
+          # /docker installer pulls `:latest`, and a workflow_dispatch with an
+          # empty tag used to REPOINT `:latest` at a build with no release tag
+          # behind it. Every Docker user then silently received an untagged
+          # binary while the dashboard still showed the release version - which
+          # reads exactly like "docker did not rebuild". So:
+          #   :latest  -> only ever a TAGGED release
+          #   :native  -> mirrored continuously (render.yaml / heroku.yml pin it)
+          #   :preview -> untagged builds, never handed to end users
+          TAGS=(-t "$IMAGE:native")
           if [ -n "${TAG:-}" ]; then
-            TAGS+=(-t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
+            TAGS+=(-t "$IMAGE:latest" -t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
+          else
+            TAGS+=(-t "$IMAGE:preview")
           fi
           docker buildx imagetools create "${TAGS[@]}" \
             "$IMAGE:native-amd64" "$IMAGE:native-arm64"
-          echo "=== published manifest ==="
-          docker buildx imagetools inspect "$IMAGE:native"
+          echo "=== published manifests ==="
+          for t in "${TAGS[@]}"; do
+            [ "$t" = "-t" ] && continue
+            echo "--- $t"
+            docker buildx imagetools inspect "$t" 2>/dev/null | head -n 20 || true
+          done
 
       # Fail the release if the arm64 half is missing: that is the exact failure
       # mode this whole restructure exists to remove.
@@ -440,16 +456,23 @@ jobs:
           path: dist-all
           merge-multiple: true
 
-      - name: Add the installer scripts and logo
+      # NOTE: no `.sh` installers and no logo.png are uploaded any more.
+      # `telegra.my` serves its OWN inline installers (SH_INSTALL / PS1_INSTALL /
+      # SH_TERMUX / SH_DOCKER in cloudflare-worker-telegra-my.js) which resolve
+      # `releases/latest/download/pencarimovie-server-<os>-<arch>.tar.gz` at run
+      # time, so they need no copy in the release. Nothing else downloads the
+      # repo's `pencarimovie-*.sh` from a release URL either. Uploading them was
+      # noise that also implied a coupling that does not exist.
+      #
+      # IMPORTANT: `telegra.my` resolves `releases/latest`, and GitHub decides
+      # that by semver AND creation time, not by "most recently published". A
+      # release with an OLDER tag created later can therefore still lose to a
+      # newer-tagged one, so always release incrementally - otherwise an
+      # installer keeps fetching the previous build and it looks like the image
+      # "did not rebuild".
+      - name: List what will be published
         run: |
           set -euo pipefail
-          # The POSIX installers are what most users actually run; keeping them
-          # beside the tarballs is how `curl -fsSL .../pencarimovie-linux.sh` and
-          # the in-app OTA stay version-locked to these assets.
-          for f in pencarimovie-linux.sh pencarimovie-termux.sh; do
-            [ -f "$f" ] && cp "$f" dist-all/ || true
-          done
-          [ -f public/logo.png ] && cp public/logo.png dist-all/ || true
           ls -lh dist-all/
 
       - name: Assert all five architectures are present
