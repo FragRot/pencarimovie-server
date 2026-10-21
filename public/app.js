@@ -2521,6 +2521,36 @@ class PencariMovieApp {
         return b.width > 0 && b.height > 0 && getComputedStyle(el).visibility !== "hidden";
       });
     };
+    // D-pad MOVEMENT must never pop the on-screen keyboard. On Android WebView,
+    // merely focusing an <input>/<textarea> opens the IME, so arrowing down the
+    // #settings / #addon columns used to cover half the screen with a keyboard.
+    // The field stays reachable (a TV still has to type the bot token): it is
+    // focused READ-ONLY, and OK/Enter (or a tap) clears that so the IME opens
+    // only when the user actually intends to edit.
+    const isEditable = el => {
+      if (!el) return false;
+      if (el.tagName === "TEXTAREA") return true;
+      return el.tagName === "INPUT" && !/^(checkbox|radio|button|submit|reset|range|file|color)$/i.test(el.type || "text");
+    };
+    const holdEditing = el => {
+      if (isEditable(el) && !el.readOnly) {
+        el.dataset.dpadRo = "1";
+        el.readOnly = true;
+      }
+    };
+    const releaseEditing = el => {
+      if (el && el.dataset && el.dataset.dpadRo === "1") {
+        delete el.dataset.dpadRo;
+        el.readOnly = false;
+      }
+    };
+    const focusOverlayTarget = el => {
+      holdEditing(el);
+      try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+      if (typeof el.scrollIntoView === "function") {
+        el.scrollIntoView({ block: "nearest" });
+      }
+    };
     document.addEventListener("keydown", e => {
       const modal = document.querySelector("#addonModal:not(.hidden), #settingsGate:not(.hidden), #authGate:not(.hidden)");
       if (!modal) return;
@@ -2533,6 +2563,18 @@ class PencariMovieApp {
       const isEnter = code === 13 || code === 23 || code === 66 || keyName === "Enter" || keyName === "OK" || keyName === "Select";
       const isSpace = code === 32 || keyName === " " || keyName === "Space";
       const active = document.activeElement;
+      if (isEnter && isEditable(active) && active.dataset && active.dataset.dpadRo === "1") {
+        // OK on a field reached by D-pad: hand it to the IME (blur+focus is what
+        // actually re-opens the keyboard on Android after being read-only).
+        e.preventDefault();
+        e.stopPropagation();
+        const el = active;
+        delete el.dataset.dpadRo;
+        el.readOnly = false;
+        el.blur();
+        el.focus();
+        return;
+      }
       if ((isEnter || isSpace) && active && active.tagName === "INPUT") {
         if (active.type === "checkbox") {
           e.preventDefault();
@@ -2565,12 +2607,7 @@ class PencariMovieApp {
       let idx = focusables.indexOf(active);
       if (idx === -1) {
         e.preventDefault();
-        focusables[0].focus();
-        if (typeof focusables[0].scrollIntoView === "function") {
-          focusables[0].scrollIntoView({
-            block: "nearest"
-          });
-        }
+        focusOverlayTarget(focusables[0]);
         return;
       }
       const isText = active.tagName === "INPUT" && !/^(checkbox|radio|button|submit|reset)$/i.test(active.type) || active.tagName === "TEXTAREA";
@@ -2586,15 +2623,19 @@ class PencariMovieApp {
       if (nextIdx !== idx && focusables[nextIdx]) {
         e.preventDefault();
         e.stopPropagation();
-        const target = focusables[nextIdx];
-        target.focus();
-        if (typeof target.scrollIntoView === "function") {
-          target.scrollIntoView({
-            block: "nearest"
-          });
-        }
+        // Leaving a field we were only hovering with the D-pad restores it, so a
+        // later tap or a re-entry behaves like a normal editable input.
+        releaseEditing(active);
+        focusOverlayTarget(focusables[nextIdx]);
       }
     }, true);
+    // A pointer/touch on a held field means the user WANTS to type.
+    ["pointerdown", "touchstart", "mousedown"].forEach(evt => {
+      document.addEventListener(evt, e => {
+        const el = e.target;
+        if (el && el.dataset && el.dataset.dpadRo === "1") releaseEditing(el);
+      }, true);
+    });
   }
   showSettingsGate(options = {}) {
     window.showSettingsGate = opts => this.showSettingsGate(opts);
