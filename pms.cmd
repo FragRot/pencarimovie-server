@@ -16,7 +16,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 set "PM_DIR="
 if exist "%~dp0pencarimovie-server.exe" set "PM_DIR=%~dp0."
 if not defined PM_DIR if exist "%USERPROFILE%\pencarimovie-server\pencarimovie-server.exe" set "PM_DIR=%USERPROFILE%\pencarimovie-server"
-if not defined PM_DIR if exist "%~dp0port\rust\target\release\pencarimovie-server.exe" set "PM_DIR=%~dp0port\rust\target\release"
+if not defined PM_DIR if exist "%~dp0server\target\release\pencarimovie-server.exe" set "PM_DIR=%~dp0server\target\release"
 
 if not defined PM_DIR (
     echo PencariMovie Server is not installed.
@@ -103,7 +103,7 @@ exit /b 0
 
 :do_uninstall
 rem ── SAFETY: only the per-user INSTALL may be deleted ───────────────────────
-rem `pms` can resolve to a source checkout or to port\rust\target\release when it
+rem `pms` can resolve to a source checkout or to server\target\release when it
 rem is run from this repository. Uninstalling there would wipe the project, so
 rem anything that is not exactly %USERPROFILE%\pencarimovie-server is refused.
 set "PM_USER_DIR=%USERPROFILE%\pencarimovie-server"

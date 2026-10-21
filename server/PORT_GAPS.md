@@ -1,4 +1,4 @@
-# PORT_GAPS — `port/rust` vs `backend.php`
+# PORT_GAPS — `server` vs `backend.php`
 
 Audit of the Rust port against `backend.php` (20,527 lines), route by route and
 function by function. `backend.php` is authoritative: where this document says a
@@ -8,7 +8,7 @@ behaviour was "ported", the Rust code reproduces the PHP's observable output
 Verification commands (both green as of this audit):
 
 ```cmd
-cd port\rust
+cd server
 "%USERPROFILE%\.cargo\bin\cargo.exe" test --bin pencarimovie-server
 ```
 

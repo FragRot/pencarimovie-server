@@ -1,7 +1,7 @@
-//! Forces a recompile when the embedded dashboard (`../../public`) changes.
+//! Forces a recompile when the embedded dashboard (`../public`) changes.
 //!
 //! `src/assets.rs` bakes the whole tree into the binary with
-//! `include_dir!("$CARGO_MANIFEST_DIR/../../public")`, but cargo decides whether a
+//! `include_dir!("$CARGO_MANIFEST_DIR/../public")`, but cargo decides whether a
 //! crate needs rebuilding from the files' **mtime**. A dashboard copied in with
 //! PRESERVED timestamps — `robocopy /E`, `unzip`, `git checkout`, a release archive —
 //! looks older than the last build, so cargo reports the crate as up to date and the
@@ -100,7 +100,9 @@ fn build_version(manifest_dir: &Path) -> String {
 
 fn main() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let public = manifest.join("../../public");
+    // The crate is <repo>/server and `public/` stays at the repo root, so this is
+    // one level up - it MUST match include_dir!() in src/assets.rs.
+    let public = manifest.join("../public");
     let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
     walk(&public, &mut acc);
     println!("cargo:rerun-if-changed=build.rs");

@@ -13,13 +13,14 @@ name: Release Builder & Docker Publish
 # ── WHY THIS FILE HAS NO PHP JOB ANYMORE ────────────────────────────────────
 # The PHP/FrankenPHP product used to be packaged here too (`build-and-release`:
 # composer install, the MadelineProto patch, seven FrankenPHP tarballs, the
-# shared-hosting ZIP). It is gone: the Rust engine in `port/rust` is the product
+# shared-hosting ZIP). It is gone: the Rust engine in `server/` is the product
 # now — one self-contained binary with `public/` embedded via `include_dir!` —
 # and every consumer (the Android app, the desktop updaters, the OTA scripts)
 # resolves a `pencarimovie-server-<os>-<arch>.tar.gz`. Keeping the PHP
 # packagers here only slowed the run and shipped assets no client asks for.
-# The PHP runtime itself still lives in the repo and still deploys via
-# heroku.yml / Dockerfile; it is simply no longer part of this release feed.
+# The PHP sources are archived under `legacy/php/` (not built, not deployed);
+# heroku.yml / Dockerfile / render.yaml are NOT PHP — they build and deploy the
+# Rust image this workflow publishes as `ghcr.io/<repo>:native`.
 #
 # ── WHY IT IS FAST NOW (it used to take ~1 hour) ────────────────────────────
 # A single `docker/build-push-action` with `platforms: linux/amd64,linux/arm64`
@@ -94,7 +95,7 @@ jobs:
           fi
 
   # ── the five native targets the PRODUCT actually asks for ──────────────────
-  # These names must match `platform_key()` in port/rust/src/update.rs and
+  # These names must match `platform_key()` in server/src/update.rs and
   # `detect_target()` in pencarimovie-linux.sh EXACTLY. The matrix used to carry
   # only three of them, so linux-aarch64 (Raspberry Pi / ARM VPS) and
   # macos-x86_64 (Intel Mac) were requested by the code and never published: the
@@ -160,7 +161,7 @@ jobs:
       # twice for nothing (the arm64 output is not packaged).
       - name: Build (dashboard embedded)
         if: matrix.extra_target == ''
-        working-directory: port/rust
+        working-directory: server
         run: cargo build --release --locked
 
       # macOS Intel artifact: a native cross-link on the same arm64 runner.
@@ -173,7 +174,7 @@ jobs:
 
       - name: Build cross target (macOS Intel)
         if: matrix.extra_target != ''
-        working-directory: port/rust
+        working-directory: server
         shell: bash
         run: cargo build --release --locked --target "${{ matrix.extra_target }}"
 
@@ -196,7 +197,7 @@ jobs:
 
       - name: Build static musl binary (Linux container binary)
         if: matrix.musl_target != ''
-        working-directory: port/rust
+        working-directory: server
         shell: bash
         env:
           MUSL_TARGET: ${{ matrix.musl_target }}
@@ -220,8 +221,8 @@ jobs:
           echo "Verified: $BIN is statically linked"
 
           # ABSOLUTE, not relative: this step runs with
-          # `working-directory: port/rust`, so a relative `dist-container/...`
-          # lands in port/rust/dist-container and the upload-artifact step (which
+          # `working-directory: server`, so a relative `dist-container/...`
+          # lands in server/dist-container and the upload-artifact step (which
           # resolves from the workspace root) then fails with
           # "No files were found with the provided path". Verified the hard way.
           OUT="$GITHUB_WORKSPACE/dist-container/${{ matrix.container_arch }}"
@@ -237,25 +238,25 @@ jobs:
           NAME="pencarimovie-server-${{ matrix.artifact }}"
           # bin_dir is per-matrix-entry: a cross-built leg puts its output under
           # `target/<triple>/release`, not `target/release`.
-          BIN="port/rust/${{ matrix.bin_dir }}/pencarimovie-server"
+          BIN="server/${{ matrix.bin_dir }}/pencarimovie-server"
           [ -f "$BIN" ] || BIN="$BIN.exe"
           echo "binary: $BIN"
           "$BIN" --version
 
           mkdir -p "stage/$NAME/storage" dist-rust
           cp "$BIN" "stage/$NAME/"
-          cp port/rust/desktop/README.txt "stage/$NAME/"
+          cp server/desktop/README.txt "stage/$NAME/"
           case "$RUNNER_OS" in
             Windows)
-              cp port/rust/desktop/windows/* "stage/$NAME/"
+              cp server/desktop/windows/* "stage/$NAME/"
               [ -f tray.ico ] && cp tray.ico "stage/$NAME/pencarimovie.ico" || true
               ;;
             Linux)
-              cp port/rust/desktop/linux/* "stage/$NAME/"
+              cp server/desktop/linux/* "stage/$NAME/"
               [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
               ;;
             macOS)
-              cp port/rust/desktop/macos/* "stage/$NAME/"
+              cp server/desktop/macos/* "stage/$NAME/"
               [ -f tray.png ] && cp tray.png "stage/$NAME/pencarimovie.png" || true
               ;;
           esac

@@ -55,16 +55,16 @@ API 26, this app is minSdk 21): [`android/pencarimovie-rust/README.md`](../../an
 
 | Script                           | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scripts/build-rust-windows.bat` | `cargo build --release` → `port/rust/dist-rust/windows-x86_64/` (exe, `start.bat`, `README.txt`, empty `storage/`) + `pencarimovie-rust-windows-x86_64.zip`. Asserts `--version`. Pure `cmd`, no PowerShell.                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `scripts/build-rust-windows.bat` | `cargo build --release` → `server/dist-rust/windows-x86_64/` (exe, `start.bat`, `README.txt`, empty `storage/`) + `pencarimovie-rust-windows-x86_64.zip`. Asserts `--version`. Pure `cmd`, no PowerShell.                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `scripts/build-rust-linux.sh`    | Builds on the host, maps `uname -m` → triple, asserts `--version`, stages `dist-rust/linux-<arch>/` and `pencarimovie-rust-<arch>.tar.gz` (binary + `start.sh` + `README.txt` + empty `storage/`). The tarball's `start.sh` sets `ulimit -n 65536`.                                                                                                                                                                                                                                                                                                                                                                   |
 | `scripts/build-rust-android.sh`  | Cross-builds with the NDK for any of `arm64-v8a,armeabi-v7a,x86_64,x86` (default: all four). Finds the NDK via `--ndk` / `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` / `$ANDROID_HOME/ndk/*` / `$HOME/AppData/Local/Android/Sdk/ndk/*`; sets `CARGO_TARGET_<TRIPLE>_LINKER`, `CC_`/`AR_`/`RANLIB_<triple>`; stages `dist-rust/android-<abi>/` + `pencarimovie-rust-android-<abi>.tar.gz`. The `android-` infix is load-bearing: `x86_64`/`arm64-v8a` would otherwise clobber the desktop `pencarimovie-rust-<arch>.tar.gz` from `build-rust-linux.sh` (it did — and the `.sha256` sidecar then described the wrong file). |
 | `scripts/build-rust-termux.sh`   | Builds **on the device** with Termux's own `rust` + `clang` (`pkg install -y rust clang make`). No NDK, no cross compiler; the host triple _is_ the target. **Untested** (no Termux device here) — see §5.                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `port/rust/tools/smoke_boot.mjs` | Boots any built binary **cold** (fresh temp `PM_APP_ROOT` unless one is given), polls `/api/version`, then runs the 16 checks in §1 row 1 and kills the process tree. Node only, no PowerShell, always exits. `node tools/smoke_boot.mjs <binary> [port] [app-root]`.                                                                                                                                                                                                                                                                                                                                                 |
-| `port/rust/tools/build-dist.ps1` | The original Windows stager. Still works, unchanged. Prefer the `.bat` (the rules forbid PowerShell for build steps).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `port/rust/Dockerfile`           | Multi-stage container build (repo root as context). `ENTRYPOINT /app/start.sh`, `PORT`/`PM_LISTEN_HOST`/`PM_PAAS` env, `/app/storage` volume, `/api/version` healthcheck. **Untested** — no Docker engine on this machine (`where docker` → not found).                                                                                                                                                                                                                                                                                                                                                               |
-| `port/rust/docker-compose.yml`   | One service, `8088:8088`, named volume `pm-rust-storage`, and the optional `PM_WORKERS` / `PM_INFLIGHT` / `PM_MAX_STREAMS` knobs. **Untested** (same reason).                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `server/tools/smoke_boot.mjs` | Boots any built binary **cold** (fresh temp `PM_APP_ROOT` unless one is given), polls `/api/version`, then runs the 16 checks in §1 row 1 and kills the process tree. Node only, no PowerShell, always exits. `node tools/smoke_boot.mjs <binary> [port] [app-root]`.                                                                                                                                                                                                                                                                                                                                                 |
+| `server/tools/build-dist.ps1` | The original Windows stager. Still works, unchanged. Prefer the `.bat` (the rules forbid PowerShell for build steps).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `server/Dockerfile`           | Multi-stage container build (repo root as context). `ENTRYPOINT /app/start.sh`, `PORT`/`PM_LISTEN_HOST`/`PM_PAAS` env, `/app/storage` volume, `/api/version` healthcheck. **Untested** — no Docker engine on this machine (`where docker` → not found).                                                                                                                                                                                                                                                                                                                                                               |
+| `server/docker-compose.yml`   | One service, `8088:8088`, named volume `pm-rust-storage`, and the optional `PM_WORKERS` / `PM_INFLIGHT` / `PM_MAX_STREAMS` knobs. **Untested** (same reason).                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
-`port/rust/dist-rust/` is generated output — do not commit it (`storage/` inside
+`server/dist-rust/` is generated output — do not commit it (`storage/` inside
 the checkout holds live secrets and is never copied into an artifact).
 
 ## 3. Bind address: desktop vs Android vs PaaS
@@ -196,21 +196,21 @@ binary in §1 is the verified path.
 
 ```bash
 # any target, one command, 16 checks, never hangs (Node only)
-node port/rust/tools/smoke_boot.mjs port/rust/dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
-node port/rust/tools/smoke_boot.mjs port/rust/dist-rust/android-x86/pencarimovie-rust 8096
-node port/rust/tools/smoke_boot.mjs ./linux-x86_64/pencarimovie-rust 8097
+node server/tools/smoke_boot.mjs server/dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
+node server/tools/smoke_boot.mjs server/dist-rust/android-x86/pencarimovie-rust 8096
+node server/tools/smoke_boot.mjs ./linux-x86_64/pencarimovie-rust 8097
 
 # Windows (cmd; PowerShell hangs on this box)
 scripts\build-rust-windows.bat --skip-build
-port\rust\dist-rust\windows-x86_64\pencarimovie-rust.exe --version
+server\dist-rust\windows-x86_64\pencarimovie-rust.exe --version
 
 # Linux (on the host)
 ./scripts/build-rust-linux.sh          # writes dist-rust/pencarimovie-rust-<arch>.tar.gz
-mkdir -p /tmp/pm-run && tar -xzf port/rust/dist-rust/pencarimovie-rust-*.tar.gz -C /tmp/pm-run
+mkdir -p /tmp/pm-run && tar -xzf server/dist-rust/pencarimovie-rust-*.tar.gz -C /tmp/pm-run
 cd /tmp/pm-run/linux-* && PORT=18081 ./start.sh &
 
 # Android (LDPlayer / any adb)
-adb push port/rust/dist-rust/android-x86/pencarimovie-rust /data/local/tmp/pm/
+adb push server/dist-rust/android-x86/pencarimovie-rust /data/local/tmp/pm/
 adb shell "chmod 755 /data/local/tmp/pm/pencarimovie-rust && /data/local/tmp/pm/pencarimovie-rust --version"
 adb shell "cd /data/local/tmp/pm && PM_APP_ROOT=/data/local/tmp/pm/state nohup ./pencarimovie-rust --port 8088 --host 0.0.0.0 >run.log 2>&1 &"
 adb forward tcp:18088 tcp:8088 && curl -s http://127.0.0.1:18088/api/version
@@ -226,7 +226,7 @@ Four traps worth keeping:
   before that fix, running the Android build after the Linux one silently
   replaced the Linux tarball (10,915,618 B → 10,891,696 B) and left its
   `.sha256` describing the wrong bytes. Check with
-  `sha256sum port/rust/dist-rust/pencarimovie-rust-x86_64.tar.gz` against the
+  `sha256sum server/dist-rust/pencarimovie-rust-x86_64.tar.gz` against the
   sidecar after any packaging run.
 
 - **`pkill -f pencarimovie-rust …` over `ssh`/`adb` kills the shell that is
@@ -332,7 +332,7 @@ Also:
   (which already polls every 1.5 s) finishes when `enabled && tunnel_url` arrive. A
   second call while one is in flight does not spawn a second cloudflared.
 
-Verification: `node port/rust/tools/tunnel_live_check.mjs` (Windows, real tunnel, PASS)
+Verification: `node server/tools/tunnel_live_check.mjs` (Windows, real tunnel, PASS)
 and, on Android, `POST /api/tunnel/enable` then `curl https://<tunnel>/api/version` → 200.
 Measured on a real OnePlus (Android 16, arm64): **accepted in 0 s, live in 6 s**,
 `PHONE_tunnel_http=200`.
@@ -407,7 +407,7 @@ Disk: on a desktop run of the same transfer (`cache_footprint_check.mjs`, 64 MB 
 `resolve_cache_*.json` metadata. **Media bytes are never cached to disk**; the only
 disk-writing playback path is ALAC, which writes `storage/cache/audio/<code>.flac` and
 is pruned by its own TTL. Reproduce with
-`node port/rust/tools/cache_footprint_check.mjs` (throws; provisions a guest bot,
+`node server/tools/cache_footprint_check.mjs` (throws; provisions a guest bot,
 streams 64 MB, asserts the cache did not grow by more than 1/8 of the transfer).
 
 ## 7.5 The Android app replaces the TDLib app in place

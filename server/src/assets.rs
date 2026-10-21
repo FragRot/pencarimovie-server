@@ -1,10 +1,10 @@
 //! The dashboard, compiled into the binary.
 //!
-//! [`include_dir!`] bakes `public/` (the same directory the PHP runtime serves:
-//! `index.html`, `app.bundle.js`, `css/bundle.css`, `styles.css`, `res/i18n/*`,
-//! `assets/**` — 113 files, ~16 MB) into the executable at build time. That is
-//! what makes the server a **single `pencarimovie-server` executable**: nothing has to sit
-//! beside it, and there is no PHP runtime anywhere in the deployment.
+//! [`include_dir!`] bakes `public/` (`index.html`, `app.bundle.js`,
+//! `css/bundle.css`, `styles.css`, `res/i18n/*`, `assets/**`) into the executable
+//! at build time. That is what makes the server a **single `pencarimovie-server`
+//! executable**: nothing has to sit beside it, and there is no separate runtime
+//! anywhere in the deployment.
 //!
 //! Two consequences worth knowing:
 //!
@@ -17,7 +17,13 @@
 use include_dir::{include_dir, Dir};
 
 /// `<repo>/public`, embedded at compile time.
-pub static PUBLIC: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../public");
+///
+/// The crate lives at `<repo>/server`, and `public/` deliberately stays at the
+/// repository root (it is the dashboard shared by every distribution channel and
+/// the path the release workflow stages from), so this is exactly one level up.
+/// Moving the crate deeper or moving `public/` requires updating this path *and*
+/// the `Dockerfile` COPY pair that reproduces the same relative layout.
+pub static PUBLIC: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../public");
 
 /// Read an embedded asset by its path relative to `public/`
 /// (`"css/bundle.css"`, `"index.html"`).

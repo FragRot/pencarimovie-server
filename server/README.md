@@ -42,7 +42,7 @@ untested), and `Dockerfile` + `docker-compose.yml`.
 Prove any of them in one command — cold boot, 16 checks, no PowerShell:
 
 ```bash
-node port/rust/tools/smoke_boot.mjs port/rust/dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
+node server/tools/smoke_boot.mjs server/dist-rust/windows-x86_64/pencarimovie-rust.exe 8095
 ```
 
 `PM_APP_ROOT` decides where `storage/` lives and, when set, it is authoritative
@@ -91,7 +91,7 @@ Environment: `PORT`, `PM_LISTEN_HOST`/`HOST`, `PM_APP_ROOT`, `PM_ASSETS=disk`,
 ### End-to-end proof (Windows, this checkout)
 
 ```powershell
-powershell -NoProfile -File port\rust\tools\e2e_range.ps1 -Item "pm:post:9000031194"
+powershell -NoProfile -File server\tools\e2e_range.ps1 -Item "pm:post:9000031194"
 # streams = 4
 # payload = {"file_name":"Siccin.9.2026.1080p.WEBRip.x264.AAC5.1.YTS.mp4",...}
 # HTTP/1.1 206 Partial Content

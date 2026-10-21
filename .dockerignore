@@ -16,11 +16,11 @@ target/
 
 # local build output inside the crate; never ship any of it into an image.
 
-port/rust/storage/
-port/rust/dist/
-port/rust/dist-native/
-port/rust/target/
-port/rust/tests/
+server/storage/
+server/dist/
+server/dist-native/
+server/target/
+server/tests/
 node_modules/
 .git/
 android/
