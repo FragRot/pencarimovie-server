@@ -227,17 +227,22 @@ async fn main() -> anyhow::Result<()> {
     // Global cap on concurrent download responses: beyond it viewers get a
     // fast `503 / retry_after: 1` instead of all opening a Telegram part at once.
     //
-    // `0` (or `--max-streams 0`, `PM_MAX_STREAMS=0`) means NO CAP — the gate is
-    // then sized to the semaphore maximum and never blocks. Deliberate: the
-    // operator asked for unlimited, and the real backstop beyond that is the
-    // PaaS router (Heroku answers H12 at 30 s) plus dyno memory.
+    // DEFAULT IS 0 = NO CAP, because this product is self-hosted: on a desktop,
+    // an Android box or a VPS the real throttle is already the Telegram pool
+    // (`workers × inflight` parts), and there is no 30 s router to kill queued
+    // requests. A cap there only turns "slightly slower" into "refused".
     //
-    // NOTE: `.max(1)` used to be here, which turned `0` into a gate of ONE —
-    // i.e. a single viewer and everyone else 503. Do not put it back.
+    // Hosts that DO have a short request timeout should set it explicitly: on
+    // Heroku a 1× Basic dyno measured 250/400 served with `PM_MAX_STREAMS=256`
+    // (clean JSON 503 + retry_after for the rest) versus 312/400 uncapped where
+    // the 88 losers died on `H12` after 30 s and got an HTML error page.
+    //
+    // NOTE: `.max(1)` used to sit here and turned an explicit `0` into a gate of
+    // ONE — one viewer, everyone else 503. Do not put it back.
     let max_streams: usize = arg_value("--max-streams")
         .or_else(|| storage::env("PM_MAX_STREAMS"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(0);
     let gate_permits = if max_streams == 0 {
         tokio::sync::Semaphore::MAX_PERMITS
     } else {

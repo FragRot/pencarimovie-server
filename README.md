@@ -197,18 +197,18 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
 ### Configuration Variables Reference
 
-| Variable          | Default              | Description                                                                                     |
-| :---------------- | :------------------- | :---------------------------------------------------------------------------------------------- |
-| `PORT`            | `8088`               | Port where the server listens (or provided by PaaS runtime).                                    |
-| `SERVER_PASSWORD` | `123456`             | Password for dashboard access on public IPs, tunnels and cloud hosts. LAN is password-free.     |
-| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for public addon URLs (`/<token>/manifest.json`); makes the link permanent. |
-| `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                    |
-| `PM_APP_ROOT`     | `storage/`           | Where sessions, auth and caches live.                                                           |
-| `PM_INFLIGHT`     | _(auto)_             | Maximum concurrent requests (`0` = auto).                                                       |
-| `PM_MAX_STREAMS`  | _(auto)_             | Maximum simultaneous streams (`0` = auto).                                                      |
-| `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                           |
-| `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                      |
-| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                       |
+| Variable          | Default              | Description                                                                                                                                                                                                                |
+| :---------------- | :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`            | `8088`               | Port where the server listens (or provided by PaaS runtime).                                                                                                                                                               |
+| `SERVER_PASSWORD` | `123456`             | Password for dashboard access on public IPs, tunnels and cloud hosts. LAN is password-free.                                                                                                                                |
+| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for public addon URLs (`/<token>/manifest.json`); makes the link permanent.                                                                                                                            |
+| `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                                                                                                                                               |
+| `PM_APP_ROOT`     | `storage/`           | Where sessions, auth and caches live.                                                                                                                                                                                      |
+| `PM_INFLIGHT`     | _(auto)_             | Maximum concurrent requests (`0` = auto).                                                                                                                                                                                  |
+| `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = **unlimited** (the default). Set a number only on a host with a short request timeout — past the cap a viewer gets a fast `503` + `Retry-After` instead of dying on the proxy timeout. |
+| `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                                      |
+| `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                                 |
+| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                                                                                                                                                  |
 
 ---
 

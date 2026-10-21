@@ -21,6 +21,11 @@
       "description": "Password for web dashboard access on public deployments",
       "value": "123456",
       "required": false
+    },
+    "PM_MAX_STREAMS": {
+      "description": "Concurrent /api/download bodies before 503 + Retry-After. The engine default is 0 (unlimited), which suits self-hosting; a PaaS with a short request timeout wants an explicit cap, because overflow past it dies on the router timeout (Heroku H12 at 30s) and returns an HTML error page instead of a retryable JSON 503.",
+      "value": "256",
+      "required": false
     }
   },
   "formation": {
