@@ -5492,7 +5492,9 @@ class PencariMovieApp {
           // Show the APP version (the installed APK / desktop package) when the
           // engine reports one; `current_version` is the engine and does not
           // change between app releases.
-          this.version = String((data == null ? void 0 : data.client_version) || data.current_version);
+          // `data.version` is the clean X.Y.Z the engine reports; without it a
+          // desktop build showed the git stamp (`2.8.9-4-g02e7dea`) in the badge.
+          this.version = String((data == null ? void 0 : data.version) || (data == null ? void 0 : data.client_version) || data.current_version);
           this.engineVersion = String(data.current_version);
           this.renderSettingsVersion();
         }
@@ -5562,8 +5564,8 @@ class PencariMovieApp {
         const info = yield resp.json();
         if (info && info.ok && info.update_available) {
           this.renderUpdateNotice({
-            current: info.current,
-            latest: info.latest,
+            current: info.current_display || info.current,
+            latest: info.latest_display || info.latest,
             build: info.build
           });
         }
@@ -5576,14 +5578,18 @@ class PencariMovieApp {
     if (!info) return;
     const roots = [this.$("#settingsGate"), this.$("#addonModal")].filter(Boolean);
     if (!roots.length) return;
-    const text = "Update available: v".concat(info.latest || "?", " (installed ").concat(info.current || "?", ")");
+    const v = value => String(value || "?").replace(/^v/i, "");
+    const text = "Update available: v".concat(v(info.latest), " (installed v").concat(v(info.current), ")");
     roots.forEach(root => {
+      // The bar belongs INSIDE the visible card. Inserted into the overlay it sat
+      // above the card and was clipped off-screen, so nobody could read it.
+      const host = root.querySelector(".settings-gate__card") || root;
       let bar = root.querySelector(".pm-update-notice");
       if (!bar) {
         bar = document.createElement("div");
         bar.className = "pm-update-notice";
-        bar.setAttribute("style", "margin:10px 0;padding:10px 12px;border-radius:8px;background:#2b2110;border:1px solid #ff6b35;color:#ffd8c2;font-size:13px;line-height:1.5;display:flex;gap:10px;align-items:center;justify-content:space-between");
-        root.insertBefore(bar, root.firstChild);
+        bar.setAttribute("style", "position:relative;z-index:3;margin:0 0 12px;padding:10px 12px;border-radius:8px;background:#2b2110;border:1px solid #ff6b35;color:#ffd8c2;font-size:13px;line-height:1.5;display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap");
+        host.insertBefore(bar, host.firstChild);
       }
       bar.textContent = "";
       const label = document.createElement("span");
@@ -5618,7 +5624,27 @@ class PencariMovieApp {
         }
         btn.disabled = false;
         btn.textContent = label;
-        alert((res && res.error) || "Update failed.");
+        // Show the reason IN the bar (an alert is invisible in a WebView and
+        // left the button looking dead), plus a one-click manual path.
+        const owner = btn.parentElement;
+        if (owner) {
+          const msg = document.createElement("span");
+          msg.style.cssText = "flex:1 1 100%;order:3;font-size:12px;color:#ffb27a";
+          msg.textContent = (res && res.error) || "Update failed.";
+          if (res && res.releases_url) {
+            const a = document.createElement("a");
+            a.href = res.releases_url;
+            a.target = "_blank";
+            a.rel = "noopener";
+            a.textContent = "Open releases";
+            a.style.cssText = "color:#ff6b35;text-decoration:underline;margin-left:6px";
+            msg.appendChild(a);
+          }
+          owner.appendChild(msg);
+        }
+        if (!(res && res.releases_url)) {
+          alert((res && res.error) || "Update failed.");
+        }
       } catch (e) {
         btn.disabled = false;
         btn.textContent = label;

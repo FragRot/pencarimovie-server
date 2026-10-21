@@ -125,6 +125,11 @@ pub async fn check() -> Value {
         "ok": true,
         "current": current,
         "build": config::build_id(),
+        // Clean X.Y.Z forms for display: a badge or an update bar must never
+        // show a git stamp like `2.8.9-4-g02e7dea`, and `latest` already starts
+        // with "v" so the UI must not prepend another one.
+        "current_display": config::clean_version(&current),
+        "latest_display": config::clean_version(&latest),
         "latest": latest,
         "update_available": is_newer(&latest, &current),
         "asset": asset,
@@ -169,6 +174,23 @@ pub async fn apply() -> Value {
             "error": "The release has no artifact for this platform.",
         });
     };
+    // Check for the apply script BEFORE downloading: on a bare build (cargo
+    // target dir, or a package extracted without the launcher scripts) the swap
+    // is impossible, and downloading 30 MB first only to fail made the button
+    // look dead.
+    let script = apply_script();
+    if !script.is_file() {
+        return serde_json::json!({
+            "ok": false,
+            "manual": true,
+            "asset": asset,
+            "releases_url": format!("https://github.com/{REPO}/releases/latest"),
+            "error": format!(
+                "This build has no {} next to the binary, so it cannot replace itself. Download the release and extract it over this folder.",
+                script.file_name().unwrap_or_default().to_string_lossy()
+            ),
+        });
+    }
     let release = latest_release().await;
     let Some(url) = asset_url(&release, &asset) else {
         return serde_json::json!({ "ok": false, "error": "Asset URL is missing from the release." });
@@ -199,18 +221,6 @@ pub async fn apply() -> Value {
                 "error": "The downloaded archive failed its SHA-256 check; nothing was installed.",
             });
         }
-    }
-    let script = apply_script();
-    if !script.is_file() {
-        return serde_json::json!({
-            "ok": false,
-            "downloaded": dest.display().to_string(),
-            "error": format!(
-                "Downloaded {}, but {} is missing - extract the archive over this folder manually.",
-                asset,
-                script.display()
-            ),
-        });
     }
     let started = if cfg!(windows) {
         std::process::Command::new("cmd")

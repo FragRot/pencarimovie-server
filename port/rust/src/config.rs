@@ -119,6 +119,12 @@ pub fn descriptor_version() -> String {
     xyz(&client_version()).unwrap_or_else(semver)
 }
 
+/// A display version: `X.Y.Z` when the input has one, otherwise the input
+/// without a leading `v`. Used so a UI never shows `2.8.9-4-g02e7dea`.
+pub fn clean_version(raw: &str) -> String {
+    xyz(raw).unwrap_or_else(|| raw.trim().trim_start_matches('v').to_string())
+}
+
 /// The port reports its own identity in the user agent; the PHP uses
 /// `pencarimovie-server/<version>` and the WordPress logs show it.
 pub fn user_agent() -> String {

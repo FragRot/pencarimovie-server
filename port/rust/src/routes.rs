@@ -4649,6 +4649,9 @@ async fn check_version() -> Value {
             "ok": false,
             "update_needed": false,
             "current_version": app_version(),
+            // Clean X.Y.Z for the dashboard badge; `current_version` may be a
+            // git stamp (`2.8.9-4-g02e7dea`), which is not for humans.
+            "version": crate::config::descriptor_version(),
             "client_version": client_version,
             "build": crate::config::build_id(),
         });
@@ -4658,6 +4661,7 @@ async fn check_version() -> Value {
         "ok": true,
         "update_needed": version_less(&current, &min_version),
         "current_version": current,
+        "version": crate::config::descriptor_version(),
         "client_version": client_version,
         "build": crate::config::build_id(),
         "minimum_version": min_version,
