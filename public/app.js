@@ -781,18 +781,32 @@ class PencariMovieApp {
           const currentCountry = res.configured_country || "";
           this.country = ((_a2 = res.country) == null ? void 0 : _a2.country_code) || currentCountry;
           if (addonCountrySelect && Array.isArray(res.available_countries)) {
-            addonCountrySelect.innerHTML = "";
+            // Type-to-search: the field is an <input list="addonCountryList">, so the
+            // user types "jap" and the browser filters. `value` stays the 2-letter
+            // CODE (that is what the origin's catalog query takes), the label is the
+            // name — which is why a typed NAME is resolved back to a code below.
+            const dataList = this.$("#addonCountryList");
+            this._countryByCode = {};
+            this._codeByName = {};
+            if (dataList) dataList.innerHTML = "";
             res.available_countries.forEach(ac => {
-              const opt = document.createElement("option");
-              opt.value = ac.code;
-              if (ac.code === "") {
-                opt.textContent = "Auto (".concat(res.country.country_name || res.country.country_code, ")");
-              } else {
-                opt.textContent = "".concat(ac.name, " (").concat(ac.code, ")");
+              const code = String(ac.code || "").toUpperCase();
+              const name = String(ac.name || "");
+              if (!code) return;
+              this._countryByCode[code] = name;
+              this._codeByName[name.toLowerCase()] = code;
+              if (dataList) {
+                const opt = document.createElement("option");
+                opt.value = code;
+                opt.label = name;
+                opt.textContent = name;
+                dataList.appendChild(opt);
               }
-              addonCountrySelect.appendChild(opt);
             });
+            const autoName = res.country.country_name || res.country.country_code || "Detected";
+            addonCountrySelect.placeholder = "Auto (".concat(autoName, ")");
             addonCountrySelect.value = currentCountry;
+            addonCountrySelect.title = currentCountry ? this._countryByCode[currentCountry] || currentCountry : "Auto (".concat(autoName, ")");
           }
         }
       } catch (err) {
@@ -802,7 +816,13 @@ class PencariMovieApp {
     if (addonCountrySelect) {
       addonCountrySelect.addEventListener("change", () => __async(this, null, function* () {
         var _a2;
-        const newCountry = addonCountrySelect.value;
+        // Accept a CODE ("JP"), a NAME ("Japan") or "Japan (JP)" - the datalist
+        // hands back the code, but a keyboard user may simply type the name.
+        const newCountry = this._countryCodeFromInput(addonCountrySelect.value);
+        if (newCountry === null) {
+          addonCountrySelect.value = catalogSettingsState.country || "";
+          return;
+        }
         try {
           const res = yield fetch("".concat(this.localApiBase, "/api/country"), {
             method: "POST",
@@ -816,6 +836,7 @@ class PencariMovieApp {
           const resData = yield res.json().catch(() => null);
           if (res.ok && (resData == null ? void 0 : resData.ok)) {
             catalogSettingsState.country = newCountry;
+            addonCountrySelect.value = newCountry;
             this.country = ((_a2 = resData.country) == null ? void 0 : _a2.country_code) || newCountry;
             this._cacheClear();
             this.loadInitialData().catch(e => console.warn("Failed to refresh data after country change:", e));
@@ -995,7 +1016,7 @@ class PencariMovieApp {
           const maxPerResEl = this.$("#streamMaxPerRes");
           const payload = {
             catalogs_enabled: isEnabled,
-            country: addonCountrySelect ? addonCountrySelect.value : catalogSettingsState.country || "",
+            country: addonCountrySelect ? this._countryCodeFromInput(addonCountrySelect.value) || "" : catalogSettingsState.country || "",
             enabled_types: {
               movie: !!(catTypeMovies && catTypeMovies.checked),
               series: !!(catTypeSeries && catTypeSeries.checked),
@@ -2571,8 +2592,19 @@ class PencariMovieApp {
         const el = active;
         delete el.dataset.dpadRo;
         el.readOnly = false;
+        // blur+focus in the SAME task leaves BODY active on some WebViews, so the
+        // remote's focus disappears and the user has to navigate from the top
+        // again. Re-focus on the next tick and keep the caret position.
+        const caret = typeof el.selectionStart === "number" ? el.selectionStart : null;
         el.blur();
-        el.focus();
+        setTimeout(() => {
+          try {
+            el.focus();
+            if (caret !== null && typeof el.setSelectionRange === "function") {
+              el.setSelectionRange(caret, caret);
+            }
+          } catch (_) {}
+        }, 0);
         return;
       }
       if ((isEnter || isSpace) && active && active.tagName === "INPUT") {
@@ -5600,6 +5632,23 @@ class PencariMovieApp {
       if (cPart > mPart) return false;
     }
     return false;
+  }
+  /**
+   * Map whatever the region field holds to an ISO-3166 code.
+   * Accepts "JP", "Japan", "japan", "Japan (JP)" and "". Returns `null` when it
+   * cannot be resolved, so the caller restores the previous value instead of
+   * POSTing junk to /api/country.
+   */
+  _countryCodeFromInput(raw) {
+    const text = String(raw == null ? "" : raw).trim();
+    if (!text) return "";
+    const inParens = text.match(/\(([A-Za-z]{2})\)\s*$/);
+    if (inParens) return inParens[1].toUpperCase();
+    const upper = text.toUpperCase();
+    if ((this._countryByCode || {})[upper]) return upper;
+    const byName = this._codeByName || {};
+    if (byName[text.toLowerCase()]) return byName[text.toLowerCase()];
+    return null;
   }
   /**
    * `X.Y.Z` or nothing. A `git describe` stamp (`2.9.0-9-ga8a1f3d-dirty`) is

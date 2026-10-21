@@ -672,9 +672,17 @@
                 <label for="addonCountrySelect" class="addon-country-label"
                   >🌍 Region:</label
                 >
-                <select id="addonCountrySelect" class="addon-country-select">
-                  <option value="">Auto (Detecting...)</option>
-                </select>
+                <input
+                  id="addonCountrySelect"
+                  class="addon-country-select"
+                  list="addonCountryList"
+                  type="text"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="Auto (Detecting...)"
+                  aria-label="Region"
+                />
+                <datalist id="addonCountryList"></datalist>
               </div>
             </div>
             <span class="addon-catalog-card__badge" id="addonCatalogStatusBadge"
@@ -1745,6 +1753,6 @@
         }
       })();
     </script>
-    <script defer src="app.js?v=20261021ver6"></script>
+    <script defer src="app.js?v=20261021ver7"></script>
   </body>
 </html>
