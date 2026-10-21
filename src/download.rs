@@ -512,6 +512,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 if file_size == 0 && fs > 0 {
                     file_size = fs;
                 }
+                if file_name.is_empty() {
+                    let t = jstr(&entry, "title");
+                    file_name = if t.is_empty() { jstr(&entry, "file_name") } else { t };
+                }
+                if file_mime.is_empty() {
+                    let m = jstr(&entry, "mime");
+                    file_mime = if m.is_empty() { jstr(&entry, "file_type") } else { m };
+                }
             }
         }
     }
@@ -670,6 +678,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             }),
         );
     }
+
+    file_name = stream_filename(&file_name, &file_mime);
+    file_mime = guess_video_mime(&file_name, &file_mime);
+
     if file_size == 0 || file_name.is_empty() || file_mime.is_empty() {
         record_refusal(
             ctx, started, 400, "MISSING_FILE_META",
@@ -1540,4 +1552,26 @@ async fn serve_alac(
     Some(builder.body(Body::from(body)).unwrap_or_else(|_| {
         json_response(500, &serde_json::json!({"ok": 0, "message": "response build failed"}))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guesses_video_mime_when_omitted() {
+        let name = "Sengkolo.Petaka.Satu.Suro.2026.1080p.MalaySub.WEB.MSM.mp4";
+        let mime = guess_video_mime(name, "");
+        assert_eq!(mime, "video/mp4");
+
+        let mkv = "Movie.2026.mkv";
+        assert_eq!(guess_video_mime(mkv, ""), "video/x-matroska");
+    }
+
+    #[test]
+    fn stream_filename_and_mime_fallbacks() {
+        let name = stream_filename("video", "video/mp4");
+        assert_eq!(name, "video.mp4");
+        assert_eq!(guess_video_mime(&name, ""), "video/mp4");
+    }
 }

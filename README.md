@@ -105,13 +105,11 @@ Run in terminal:
 curl -fsSL telegra.my/mac | bash
 ```
 
-#### 🤖 Android (Termux)
+#### 🤖 Android (APK)
 
-Run in Termux:
+The engine runs inside the app — download and install the APK:
 
-```bash
-curl -fsSL telegra.my/termux | bash
-```
+👉 **https://telegra.my/apk**
 
 #### 🐳 Docker (Any OS / NAS / VPS)
 
@@ -332,7 +330,6 @@ Built on the shoulders of these fantastic open-source projects:
 - [**grammers**](https://codeberg.org/grammers/grammers) — Telegram MTProto client library.
 - [**axum**](https://github.com/tokio-rs/axum) — HTTP server and router.
 - [**cloudflared**](https://github.com/cloudflare/cloudflared) — Cloudflare tunnel client enabling seamless TryCloudflare quick tunnels.
-- [**Termux**](https://github.com/termux/termux-app) — Terminal environment and process runner for Android devices.
 
 ---
 
