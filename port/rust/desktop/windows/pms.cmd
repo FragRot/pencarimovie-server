@@ -102,6 +102,24 @@ start "" "http://127.0.0.1:8088/#addon"
 exit /b 0
 
 :do_uninstall
+rem ── SAFETY: only the per-user INSTALL may be deleted ───────────────────────
+rem `pms` can resolve to a source checkout or to port\rust\target\release when it
+rem is run from this repository. Uninstalling there would wipe the project, so
+rem anything that is not exactly %USERPROFILE%\pencarimovie-server is refused.
+set "PM_USER_DIR=%USERPROFILE%\pencarimovie-server"
+for %%I in ("%PM_DIR%") do set "PM_ABS=%%~fI"
+for %%I in ("%PM_USER_DIR%") do set "PM_USER_ABS=%%~fI"
+if /i not "%PM_ABS%"=="%PM_USER_ABS%" (
+    echo Refusing to delete: %PM_ABS%
+    echo Only the installed copy can be uninstalled: %PM_USER_ABS%
+    echo Stopping the server instead.
+    call "%~f0" stop >nul 2>&1
+    exit /b 1
+)
+if exist "%PM_DIR%\.git" (
+    echo Refusing to delete a git checkout: %PM_DIR%
+    exit /b 1
+)
 echo This stops the server, removes the Windows startup entry and deletes:
 echo   %PM_DIR%
 echo.
