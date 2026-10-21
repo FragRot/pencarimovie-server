@@ -1,7 +1,7 @@
 name: Test Release Build & Installers
 
-# Scope note: the SERVED product is the Rust binary (`server/`, built and released
-# by release.yml), so this workflow does not build it. What it does guard is the
+# Scope note: the SERVED product is the Rust binary (crate at the repo root, built
+# and released by release.yml), so this workflow does not build it. What it does guard is the
 # two things a layout change can silently break:
 #
 #   * the user-facing installers at the repo root (their URLs are a public

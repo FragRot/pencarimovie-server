@@ -1,8 +1,8 @@
 # `legacy/` — superseded implementations
 
 Nothing in this directory is built, released or deployed. The product is the Rust
-server in [`server/`](../server) (published as `pencarimovie-server-<os>-<arch>`);
-`public/` at the repository root is the dashboard it embeds.
+server at the repository root (published as `pencarimovie-server-<os>-<arch>`);
+`public/` is the dashboard it embeds.
 
 | Directory     | What it is                                                                 | Status                                                                                                                                |
 | ------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
@@ -13,10 +13,9 @@ server in [`server/`](../server) (published as `pencarimovie-server-<os>-<arch>`
 
 The PHP implementation is the reference for a lot of behaviour the Rust port had to
 match (catalog gating, the stream matcher, the auth token model, the ALAC handling).
-The port audit in [`server/PORT_GAPS.md`](../server/PORT_GAPS.md) and
-[`server/PARITY.md`](../server/PARITY.md) refers back to it, so deleting it would
-break those references. Git history alone is not enough for something that is still
-used as a specification.
+The port audit (PARITY.md / PORT_GAPS.md — kept locally, not published) refers back
+to it, so deleting it would break those references. Git history alone is not enough
+for something that is still used as a specification.
 
 If you are looking for how to install or run the server, you do not want anything in
 this directory — see the root [`README.md`](../README.md).
