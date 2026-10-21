@@ -101,6 +101,24 @@ pub fn stream_ajax_wants_bot(action: &str) -> bool {
 /// code read the file "at any age" for this; bounded now.
 const AJAX_STALE_GRACE: i64 = 21_600;
 
+/// How long an EMPTY ajax payload may be cached — deliberately far shorter than
+/// every [`stream_ajax_ttl`], so a transient empty answer self-heals in a minute
+/// instead of pinning a catalog row for ten.
+const EMPTY_PAYLOAD_TTL: i64 = 60;
+
+/// `[]`, `{}`, or an object whose array members are all empty (`{"files":[]}`).
+fn is_empty_payload(v: &Value) -> bool {
+    match v {
+        Value::Array(a) => a.is_empty(),
+        Value::Object(m) => m.values().all(|x| match x {
+            Value::Array(a) => a.is_empty(),
+            Value::Null => true,
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
 /// Freshness of the PER-EPISODE `stream-files` search.
 ///
 /// The PHP fetches that exact URL through `fd_cached_wp_json($url, 15)`
@@ -149,6 +167,16 @@ pub async fn fetch_stream_ajax(action: &str, params: &[(String, String)]) -> Val
     })
     .await;
 
+    // An EMPTY payload is cached for at most a minute, never for the action's full
+    // TTL. One origin hiccup used to pin an empty `posts`/`search_files` answer for
+    // 600 s, and because `/catalog/*` itself refuses to cache an empty row, the
+    // only symptom was a catalog that stayed empty for ten minutes and looked
+    // "broken" with no error anywhere (measured twice while porting the PHP's
+    // catalog rows: `series/top` and `pm_series_year` answered `{"metas":[]}`
+    // while the origin returned 69 and 100 posts for the identical query).
+    if !body.is_null() && is_empty_payload(&body) {
+        crate::cache::put("wp_ajax", &key, &body, EMPTY_PAYLOAD_TTL, AJAX_STALE_GRACE);
+    }
     if body.is_null() {
         if let Some(stale) = crate::cache::get_stale("wp_ajax", &key) {
             log(
@@ -175,6 +203,9 @@ pub struct WpFile {
     pub mime: String,
     pub season_num: i32,
     pub episode_num: i32,
+    /// `thumbnail_url` — the poster a Telegram-FILE catalog row shows
+    /// (backend.php:15829 `'poster' => $fThumb`). Empty for post files.
+    pub thumbnail: String,
 }
 
 pub fn wp_file_from(v: &Value) -> Option<WpFile> {
@@ -206,6 +237,12 @@ pub fn wp_file_from(v: &Value) -> Option<WpFile> {
         .find_map(|k| v.get(*k).and_then(|x| x.as_str()))
         .unwrap_or("")
         .to_string();
+    let thumbnail = v
+        .get("thumbnail_url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     Some(WpFile {
         short_code,
         title,
@@ -214,6 +251,7 @@ pub fn wp_file_from(v: &Value) -> Option<WpFile> {
         mime,
         season_num: json_i32(v, "season_num"),
         episode_num: json_i32(v, "episode_num"),
+        thumbnail,
     })
 }
 
@@ -579,13 +617,22 @@ pub async fn stream_files_episode(
 /// free-text index probe the episode fallback ladder races in parallel
 /// (`fd_search_files_parallel()`, backend.php:9881).
 pub async fn search_files(search: &str, limit: usize) -> Vec<WpFile> {
+    search_files_at(search, limit, 0).await
+}
+
+/// `search_files` with an `offset`, for the paged Telegram-FILE catalogs
+/// (backend.php:15759 passes `offset => $skip`).
+///
+/// `search` may be the origin's `__latest__` token (newest files) or a 4-digit
+/// year, both of which the endpoint understands.
+pub async fn search_files_at(search: &str, limit: usize, offset: usize) -> Vec<WpFile> {
     if search.trim().is_empty() {
         return Vec::new();
     }
     let params = vec![
         ("search".to_string(), search.to_string()),
         ("limit".to_string(), limit.to_string()),
-        ("offset".to_string(), "0".to_string()),
+        ("offset".to_string(), offset.to_string()),
     ];
     let res = fetch_stream_ajax("search_files", &params).await;
     rows_of(&res, &["files", "items"])
@@ -703,6 +750,23 @@ pub fn post_year(post: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_payload_is_cached_only_briefly() {
+        // `[]`, `{}` and `{"files":[]}` are EMPTY: one origin hiccup must not pin a
+        // catalog row for the action's full TTL.
+        assert!(is_empty_payload(&serde_json::json!([])));
+        assert!(is_empty_payload(&serde_json::json!({})));
+        assert!(is_empty_payload(&serde_json::json!({"files": []})));
+        assert!(is_empty_payload(&serde_json::json!({"files": [], "items": []})));
+        // A real payload is not.
+        assert!(!is_empty_payload(&serde_json::json!({"files": [{"short_code": "x"}]})));
+        assert!(!is_empty_payload(&serde_json::json!([{"id": 1}])));
+        assert!(!is_empty_payload(&serde_json::json!({"files": [{"a": 1}], "has_more": true})));
+        assert!(!is_empty_payload(&serde_json::json!({"id": 9000016, "title": "x"})));
+        assert!(EMPTY_PAYLOAD_TTL < stream_ajax_ttl("search"));
+        assert!(EMPTY_PAYLOAD_TTL < stream_ajax_ttl("posts"));
+    }
 
     #[test]
     fn ttl_matches_php() {

@@ -3334,13 +3334,15 @@ fn write_catalog_settings(data: &Value) -> bool {
 /// reproduced verbatim, plus the port's two merged trending post rows.
 fn default_catalog_options() -> Value {
     serde_json::json!({
-        // The four rows this port's manifest actually advertises. They are not
-        // in the PHP's map (the PHP builds equivalent rows under the `top` /
-        // `year` ids) but the panel needs one checkbox per advertised row.
-        "pm_movies": {"type": "movie", "group": "row", "name": "PencariMovie Movies", "default": true},
-        "pm_latest_movies": {"type": "movie", "group": "row", "name": "Latest Movies", "default": true},
-        "pm_series": {"type": "series", "group": "row", "name": "PencariMovie Series", "default": true},
-        "pm_latest_series": {"type": "series", "group": "row", "name": "Latest Series", "default": true},
+        // Every row here is one the descriptor can advertise (`pm_catalogs()` +
+        // the keyword rows), so a checkbox always does something. The
+        // `pm_movies` / `pm_latest_movies` / `pm_series` / `pm_latest_series`
+        // rows this port used to ship are GONE: they exist in no PHP manifest and
+        // their ids map to no client's home row, which is why the catalog was
+        // reported "broken".
+        //
+        // `pm_series_top` and `pm_files_year` are the GATE keys for the series
+        // and Telegram-file `top` rows (backend.php:15323-15327), not row ids.
         // Special catalogs: Popular, New, Search, Telegram Files, Trending.
         "top": {"type": "movie", "group": "special", "name": "Popular (Movies)", "default": true},
         "year": {"type": "movie", "group": "special", "name": "New (Movies)", "default": true},
@@ -3382,11 +3384,26 @@ fn default_catalog_options() -> Value {
     })
 }
 
-/// PHP's per-row gate on the descriptor (backend.php:15303-15336): a local row
-/// is advertised when its media type is enabled AND `enabled_catalogs[id]` is
-/// not explicitly `false`. A missing type / missing id means ENABLED, which is
-/// what makes every row appear on a fresh install.
-fn catalog_row_enabled(settings: &Value, cat: &Value) -> bool {
+/// One checkbox in `enabled_catalogs`. A missing key means ENABLED (the PHP's
+/// `!isset($map[$id]) || !empty($map[$id])` rule), which is what makes every row
+/// appear on a fresh install.
+fn catalog_switch(settings: &Value, id: &str) -> bool {
+    match settings.get("enabled_catalogs").and_then(|m| m.get(id)) {
+        Some(v) => v.as_bool().unwrap_or(true),
+        None => true,
+    }
+}
+
+/// PHP's per-row gate on the descriptor (backend.php:15303-15332): a local row
+/// is advertised when its media type is enabled AND its catalog switch is on.
+///
+/// Three details are load-bearing and each one silently drops rows when missed:
+/// 1. `series` + `top` is gated by `pm_series_top`, and `other` + `top` by
+///    `pm_files_year` (the PHP checks a DIFFERENT key than the row's id);
+/// 2. every `pm_topkw_<hash>` row also needs the `pm_trending_keywords` master
+///    toggle, so one checkbox hides all keyword rows;
+/// 3. a row whose `type` is not in `enabled_types` never reaches a client.
+fn catalog_advertised(settings: &Value, cat: &Value) -> bool {
     let ctype = cat.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let type_on = settings
         .get("enabled_types")
@@ -3397,10 +3414,15 @@ fn catalog_row_enabled(settings: &Value, cat: &Value) -> bool {
         return false;
     }
     let id = cat.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    match settings.get("enabled_catalogs").and_then(|m| m.get(id)) {
-        Some(v) => v.as_bool().unwrap_or(true),
-        None => true,
+    if id.starts_with("pm_topkw_") && !catalog_switch(settings, "pm_trending_keywords") {
+        return false;
     }
+    let check_id = match (ctype, id) {
+        ("series", "top") => "pm_series_top",
+        ("other", "top") => "pm_files_year",
+        _ => id,
+    };
+    catalog_switch(settings, check_id)
 }
 
 fn apply_stream_config(sc: &mut Value, input: &serde_json::Map<String, Value>) {
@@ -3961,6 +3983,112 @@ async fn build_trending_row(item_type: &str, skip: usize) -> Vec<Value> {
     page
 }
 
+/// Resolution / source / codec pills for a Telegram file name
+/// (backend.php:15793-15803). The PHP also matches a bare `\bhd\b` / `\bsd\b`;
+/// those are dropped here because they fire on ordinary words inside a name.
+fn file_pills(title: &str, size: u64) -> Vec<String> {
+    let t = title.to_lowercase();
+    let mut pills: Vec<String> = Vec::new();
+    if t.contains("2160p") || t.contains("4k") || t.contains("uhd") {
+        pills.push("4K".to_string());
+    } else if t.contains("1080p") || t.contains("fhd") {
+        pills.push("1080p".to_string());
+    } else if t.contains("720p") {
+        pills.push("720p".to_string());
+    } else if t.contains("480p") || t.contains("360p") {
+        pills.push("SD".to_string());
+    }
+    if t.contains("bluray") || t.contains("blu-ray") || t.contains("remux") {
+        pills.push("BluRay".to_string());
+    } else if t.contains("web-dl") || t.contains("webdl") || t.contains("webrip") {
+        pills.push("WEB-DL".to_string());
+    }
+    if t.contains("hevc") || t.contains("x265") || t.contains("h265") {
+        pills.push("HEVC".to_string());
+    }
+    if size > 0 {
+        pills.push(format_bytes(size));
+    }
+    pills
+}
+
+/// `other/*` and `pm_topkw_*` rows: the origin's newest / keyword FILE lists,
+/// rendered exactly like the PHP's Telegram-file catalog items
+/// (backend.php:15750-15850).
+///
+/// The search term is, in order: the row's own `search` extra (the PHP ignores it
+/// on `pm_search_files`, which made that row useless), the selected year, the
+/// `pm_topkw_<hash>` keyword, else `__latest__` (the origin's "newest files"
+/// token).
+async fn file_catalog_metas(
+    cat_id: &str,
+    search: &str,
+    genre: &str,
+    year: &str,
+    skip: usize,
+) -> Vec<Value> {
+    let term = if !search.trim().is_empty() {
+        search.trim().to_string()
+    } else if !year.trim().is_empty() {
+        year.trim().to_string()
+    } else if cat_id.starts_with("pm_topkw_") {
+        // A keyword row whose keyword has fallen out of the cached map renders
+        // EMPTY, like the PHP — never the newest files, which would present
+        // unrelated releases under a trending name.
+        match topkw_map().await.into_iter().find(|(id, _)| id == cat_id) {
+            Some((_, kw)) => kw,
+            None => return Vec::new(),
+        }
+    } else {
+        "__latest__".to_string()
+    };
+    let limit = if genre.is_empty() && year.is_empty() { 50 } else { 100 };
+    let files = crate::wp_data::search_files_at(&term, limit, skip).await;
+    let mut metas: Vec<Value> = Vec::new();
+    for f in &files {
+        let title = clean_post_title(&f.title);
+        if title.is_empty() {
+            continue;
+        }
+        let pills = file_pills(&title, f.file_size);
+        // On a file row the `genre` extra is a QUALITY pill (4K/1080p/BluRay/HEVC).
+        if !genre.is_empty() && !pills.iter().any(|p| p.eq_ignore_ascii_case(genre.trim())) {
+            continue;
+        }
+        if !year.is_empty() && !title.contains(year.trim()) {
+            continue;
+        }
+        let pill_line = if pills.is_empty() {
+            "Ready to stream".to_string()
+        } else {
+            pills.join(" · ")
+        };
+        let primary = if cat_id == "pm_files_year" || cat_id == "pm_files_latest" {
+            "Year"
+        } else if cat_id.starts_with("pm_topkw_") {
+            "Trending File"
+        } else {
+            "Telegram File"
+        };
+        let mut genres: Vec<String> = vec![primary.to_string()];
+        for p in &pills {
+            if !genres.iter().any(|g| g == p) {
+                genres.push(p.clone());
+            }
+        }
+        metas.push(serde_json::json!({
+            "id": format!("pm_file_{}", f.short_code),
+            "type": "other",
+            "name": title,
+            "poster": f.thumbnail,
+            "posterShape": "poster",
+            "description": format!("{}\n\n{}", pill_line, title),
+            "genres": genres,
+        }));
+    }
+    metas
+}
+
 async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
     let Some((item_type, cat_id, extra)) = split_addon(path, "/catalog/") else {
         return stremio_json(200, &serde_json::json!({"metas": []}), "no-store");
@@ -4036,6 +4164,32 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
             );
             return stremio_json(200, &hit, "no-store");
         }
+    }
+    // ── Telegram-FILE rows (`other/*`, `pm_topkw_*`) ───────────────────────
+    // backend.php:15750-15850: these catalogs list FILES (`search-files`), never
+    // posts. The generic path below would answer POSTS for `other`, which is why
+    // the "Telegram Files" row used to show movie posts instead of files.
+    if item_type == "other" || cat_id.starts_with("pm_topkw_") {
+        let metas = file_catalog_metas(&cat_id, &search, &genre, &year, skip).await;
+        let body = serde_json::json!({"metas": metas});
+        if body
+            .get("metas")
+            .and_then(|m| m.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+        {
+            crate::cache::put("catalog", &cat_key, &body, 600, 0);
+        }
+        log(
+            "file catalog built",
+            &serde_json::json!({
+                "type": item_type,
+                "id": cat_id,
+                "search": search,
+                "count": body["metas"].as_array().map(|a| a.len()).unwrap_or(0),
+            }),
+        );
+        return stremio_json(200, &body, "no-store");
     }
     let limit = if search.is_empty() { 100 } else { 30 };
     // ── trending rows (merged over the trending keyword map) ───────────────
@@ -4231,29 +4385,256 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
     stremio_json(200, &serde_json::json!({"meta": Value::Null}), "no-store")
 }
 
-/// The catalog rows the dashboard, Stremio and Nuvio browse.
+/// Movies > Country catalogs, exactly the PHP's ids, names and order
+/// (`$movieCountryCatalogs`, backend.php:15075-15086).
+const MOVIE_COUNTRY_CATALOGS: &[(&str, &str)] = &[
+    ("pm_movies_malay", "Malaysia"),
+    ("pm_movies_indo", "Indonesia"),
+    ("pm_movies_korean", "Korea"),
+    ("pm_movies_japan", "Japan"),
+    ("pm_movies_anime", "Anime"),
+    ("pm_movies_chinese", "China / HK"),
+    ("pm_movies_thai", "Thailand"),
+    ("pm_movies_bollywood", "India"),
+    ("pm_movies_philippines", "Philippines"),
+    ("pm_movies_english", "English"),
+];
+
+/// Series > Country catalogs (`$seriesCountryCatalogs`, backend.php:15106-15117).
+const SERIES_COUNTRY_CATALOGS: &[(&str, &str)] = &[
+    ("pm_series_malay", "Malaysia"),
+    ("pm_series_indo", "Indonesia"),
+    ("pm_series_kdrama", "K-Drama"),
+    ("pm_series_anime", "Anime"),
+    ("pm_series_japan", "J-Drama"),
+    ("pm_series_cdrama", "C-Drama"),
+    ("pm_series_thai", "Thailand"),
+    ("pm_series_philippines", "Philippines"),
+    ("pm_series_india", "India"),
+    ("pm_series_english", "English"),
+];
+
+/// `country_code` → the country catalog of each type (`$cMapMovie` /
+/// `$cMapSeries`, backend.php:15087-15132).
+const COUNTRY_CATALOG_MAP: &[(&str, &str, &str)] = &[
+    ("my", "pm_movies_malay", "pm_series_malay"),
+    ("id", "pm_movies_indo", "pm_series_indo"),
+    ("kr", "pm_movies_korean", "pm_series_kdrama"),
+    ("jp", "pm_movies_japan", "pm_series_japan"),
+    ("cn", "pm_movies_chinese", "pm_series_cdrama"),
+    ("hk", "pm_movies_chinese", "pm_series_cdrama"),
+    ("th", "pm_movies_thai", "pm_series_thai"),
+    ("in", "pm_movies_bollywood", "pm_series_india"),
+    ("ph", "pm_movies_philippines", "pm_series_philippines"),
+];
+
+/// One descriptor catalog row. `extra` entries keep `name`/`isRequired` and the
+/// legacy `extraSupported` / `extraRequired` arrays the PHP also emits.
 ///
-/// Deliberately small (Stremio rejects a descriptor over ~49 KB) and with **no
-/// `genres` array** on any catalog — the genre values live in the `genre` extra,
-/// exactly like cinemeta's own manifest.
+/// Deliberately NO `options` arrays and NO `genres`: the PHP ships the full genre
+/// and year option lists on every country row, which is how its descriptor reached
+/// 50,842 B — over Stremio's ~49 KB cap (`code 20004`). The values still work as a
+/// plain `genre`/`year` value in the extra path.
+fn catalog_row(ty: &str, id: &str, name: &str, extras: &[&str], required: &[&str]) -> Value {
+    let extra: Vec<Value> = extras
+        .iter()
+        .map(|n| serde_json::json!({"name": n, "isRequired": required.contains(n)}))
+        .collect();
+    let mut row = serde_json::json!({
+        "type": ty,
+        "id": id,
+        "name": name,
+        "extra": extra,
+        "extraSupported": extras,
+    });
+    if !required.is_empty() {
+        row["extraRequired"] = serde_json::json!(required);
+    }
+    row
+}
+
+/// The LOCAL catalog rows — a full port of the PHP's `$manifestCatalogs`
+/// (backend.php:15135-15292), in the PHP's order:
+///
+/// * movie: `top` (Popular), `year` (New), `pm_search_movie`, then the 10
+///   country rows;
+/// * series: `top`, `pm_series_year`, `pm_search_series`, then the 10 country
+///   rows;
+/// * other (Telegram Files): `top`, `pm_files_year`, `pm_search_files`.
+///
+/// Plus this port's two merged TRENDING rows (`pm_trending_movies` /
+/// `pm_trending_series`), which replace the PHP's per-keyword `pm_topkw_*` rows
+/// for post discovery; the keyword FILE rows are appended by [`topkw_catalogs`].
+///
+/// The previous hand-written six-row list (`pm_movies`, `pm_latest_movies`, …)
+/// advertised ids that exist nowhere in the PHP and in no client's home-row map,
+/// while every real row the dashboard's Catalog Configuration panel offers
+/// (`top`, `pm_movies_malay`, `pm_files_year`, …) was missing — which is what
+/// looked like "manifest.json catalog is broken".
 fn pm_catalogs() -> Value {
-    serde_json::json!([
-        {"type": "movie", "id": "pm_movies", "name": "PencariMovie Movies",
-         "extra": [{"name": "search", "isRequired": false}, {"name": "genre", "isRequired": false}, {"name": "skip", "isRequired": false}]},
-        {"type": "movie", "id": "pm_latest_movies", "name": "Latest Movies",
-         "extra": [{"name": "skip", "isRequired": false}]},
-        // Merged trending rows: every valid keyword from `GET /trending`, split
-        // by the post's movie/series classification. Both are served from the
-        // same keyword map, so they cost nothing extra in the descriptor.
-        {"type": "movie", "id": "pm_trending_movies", "name": "Trending Movies",
-         "extra": [{"name": "skip", "isRequired": false}]},
-        {"type": "series", "id": "pm_series", "name": "PencariMovie Series",
-         "extra": [{"name": "search", "isRequired": false}, {"name": "genre", "isRequired": false}, {"name": "skip", "isRequired": false}]},
-        {"type": "series", "id": "pm_latest_series", "name": "Latest Series",
-         "extra": [{"name": "skip", "isRequired": false}]},
-        {"type": "series", "id": "pm_trending_series", "name": "Trending Series",
-         "extra": [{"name": "skip", "isRequired": false}]}
-    ])
+    let mut rows: Vec<Value> = Vec::new();
+    // ── 1. Movies ──────────────────────────────────────────────────────────
+    rows.push(catalog_row(
+        "movie",
+        "top",
+        "Popular",
+        &["search", "genre", "year", "skip"],
+        &[],
+    ));
+    rows.push(catalog_row("movie", "year", "New", &["genre", "skip"], &["genre"]));
+    rows.push(catalog_row(
+        "movie",
+        "pm_search_movie",
+        "Search Movies",
+        &["search", "genre", "year", "skip"],
+        &["search"],
+    ));
+    for (id, name) in MOVIE_COUNTRY_CATALOGS {
+        rows.push(catalog_row("movie", id, name, &["genre", "year", "skip"], &[]));
+    }
+    // ── 2. Series ──────────────────────────────────────────────────────────
+    rows.push(catalog_row(
+        "series",
+        "top",
+        "Popular",
+        &["search", "genre", "year", "skip"],
+        &[],
+    ));
+    rows.push(catalog_row(
+        "series",
+        "pm_series_year",
+        "New",
+        &["genre", "skip"],
+        &["genre"],
+    ));
+    rows.push(catalog_row(
+        "series",
+        "pm_search_series",
+        "Search Series",
+        &["search", "genre", "year", "skip"],
+        &["search"],
+    ));
+    for (id, name) in SERIES_COUNTRY_CATALOGS {
+        rows.push(catalog_row("series", id, name, &["genre", "year", "skip"], &[]));
+    }
+    // ── 3. Other (Telegram files) ──────────────────────────────────────────
+    rows.push(catalog_row(
+        "other",
+        "top",
+        "Telegram Files",
+        &["search", "genre", "skip"],
+        &[],
+    ));
+    rows.push(catalog_row(
+        "other",
+        "pm_files_year",
+        "New (Telegram Files)",
+        &["genre", "skip"],
+        &["genre"],
+    ));
+    rows.push(catalog_row(
+        "other",
+        "pm_search_files",
+        "Telegram Files (Search)",
+        &["search", "genre", "skip"],
+        &["search"],
+    ));
+    // ── 4. This port's merged trending post rows ───────────────────────────
+    rows.push(catalog_row(
+        "movie",
+        TRENDING_MOVIE_CATALOG,
+        "Trending Movies",
+        &["skip"],
+        &[],
+    ));
+    rows.push(catalog_row(
+        "series",
+        TRENDING_SERIES_CATALOG,
+        "Trending Series",
+        &["skip"],
+        &[],
+    ));
+    Value::Array(rows)
+}
+
+/// `substr(md5(strtolower($kw)), 0, 10)` — the keyword catalog id suffix
+/// (backend.php:11859).
+fn topkw_id_suffix(kw: &str) -> String {
+    crate::fileid::md5_hex(kw.to_lowercase().as_bytes())
+        .chars()
+        .take(10)
+        .collect()
+}
+
+/// `ucwords($kw)`.
+fn ucwords(raw: &str) -> String {
+    raw.split_whitespace()
+        .map(|w| {
+            let mut it = w.chars();
+            match it.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + it.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
+/// `pm_topkw_<md5(kw)[0..10]>` → keyword, at most FIVE entries
+/// (`fd_get_trending_keywords_map()`, backend.php:11853-11865).
+///
+/// The map is memoised by [`crate::wp_data::trending_keywords`] (1 h), so the
+/// descriptor does not pay an origin call per request.
+async fn topkw_map() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (kw, _) in crate::wp_data::trending_keywords().await {
+        let kw = kw.trim().to_string();
+        if !crate::wp_data::is_topkeyword_valid(&kw) {
+            continue;
+        }
+        out.push((format!("pm_topkw_{}", topkw_id_suffix(&kw)), kw));
+        if out.len() >= 5 {
+            break;
+        }
+    }
+    out
+}
+
+/// The keyword FILE catalogs the PHP appends to the descriptor
+/// (backend.php:15279-15292).
+async fn topkw_catalogs() -> Vec<Value> {
+    topkw_map()
+        .await
+        .into_iter()
+        .map(|(id, kw)| catalog_row("other", &id, &ucwords(&kw), &["genre", "year", "skip"], &[]))
+        .collect()
+}
+
+/// Move the detected home country's movie/series rows to the top of their type,
+/// like the PHP (backend.php:15087-15132).
+fn prioritise_home_country(catalogs: Vec<Value>, settings: &Value) -> Vec<Value> {
+    let cc = settings
+        .get("country")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let Some((_, movie, series)) = COUNTRY_CATALOG_MAP.iter().find(|(c, _, _)| *c == cc) else {
+        return catalogs;
+    };
+    let type_rank = |t: &str| match t {
+        "movie" => 0,
+        "series" => 1,
+        _ => 2,
+    };
+    let mut rows = catalogs;
+    rows.sort_by_key(|c| {
+        let ty = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let home = id == *movie || id == *series;
+        (type_rank(ty), if home { 0 } else { 1 })
+    });
+    rows
 }
 
 /* ── Eclipse music (backend.php:13568-14259) ─────────────────────────────── */
@@ -4544,7 +4925,13 @@ async fn manifest(base_url: &str) -> Value {
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if catalogs_enabled {
-        catalogs.retain(|c| catalog_row_enabled(&settings, c));
+        // The PHP appends one `other` FILE catalog per trending keyword
+        // (`pm_topkw_<hash>`, at most five) — backend.php:15279-15292. Skipped
+        // while catalogs are off: the keyword map is an origin call.
+        catalogs.extend(topkw_catalogs().await);
+        // A detected home country puts its rows first inside each type.
+        catalogs = prioritise_home_country(catalogs, &settings);
+        catalogs.retain(|c| catalog_advertised(&settings, c));
     } else {
         catalogs.clear();
     }
@@ -4621,58 +5008,99 @@ fn version_less(a: &str, b: &str) -> bool {
     false
 }
 
+/// The `/api/version` body (backend.php `fd_check_version`).
+///
+/// `client` is the APP SHELL that launched this engine (`RustServer.kt` passes the
+/// APK's `versionName`), empty on a desktop build. `current` is this binary's own
+/// version (`config::app_version()`, which IS `client` when one was supplied).
+///
+/// **The WordPress `min_version` may only gate a DESKTOP build.** It is a minimum
+/// for the PHP ENGINE lineage (`2.7.9`), so an app shell — whose product version
+/// is the APK's (`1.0.55`) — is ALWAYS "older" and the dashboard demanded an
+/// upgrade to v2.7.9 on every install ("android app? its wrongly check v2.x.x
+/// version"). An app-managed build reports `app_shell: true` and
+/// `update_needed: false`; the APK has its own `apk-server-latest` updater.
+fn version_answer(
+    client: &str,
+    current: &str,
+    min_version: &str,
+    update_url: &str,
+    notes: &str,
+) -> Value {
+    let app_shell = !client.trim().is_empty();
+    // Clean X.Y.Z for the dashboard badge; `current` may be a git stamp
+    // (`2.8.9-4-g02e7dea`), which is not for humans.
+    let display = crate::config::clean_version(if app_shell { client } else { current });
+    let mut out = serde_json::json!({
+        "ok": !min_version.is_empty(),
+        "update_needed": false,
+        "app_shell": app_shell,
+        "current_version": current,
+        "version": display,
+        "client_version": client,
+        "build": crate::config::build_id(),
+    });
+    if !min_version.is_empty() {
+        out["minimum_version"] = serde_json::json!(min_version);
+        out["update_url"] = serde_json::json!(update_url);
+        out["release_notes"] = serde_json::json!(notes);
+        // Informational only for an app shell: it is not comparable to the APK's
+        // version, and the app updates itself.
+        out["update_needed"] = serde_json::json!(!app_shell && version_less(current, min_version));
+    }
+    out
+}
+
 async fn check_version() -> Value {
+    let client = crate::config::client_version();
+    let current = app_version();
     // The WordPress body is already cached by `cached_wp_json`; this extra memo is
     // for the DERIVED answer (version comparison), so it is keyed `version`.
     if let Some(hit) = crate::cache::get("version", "check") {
         let mut v = (*hit).clone();
-        // `client_version` describes THIS process, not the cached answer: stamp it
-        // on the way out so a cached body (TTL 1h) can never hide an APK update,
-        // and so a server that never got `--app-version` reports "" rather than a
-        // stale value from a previous run.
+        let min = v
+            .get("minimum_version")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Everything that describes THIS process is recomputed on the way out, so
+        // a cached body (TTL 1h) can never tell an app shell to update to the
+        // ENGINE minimum, hide a desktop update, or report another run's version.
         if let Some(obj) = v.as_object_mut() {
-            obj.insert(
-                "client_version".to_string(),
-                serde_json::json!(crate::config::client_version()),
-            );
+            let app_shell = !client.trim().is_empty();
+            obj.insert("client_version".to_string(), serde_json::json!(client));
             obj.insert(
                 "build".to_string(),
                 serde_json::json!(crate::config::build_id()),
+            );
+            obj.insert("app_shell".to_string(), serde_json::json!(app_shell));
+            obj.insert(
+                "current_version".to_string(),
+                serde_json::json!(current.clone()),
+            );
+            obj.insert(
+                "version".to_string(),
+                serde_json::json!(crate::config::clean_version(if app_shell {
+                    client.as_str()
+                } else {
+                    current.as_str()
+                })),
+            );
+            obj.insert(
+                "update_needed".to_string(),
+                serde_json::json!(!app_shell && !min.is_empty() && version_less(&current, &min)),
             );
         }
         return v;
     }
     let r = cached_wp_json(&wp_version_url(), 3600, 8).await;
-    let min_version = jstr(&r, "min_version");
-    // `client_version` is the APP shell that launched this engine (the Android
-    // APK's versionName). `current_version` stays the ENGINE version because the
-    // minimum-version gate is about the engine; the dashboard displays
-    // `client_version` when it exists so a new APK visibly changes the number.
-    let client_version = crate::config::client_version();
-    if min_version.is_empty() {
-        return serde_json::json!({
-            "ok": false,
-            "update_needed": false,
-            "current_version": app_version(),
-            // Clean X.Y.Z for the dashboard badge; `current_version` may be a
-            // git stamp (`2.8.9-4-g02e7dea`), which is not for humans.
-            "version": crate::config::descriptor_version(),
-            "client_version": client_version,
-            "build": crate::config::build_id(),
-        });
-    }
-    let current = app_version();
-    let data = serde_json::json!({
-        "ok": true,
-        "update_needed": version_less(&current, &min_version),
-        "current_version": current,
-        "version": crate::config::descriptor_version(),
-        "client_version": client_version,
-        "build": crate::config::build_id(),
-        "minimum_version": min_version,
-        "update_url": jstr(&r, "update_url"),
-        "release_notes": jstr(&r, "release_notes"),
-    });
+    let data = version_answer(
+        &client,
+        &current,
+        &jstr(&r, "min_version"),
+        &jstr(&r, "update_url"),
+        &jstr(&r, "release_notes"),
+    );
     crate::cache::put("version", "check", &data, 3600, 0);
     data
 }
@@ -4848,55 +5276,170 @@ mod tests {
         }
     }
 
+    fn catalog_rows() -> Vec<Value> {
+        pm_catalogs().as_array().cloned().unwrap_or_default()
+    }
+
+    fn row(ty: &str, id: &str) -> Value {
+        catalog_rows()
+            .into_iter()
+            .find(|c| c["type"] == ty && c["id"] == id)
+            .unwrap_or_else(|| panic!("no {ty} row {id}"))
+    }
+
     #[test]
-    fn catalog_row_gate_matches_php() {
-        let cats = pm_catalogs();
-        let movie = &cats[0];
-        // Fresh install: everything on.
+    fn catalog_gate_matches_the_php_remaps() {
+        // Fresh install: every row is advertised.
         let fresh = default_catalog_settings();
-        assert!(catalog_row_enabled(&fresh, movie));
-        // A media type switched off hides its rows.
+        for c in catalog_rows() {
+            assert!(
+                catalog_advertised(&fresh, &c),
+                "a fresh install must advertise {} {}",
+                c["type"],
+                c["id"]
+            );
+        }
+        // A media type switched off hides only its own rows.
         let mut no_movies = default_catalog_settings();
         no_movies["enabled_types"]["movie"] = serde_json::json!(false);
-        assert!(!catalog_row_enabled(&no_movies, movie));
-        // An explicit per-catalog `false` hides just that row; `true` and an
-        // absent key both keep it (the PHP's `!isset || !empty` rule).
+        assert!(!catalog_advertised(&no_movies, &row("movie", "top")));
+        assert!(catalog_advertised(&no_movies, &row("series", "top")));
+        // An explicit per-row `false` hides just that row; `true` and an absent
+        // key both keep it (the PHP's `!isset || !empty` rule).
         let mut hidden = default_catalog_settings();
-        hidden["enabled_catalogs"]["pm_movies"] = serde_json::json!(false);
-        assert!(!catalog_row_enabled(&hidden, movie));
+        hidden["enabled_catalogs"]["pm_movies_malay"] = serde_json::json!(false);
+        assert!(!catalog_advertised(&hidden, &row("movie", "pm_movies_malay")));
+        assert!(catalog_advertised(&hidden, &row("movie", "top")));
         let mut shown = default_catalog_settings();
-        shown["enabled_catalogs"]["pm_movies"] = serde_json::json!(true);
-        assert!(catalog_row_enabled(&shown, movie));
-        // The trending rows follow the same gate.
-        let trending = cats
-            .as_array()
-            .and_then(|a| a.iter().find(|c| c["id"] == TRENDING_MOVIE_CATALOG))
-            .cloned()
-            .expect("trending row");
-        let mut off = default_catalog_settings();
-        off["enabled_catalogs"][TRENDING_MOVIE_CATALOG] = serde_json::json!(false);
-        assert!(!catalog_row_enabled(&off, &trending));
+        shown["enabled_catalogs"]["pm_movies_malay"] = serde_json::json!(true);
+        assert!(catalog_advertised(&shown, &row("movie", "pm_movies_malay")));
+        // The series and Telegram-file `top` rows are gated by a DIFFERENT key
+        // than their own id (backend.php:15323-15327).
+        let mut series_top_off = default_catalog_settings();
+        series_top_off["enabled_catalogs"]["pm_series_top"] = serde_json::json!(false);
+        assert!(!catalog_advertised(&series_top_off, &row("series", "top")));
+        assert!(catalog_advertised(&series_top_off, &row("movie", "top")));
+        let mut files_off = default_catalog_settings();
+        files_off["enabled_catalogs"]["pm_files_year"] = serde_json::json!(false);
+        assert!(!catalog_advertised(&files_off, &row("other", "top")));
+        assert!(catalog_advertised(&files_off, &row("other", "pm_search_files")));
+        // One master toggle hides every `pm_topkw_*` row.
+        let topkw = catalog_row("other", "pm_topkw_0123456789", "Trending", &["skip"], &[]);
+        let mut kw_off = default_catalog_settings();
+        kw_off["enabled_catalogs"]["pm_trending_keywords"] = serde_json::json!(false);
+        assert!(!catalog_advertised(&kw_off, &topkw));
+        assert!(catalog_advertised(&default_catalog_settings(), &topkw));
+        // The port's trending rows follow their own id.
+        let mut trending_off = default_catalog_settings();
+        trending_off["enabled_catalogs"][TRENDING_MOVIE_CATALOG] = serde_json::json!(false);
+        assert!(!catalog_advertised(&trending_off, &row("movie", TRENDING_MOVIE_CATALOG)));
+        assert!(catalog_advertised(&trending_off, &row("series", TRENDING_SERIES_CATALOG)));
+    }
+
+    #[test]
+    fn descriptor_advertises_every_php_catalog_row() {
+        // The PHP's `$manifestCatalogs` (backend.php:15135-15292): anything
+        // missing here is a row every Stremio/Nuvio home screen loses.
+        for (ty, id) in [
+            ("movie", "top"),
+            ("movie", "year"),
+            ("movie", "pm_search_movie"),
+            ("series", "top"),
+            ("series", "pm_series_year"),
+            ("series", "pm_search_series"),
+            ("other", "top"),
+            ("other", "pm_files_year"),
+            ("other", "pm_search_files"),
+        ] {
+            row(ty, id); // panics when absent
+        }
+        for (id, _) in MOVIE_COUNTRY_CATALOGS {
+            assert_eq!(row("movie", id)["id"], *id, "movie country row {id}");
+        }
+        for (id, _) in SERIES_COUNTRY_CATALOGS {
+            assert_eq!(row("series", id)["id"], *id, "series country row {id}");
+        }
+        assert_eq!(catalog_rows().len(), 31, "13 movie + 13 series + 3 other + 2 trending");
+        // A row that needs a value says so, or the client never sends it.
+        assert_eq!(row("movie", "pm_search_movie")["extraRequired"][0], "search");
+        assert_eq!(row("movie", "year")["extraRequired"][0], "genre");
+        assert_eq!(row("series", "pm_search_series")["extraRequired"][0], "search");
+        assert_eq!(row("other", "pm_search_files")["extraRequired"][0], "search");
+        assert!(row("movie", "top").get("extraRequired").is_none());
+        // Never `genres`: Stremio caps the descriptor at ~49 KB and the genre
+        // values belong in the `genre` extra.
+        assert!(catalog_rows().iter().all(|c| c.get("genres").is_none()));
+        // The local rows alone must stay far below that cap (the PHP ships the
+        // full genre/year option lists and reached 50,842 B).
+        assert!(pm_catalogs().to_string().len() < 12_000, "local rows are small");
+    }
+
+    #[test]
+    fn keyword_catalog_ids_match_the_php_md5_prefix() {
+        // `substr(md5(strtolower($kw)), 0, 10)` — md5("abc") is the canonical
+        // vector 900150983cd24fb0d6963f7d28e17f72.
+        assert_eq!(topkw_id_suffix("abc"), "900150983c");
+        // Case-folded, exactly like the PHP.
+        assert_eq!(topkw_id_suffix("Malay"), topkw_id_suffix("malay"));
+        assert_eq!(ucwords("kudrat 1968 high council"), "Kudrat 1968 High Council");
+    }
+
+    #[test]
+    fn app_shell_never_gets_the_engine_minimum() {
+        // Desktop: the WordPress minimum still gates.
+        let desktop = version_answer("", "2.9.0-10-ge683767-dirty", "2.7.9", "http://telegra.my", "");
+        assert_eq!(desktop["app_shell"], false);
+        assert_eq!(desktop["update_needed"], false);
+        assert_eq!(desktop["version"], "2.9.0");
+        assert_eq!(desktop["ok"], true);
+        let older = version_answer("", "2.8.0", "2.9.0", "http://telegra.my", "");
+        assert_eq!(older["update_needed"], true);
+        // App shell: 1.0.55 < 2.7.9 numerically, but the minimum is informational
+        // (the APK has its own updater).
+        let android = version_answer("1.0.55", "1.0.55", "2.7.9", "http://telegra.my", "");
+        assert_eq!(android["app_shell"], true);
+        assert_eq!(android["update_needed"], false);
+        assert_eq!(android["version"], "1.0.55");
+        assert_eq!(android["client_version"], "1.0.55");
+        assert_eq!(android["minimum_version"], "2.7.9", "still reported");
+        // No maximum to compare against at all.
+        let no_min = version_answer("", "2.9.0", "", "", "");
+        assert_eq!(no_min["ok"], false);
+        assert_eq!(no_min["update_needed"], false);
     }
 
     #[test]
     fn descriptor_advertises_the_two_trending_rows() {
-        let cats = pm_catalogs();
-        let arr = cats.as_array().cloned().unwrap_or_default();
-        assert_eq!(arr.len(), 6, "4 base rows + 2 trending rows");
-        let find = |id: &str| arr.iter().find(|c| c["id"] == id).cloned();
-        let movies = find(TRENDING_MOVIE_CATALOG).expect("trending movies row");
-        assert_eq!(movies["type"], "movie");
+        let movies = row("movie", TRENDING_MOVIE_CATALOG);
         assert_eq!(movies["name"], "Trending Movies");
         assert_eq!(movies["extra"][0]["name"], "skip");
-        let series = find(TRENDING_SERIES_CATALOG).expect("trending series row");
-        assert_eq!(series["type"], "series");
+        let series = row("series", TRENDING_SERIES_CATALOG);
         assert_eq!(series["name"], "Trending Series");
         assert_eq!(series["extra"][0]["name"], "skip");
-        // Never `genres`: Stremio caps the descriptor at ~49 KB and the genre
-        // values belong in the `genre` extra (see pm_catalogs() docs).
-        assert!(arr.iter().all(|c| c.get("genres").is_none()));
-        // Two added rows must stay far below Stremio's descriptor cap.
-        assert!(cats.to_string().len() < 1_500, "local rows are small");
+    }
+
+    #[test]
+    fn home_country_row_comes_first_inside_its_type() {
+        let rows = pm_catalogs().as_array().cloned().unwrap_or_default();
+        let mut settings = default_catalog_settings();
+        settings["country"] = serde_json::json!("MY");
+        let sorted = prioritise_home_country(rows, &settings);
+        let first_movie = sorted.iter().find(|c| c["type"] == "movie").expect("a movie row");
+        let first_series = sorted.iter().find(|c| c["type"] == "series").expect("a series row");
+        assert_eq!(first_movie["id"], "pm_movies_malay");
+        assert_eq!(first_series["id"], "pm_series_malay");
+        // Types stay grouped movie → series → other, so a client's tab order holds.
+        let types: Vec<&str> = sorted
+            .iter()
+            .map(|c| c["type"].as_str().unwrap_or(""))
+            .collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for t in types {
+            if seen.last() != Some(&t) {
+                assert!(!seen.contains(&t), "{t} rows must stay contiguous");
+                seen.push(t);
+            }
+        }
     }
 
     #[test]

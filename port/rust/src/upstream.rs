@@ -970,6 +970,39 @@ mod tests {
     }
 
     #[test]
+    fn fit_descriptor_keeps_every_local_row_even_with_a_big_upstream() {
+        // The descriptor now advertises the PHP's full local set (29 rows + the
+        // port's 2 trending rows + up to 5 keyword rows = 36). An upstream burst
+        // must never eat into those, whatever the budget pressure.
+        let local: Vec<Value> = (0..36)
+            .map(|i| json!({"type": "movie", "id": format!("pm_{i}"), "name": "Row", "extra": [{"name": "skip"}]}))
+            .collect();
+        let bridged: Vec<Value> = (0..400)
+            .map(|i| {
+                json!({
+                    "type": "movie",
+                    "id": format!("up_0_cat{}", i),
+                    "name": "A very chatty upstream catalog name",
+                    "extra": [{"name": "genre", "options": ["a","b","c","d","e","f"]}]
+                })
+            })
+            .collect();
+        let mut all = local.clone();
+        all.extend(bridged);
+        let fitted = fit_descriptor(json!({"catalogs": all}), local.len());
+        let cats = fitted["catalogs"].as_array().unwrap();
+        assert_eq!(&cats[..36], &local[..], "every local row survives, in order");
+        assert!(serde_json::to_string(&fitted).unwrap().len() <= MANIFEST_DESCRIPTOR_BUDGET);
+        // When the LOCAL rows alone exceed the budget nothing is dropped either:
+        // a descriptor with no catalogs at all is worse than a large one.
+        let big: Vec<Value> = (0..40)
+            .map(|i| json!({"type": "movie", "id": format!("pm_{i}"), "name": "x".repeat(2000)}))
+            .collect();
+        let fitted = fit_descriptor(json!({"catalogs": big.clone()}), big.len());
+        assert_eq!(fitted["catalogs"].as_array().unwrap().len(), 40);
+    }
+
+    #[test]
     fn default_manifests_are_the_php_defaults() {
         let m = default_manifests();
         let list = m.as_array().unwrap();

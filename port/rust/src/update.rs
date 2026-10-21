@@ -81,20 +81,30 @@ async fn latest_release() -> Value {
     }
 }
 
+/// True when this binary lives INSIDE an app shell that ships its own updater.
+///
+/// On Android the binary is unpacked from the APK, and the APK updates itself from
+/// the `apk-server-latest` feed, so a desktop release is not something this process
+/// may install. The same is true of ANY build started with `--app-version` (the app
+/// shell told us its own product version), which is why the check is not Android-only:
+/// a desktop-format release downloaded over an app install would replace a working
+/// binary with an incompatible one.
+fn app_managed_for(client: &str) -> bool {
+    cfg!(target_os = "android") || !client.trim().is_empty()
+}
+
 /// `GET /api/update/check` — never downloads anything.
 pub async fn check() -> Value {
     let current = config::app_version();
-    // On Android this binary is INSIDE the APK, so a newer server release is not
-    // something this process can install — offering it would show "Update
-    // available" on the dashboard forever, with an "Update now" that cannot work.
-    // The APK has its own updater (`UpdateChecker` in the app shell).
-    if cfg!(target_os = "android") {
+    let client = config::client_version();
+    if app_managed_for(&client) {
         return serde_json::json!({
             "ok": false,
             "app_managed": true,
             "current": current,
+            "client": client,
             "build": config::build_id(),
-            "error": "Updates are handled by the PencariMovie Server app on Android.",
+            "error": "Updates are handled by the PencariMovie Server app that runs this engine.",
         });
     }
     let release = latest_release().await;
@@ -156,6 +166,17 @@ fn apply_script() -> std::path::PathBuf {
 /// the apply script detached. Returns as soon as the script is started; the
 /// server stops a moment later, so the caller may lose the connection.
 pub async fn apply() -> Value {
+    // Belt and braces: an app-managed build must never download a DESKTOP tarball,
+    // even if a future caller reaches `apply()` without going through `check()`.
+    let client = config::client_version();
+    if app_managed_for(&client) {
+        return serde_json::json!({
+            "ok": false,
+            "app_managed": true,
+            "current": config::app_version(),
+            "error": "This engine runs inside an app that updates itself. Use the app's own update banner.",
+        });
+    }
     let info = check().await;
     if info.get("ok").and_then(|v| v.as_bool()) != Some(true) {
         return info;
@@ -264,6 +285,15 @@ mod tests {
         assert!(is_newer("v2.8.9", "2.8.8-5-gabc"));
         assert!(!is_newer("v2.8.8", "2.8.8-5-gabc"));
         assert!(!is_newer("v2.7.9", "2.8.0"));
+    }
+
+    #[test]
+    fn an_app_shell_is_never_offered_a_desktop_artifact() {
+        // `--app-version` means an app shell owns the update path, so the desktop
+        // GitHub feed must be refused (the APK updates from `apk-server-latest`).
+        assert!(app_managed_for("1.0.55"));
+        assert!(app_managed_for(" 1.0.55 "));
+        assert_eq!(app_managed_for(""), cfg!(target_os = "android"));
     }
 
     #[test]

@@ -5517,7 +5517,13 @@ class PencariMovieApp {
             this.sponsor = null;
           }
         }
-        if (data && data.update_needed) {
+        // An APP SHELL (the Android APK) reports `app_shell: true`: the engine's
+        // WordPress `minimum_version` is a minimum for the PHP ENGINE lineage
+        // (2.7.9), which is always "newer" than the APK's own version (1.0.55), and
+        // the app updates itself from its `apk-server-latest` feed (the banner in
+        // MainActivity.checkForAppUpdate). Neither notice may fire here.
+        const appShell = !!(data && data.app_shell === true);
+        if (data && data.update_needed && !appShell) {
           // A NOTIFICATION, not a wall: the server no longer refuses requests from
           // an older build, so show what is available in #settings / #addon.
           this.renderUpdateNotice({
@@ -5525,6 +5531,10 @@ class PencariMovieApp {
             latest: this._plainVersion(data.minimum_version),
             url: data.update_url
           });
+          return null;
+        }
+        if (appShell) {
+          // The desktop release feed is not this build's feed.
           return null;
         }
         // Desktop builds also read their own release feed (silent, best effort).
