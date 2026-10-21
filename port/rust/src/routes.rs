@@ -1398,7 +1398,7 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     /* ── /api/resolve-shortcode, /api/warmup-resolve ──────────────────────── */
     // GET **and** POST (`$_REQUEST` in the PHP, backend.php:19313), and the plural
     // `short_codes` batch form the dashboard uses to pre-warm a search page
-    // ([`public/app.js:5064`](public/app.js)). The batch branch must come first.
+    // (public/app.js:5064). The batch branch must come first.
     if p == "/api/resolve-shortcode" && (m == "GET" || m == "POST") {
         let body: Value = if m == "POST" {
             serde_json::from_str(&body_text).unwrap_or(Value::Null)
