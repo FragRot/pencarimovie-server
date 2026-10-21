@@ -1051,7 +1051,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
 
         let mut skip = start.saturating_sub(aligned) as usize;
         let mut remaining = total;
-        let mut primed = first_buf;
+        let primed = first_buf;
 
         // Emit the primed head BEFORE planning: it is the bytes that were pulled
         // while the headers were being written, and the player can start on them
@@ -1130,7 +1130,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             let Some((index, result)) = stream.next().await else {
                 break;
             };
-            let mut data = match result {
+            let data = match result {
                 Ok(d) => d,
                 Err(e) => {
                         log(

@@ -1,7 +1,7 @@
 //! Constants lifted from backend.php:172-260 so every module uses the same
 //! values as the PHP runtime (same defaults, same paths, same strings).
 
-use crate::storage::{app_root, env, env_or};
+use crate::storage::{env, env_or};
 
 pub fn wp_api_base() -> String {
     env_or(

@@ -159,6 +159,15 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     let p = ctx.path.clone();
     let m = method.clone();
 
+    /* ── legacy `/stremio` alias → 301 `/nuvio` (backend.php:14688) ───────── */
+    // Only the BARE path: `/stremio/manifest.json` and every other addon route
+    // stay aliased to their `/nuvio` equivalent below.
+    if p == "/stremio" || p == "/stremio/" {
+        let mut resp = redirect("/nuvio");
+        *resp.status_mut() = StatusCode::MOVED_PERMANENTLY;
+        return resp;
+    }
+
     /* ── /api/sub-proxy — subtitle fetch + SRT→VTT (backend.php:18321) ────── */
     if p == "/api/sub-proxy" && m == "GET" {
         let sub_url = ctx.qs("url");
@@ -1290,7 +1299,9 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         addon_path = "/manifest.json".to_string();
     }
     if addon_path == "/manifest.json" {
-        return stremio_json(200, &manifest(&ctx.base_url).await, "no-store");
+        // `ETag` + `max-age=1800, stale-while-revalidate=3600`, 304 on a matching
+        // `If-None-Match` — the PHP's descriptor response (backend.php:15468-15488).
+        return manifest_response(&ctx, &manifest(&ctx).await);
     }
 
     /* ── /stream ──────────────────────────────────────────────────────────── */
@@ -1324,24 +1335,39 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             return eclipse_locked_response(&ctx.base_url);
         }
         if p == "/eclipse" || p == "/eclipse/manifest.json" {
+            // backend.php:14315-14346 verbatim: same id, name, description,
+            // `types`, the `latest` catalog row and the `quality` setting.
+            // Eclipse Music renders its catalog list and Settings sheet straight
+            // from this descriptor, so an empty `catalogs`/`settings` made the
+            // addon look installed-but-broken. The icon stays the SHIPPED logo
+            // (the PHP points at a WordPress upload; operator choice here is to
+            // never depend on that host).
             return stremio_json(
                 200,
                 &serde_json::json!({
-                    "id": "org.pencarimovie.eclipse",
-                    "name": "PencariMovie",
+                    "id": "org.pencarimovie.eclipsemusic",
+                    "name": "PencariMusic",
                     "version": "1.0.0",
-                    "description": "PencariMovie music addon",
-                    "icon": format!("{}/logo.png", rtrim(&ctx.base_url)),
-                    "contentType": "music",
+                    "description": "Stream Telegram music and audio files via PencariMovie Server",
                     "resources": ["search", "stream", "catalog"],
-                    "types": ["track"],
-                    // The rows the dashboard and Stremio/Nuvio browse. Kept small on purpose
-                    // (Stremio rejects a descriptor over ~49 KB) and with no `genres` array —
-                    // genre values live in the `genre` extra, exactly like cinemeta.
-                    "catalogs": [],
-                    "settings": [],
+                    "types": ["track", "album", "artist"],
+                    "contentType": "music",
+                    "icon": format!("{}/logo.png", rtrim(&ctx.base_url)),
+                    "catalogs": [
+                        {"id": "latest", "type": "track", "name": "Latest Telegram Tracks"}
+                    ],
+                    "settings": [{
+                        "key": "quality",
+                        "type": "select",
+                        "label": "Audio quality",
+                        "default": "high",
+                        "options": [
+                            {"value": "high", "label": "Original / High Quality"},
+                            {"value": "normal", "label": "Normal Quality"}
+                        ]
+                    }]
                 }),
-                "no-store",
+                "max-age=3600",
             );
         }
         if p.starts_with("/eclipse/search") {
@@ -1370,14 +1396,63 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
     }
 
     /* ── /api/resolve-shortcode, /api/warmup-resolve ──────────────────────── */
-    if p == "/api/resolve-shortcode" && m == "GET" {
-        let short_code = {
-            let a = ctx.qs("short_code");
-            if a.is_empty() { ctx.qs("sc") } else { a }
+    // GET **and** POST (`$_REQUEST` in the PHP, backend.php:19313), and the plural
+    // `short_codes` batch form the dashboard uses to pre-warm a search page
+    // ([`public/app.js:5064`](public/app.js)). The batch branch must come first.
+    if p == "/api/resolve-shortcode" && (m == "GET" || m == "POST") {
+        let body: Value = if m == "POST" {
+            serde_json::from_str(&body_text).unwrap_or(Value::Null)
+        } else {
+            Value::Null
         };
-        let bot_id = ctx.qs("bot_id");
+        // PHP's `$_REQUEST`: the query string wins, then the JSON/form body.
+        let field = |name: &str| -> String {
+            let q = ctx.qs(name);
+            if !q.is_empty() {
+                return q.trim().to_string();
+            }
+            body.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let raw_codes = field("short_codes");
+        let bot_id = field("bot_id");
+        // ── batch mode (backend.php:19327-19331) ──────────────────────────
+        if !raw_codes.is_empty() {
+            let codes: Vec<String> = raw_codes
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let result = warmup_resolve_batch(&codes, &bot_id).await;
+            return json_response(
+                200,
+                &serde_json::json!({
+                    "ok": 1,
+                    "total": result.total,
+                    "resolved": result.resolved,
+                    "failed": result.failed,
+                    "failed_codes": result.failed_codes,
+                    "results": result.results,
+                    "bot_id": result.bot_id,
+                }),
+            );
+        }
+        let short_code = {
+            let a = field("short_code");
+            if a.is_empty() {
+                field("sc")
+            } else {
+                a
+            }
+        };
         if short_code.is_empty() {
-            return json_response(400, &serde_json::json!({"ok": 0, "message": "short_code is required."}));
+            return json_response(
+                400,
+                &serde_json::json!({"ok": 0, "message": "short_code or short_codes is required."}),
+            );
         }
         let mut resolved = if bot_id.is_empty() {
             resolve_shortcode_concurrent(&short_code, &[]).await
@@ -1390,14 +1465,15 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             !a.is_empty() || !b.is_empty()
         };
         if !has_id {
-            let message = {
-                let m = jstr(&resolved, "message");
-                if m.is_empty() { "File could not be resolved.".to_string() } else { m }
-            };
-            return json_response(
-                404,
-                &serde_json::json!({"ok": 0, "message": message, "short_code": short_code}),
-            );
+            // The PHP answers the resolver's own body with HTTP 200
+            // (backend.php:19341-19344), so the dashboard can show `message`
+            // instead of failing on an HTTP error.
+            if resolved.get("ok").is_none() {
+                if let Some(obj) = resolved.as_object_mut() {
+                    obj.insert("ok".into(), serde_json::json!(0));
+                }
+            }
+            return json_response(200, &resolved);
         }
         // A batch-warmed cache row can lack file_size/title/mime. Enrich it with
         // a single resolve so the download payload is complete.
@@ -4241,33 +4317,134 @@ async fn build_trending_row(item_type: &str, skip: usize) -> Vec<Value> {
     page
 }
 
-/// Resolution / source / codec pills for a Telegram file name
-/// (backend.php:15793-15803). The PHP also matches a bare `\bhd\b` / `\bsd\b`;
-/// those are dropped here because they fire on ordinary words inside a name.
+/// The `\b`-bounded patterns the PHP uses for pill detection
+/// (backend.php:15793-15801 catalog rows, 16129-16143 direct-file meta).
+///
+/// The boundary is load-bearing: the PHP matches a bare `\bhd\b` / `\bsd\b`, so
+/// `Movie.720p.HD.mkv` gets a resolution pill while `HDU` does not. This port
+/// used plain `contains()` and dropped `hd`/`sd` altogether, which lost the pill
+/// on every `…HD…` release. Compiled once (a per-file compile would dominate a
+/// 100-item catalog).
+struct PillRes {
+    p4k: fancy_regex::Regex,
+    p1080: fancy_regex::Regex,
+    p720: fancy_regex::Regex,
+    psd: fancy_regex::Regex,
+    pblu: fancy_regex::Regex,
+    pweb: fancy_regex::Regex,
+    phdtv: fancy_regex::Regex,
+    phdr: fancy_regex::Regex,
+    phevc: fancy_regex::Regex,
+    pavc: fancy_regex::Regex,
+}
+
+static PILL_RES: std::sync::LazyLock<PillRes> = std::sync::LazyLock::new(|| PillRes {
+    p4k: fancy_regex::Regex::new(r"(?i)\b(2160p|4k|uhd)\b").unwrap(),
+    p1080: fancy_regex::Regex::new(r"(?i)\b(1080p|fhd)\b").unwrap(),
+    p720: fancy_regex::Regex::new(r"(?i)\b(720p|hd)\b").unwrap(),
+    psd: fancy_regex::Regex::new(r"(?i)\b(480p|360p|sd)\b").unwrap(),
+    pblu: fancy_regex::Regex::new(r"(?i)\b(bluray|blu-ray|remux)\b").unwrap(),
+    pweb: fancy_regex::Regex::new(r"(?i)\b(web-?dl|webrip)\b").unwrap(),
+    phdtv: fancy_regex::Regex::new(r"(?i)\b(hdtv|tvrip)\b").unwrap(),
+    phdr: fancy_regex::Regex::new(r"(?i)\b(hdr10\+|hdr10|hdr|dolby\s*vision|dovi|dv)\b").unwrap(),
+    phevc: fancy_regex::Regex::new(r"(?i)\b(hevc|x265|h265)\b").unwrap(),
+    pavc: fancy_regex::Regex::new(r"(?i)\b(avc|x264|h264)\b").unwrap(),
+});
+
+fn pill_hit(re: &fancy_regex::Regex, text: &str) -> bool {
+    re.is_match(text).unwrap_or(false)
+}
+
+/// Resolution / source / codec pills for a Telegram-FILE catalog row
+/// (backend.php:15793-15803).
 fn file_pills(title: &str, size: u64) -> Vec<String> {
-    let t = title.to_lowercase();
+    let r = &*PILL_RES;
     let mut pills: Vec<String> = Vec::new();
-    if t.contains("2160p") || t.contains("4k") || t.contains("uhd") {
+    if pill_hit(&r.p4k, title) {
         pills.push("4K".to_string());
-    } else if t.contains("1080p") || t.contains("fhd") {
+    } else if pill_hit(&r.p1080, title) {
         pills.push("1080p".to_string());
-    } else if t.contains("720p") {
+    } else if pill_hit(&r.p720, title) {
         pills.push("720p".to_string());
-    } else if t.contains("480p") || t.contains("360p") {
+    } else if pill_hit(&r.psd, title) {
         pills.push("SD".to_string());
     }
-    if t.contains("bluray") || t.contains("blu-ray") || t.contains("remux") {
+    if pill_hit(&r.pblu, title) {
         pills.push("BluRay".to_string());
-    } else if t.contains("web-dl") || t.contains("webdl") || t.contains("webrip") {
+    } else if pill_hit(&r.pweb, title) {
         pills.push("WEB-DL".to_string());
     }
-    if t.contains("hevc") || t.contains("x265") || t.contains("h265") {
+    if pill_hit(&r.phevc, title) {
         pills.push("HEVC".to_string());
     }
     if size > 0 {
         pills.push(format_bytes(size));
     }
     pills
+}
+
+/// The direct-file META's pills (backend.php:16129-16143). These differ from the
+/// catalog row's on purpose: `4K UHD`, `HDTV`, `HDR` and `AVC` are extra, and the
+/// caller joins them with `  •  `.
+fn file_meta_pills(title: &str, size: u64) -> Vec<String> {
+    let r = &*PILL_RES;
+    let mut pills: Vec<String> = Vec::new();
+    if pill_hit(&r.p4k, title) {
+        pills.push("4K UHD".to_string());
+    } else if pill_hit(&r.p1080, title) {
+        pills.push("1080p".to_string());
+    } else if pill_hit(&r.p720, title) {
+        pills.push("720p".to_string());
+    } else if pill_hit(&r.psd, title) {
+        pills.push("SD".to_string());
+    }
+    if pill_hit(&r.pblu, title) {
+        pills.push("BluRay".to_string());
+    } else if pill_hit(&r.pweb, title) {
+        pills.push("WEB-DL".to_string());
+    } else if pill_hit(&r.phdtv, title) {
+        pills.push("HDTV".to_string());
+    }
+    if pill_hit(&r.phdr, title) {
+        pills.push("HDR".to_string());
+    }
+    if pill_hit(&r.phevc, title) {
+        pills.push("HEVC".to_string());
+    } else if pill_hit(&r.pavc, title) {
+        pills.push("AVC".to_string());
+    }
+    if size > 0 {
+        pills.push(format_bytes(size));
+    }
+    pills
+}
+
+/// `date('Y-m-d\TH:i:s\Z')` in UTC, without a date crate.
+fn iso_now() -> String {
+    let secs = crate::storage::now();
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    if m <= 2 {
+        y += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 /// `other/*` and `pm_topkw_*` rows: the origin's newest / keyword FILE lists,
@@ -4304,29 +4481,28 @@ async fn file_catalog_metas(
     let files = crate::wp_data::search_files_at(&term, limit, skip).await;
     let mut metas: Vec<Value> = Vec::new();
     for f in &files {
-        let title = clean_post_title(&f.title);
-        if title.is_empty() {
-            continue;
-        }
+        // The PHP's file title is the raw name with HTML entities decoded
+        // (backend.php:15788), NOT `fd_clean_post_title()` — that would strip a
+        // trailing "• Movie" from a real filename and collapse its spacing.
+        let decoded = crate::matcher::decode_html_entities(f.title.trim());
+        let title = if decoded.is_empty() {
+            "Telegram File".to_string()
+        } else {
+            decoded
+        };
         let pills = file_pills(&title, f.file_size);
-        // On a file row the `genre` extra is a QUALITY pill (4K/1080p/BluRay/HEVC).
-        if !genre.is_empty() && !pills.iter().any(|p| p.eq_ignore_ascii_case(genre.trim())) {
-            continue;
-        }
-        if !year.is_empty() && !title.contains(year.trim()) {
-            continue;
-        }
         let pill_line = if pills.is_empty() {
             "Ready to stream".to_string()
         } else {
             pills.join(" · ")
         };
+        // `$primaryLabel` (backend.php:15806): 'Year' on the year rows,
+        // 'Trending File' on EVERY other Telegram-Files row — including
+        // `other/top` and `pm_search_files`.
         let primary = if cat_id == "pm_files_year" || cat_id == "pm_files_latest" {
             "Year"
-        } else if cat_id.starts_with("pm_topkw_") {
-            "Trending File"
         } else {
-            "Telegram File"
+            "Trending File"
         };
         let mut genres: Vec<String> = vec![primary.to_string()];
         for p in &pills {
@@ -4334,13 +4510,30 @@ async fn file_catalog_metas(
                 genres.push(p.clone());
             }
         }
+        // On a file row the `genre` extra is a QUALITY pill; the PHP compares it
+        // EXACTLY against the genre list it just built (backend.php:15810).
+        if !genre.is_empty() && !genres.iter().any(|g| g == genre.trim()) {
+            continue;
+        }
+        if !year.is_empty() && !title.contains(year.trim()) {
+            continue;
+        }
+        // `{$descriptionPrefix} · {$pillLine}\n\n{$fTitle}` (backend.php:15819-15831),
+        // with the PHP's calendar/lightning glyphs dropped: plain text labels.
+        let prefix = if cat_id == "pm_files_year" || cat_id == "pm_files_latest" {
+            "File"
+        } else if cat_id.starts_with("pm_topkw_") {
+            "Trending File"
+        } else {
+            "Direct Telegram File"
+        };
         metas.push(serde_json::json!({
             "id": format!("pm_file_{}", f.short_code),
             "type": "other",
             "name": title,
             "poster": f.thumbnail,
             "posterShape": "poster",
-            "description": format!("{}\n\n{}", pill_line, title),
+            "description": format!("{} · {}\n\n{}", prefix, pill_line, title),
             "genres": genres,
         }));
     }
@@ -4424,11 +4617,33 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
         }
     }
     // ── Telegram-FILE rows (`other/*`, `pm_topkw_*`) ───────────────────────
-    // backend.php:15750-15850: these catalogs list FILES (`search-files`), never
-    // posts. The generic path below would answer POSTS for `other`, which is why
-    // the "Telegram Files" row used to show movie posts instead of files.
+    // backend.php:15750-15850: these catalogs list FILES (`search-files`). With a
+    // SEARCH query the PHP also lists matching POSTS first
+    // (backend.php:15615-15656), except on `pm_search_files`, which it resets to
+    // files only (backend.php:15662).
     if item_type == "other" || cat_id.starts_with("pm_topkw_") {
-        let metas = file_catalog_metas(&cat_id, &search, &genre, &year, skip).await;
+        let mut metas: Vec<Value> = Vec::new();
+        if item_type == "other" && !search.is_empty() && cat_id != "pm_search_files" {
+            let params = vec![
+                ("search".to_string(), search.clone()),
+                ("limit".to_string(), "30".to_string()),
+                ("offset".to_string(), skip.to_string()),
+            ];
+            for post in crate::wp_data::search_posts(&params).await {
+                if post_id(&post).is_empty() {
+                    continue;
+                }
+                if !year.is_empty() {
+                    let ry = post_release_year(&post);
+                    if !ry.is_empty() && ry != year {
+                        continue;
+                    }
+                }
+                let ptype = if post_is_series(&post) { "series" } else { "movie" };
+                metas.push(meta_from_post(&post, ptype));
+            }
+        }
+        metas.extend(file_catalog_metas(&cat_id, &search, &genre, &year, skip).await);
         let body = serde_json::json!({"metas": metas});
         if body
             .get("metas")
@@ -4436,7 +4651,10 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
             .map(|a| !a.is_empty())
             .unwrap_or(false)
         {
-            crate::cache::put("catalog", &cat_key, &body, 600, 0);
+            // A SEARCH result is cached for 300 s, a browse row for 600 s — the
+            // PHP's own windows (backend.php:15586 / 15595).
+            let ttl = if search.is_empty() { 600 } else { 300 };
+            crate::cache::put("catalog", &cat_key, &body, ttl, 0);
         }
         log(
             "file catalog built",
@@ -4543,14 +4761,19 @@ async fn handle_catalog(ctx: &ReqCtx, path: &str) -> Response {
     }
     let body = serde_json::json!({"metas": metas});
     if body.get("metas").and_then(|m| m.as_array()).map(|a| !a.is_empty()).unwrap_or(false) {
-        crate::cache::put("catalog", &cat_key, &body, 600, 0);
+        // The PHP caches a SEARCH result for 300 s and a browse row for 600 s
+        // (backend.php:15586 / 15595).
+        let ttl = if search.is_empty() { 600 } else { 300 };
+        crate::cache::put("catalog", &cat_key, &body, ttl, 0);
     }
     stremio_json(200, &body, "no-store")
 }
 
-async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
+async fn handle_meta(_ctx: &ReqCtx, path: &str) -> Response {
     let Some((item_type, id, _)) = split_addon(path, "/meta/") else {
-        return stremio_json(200, &serde_json::json!({"meta": Value::Null}), "no-store");
+        // A malformed `/meta/…` path: the PHP's route regex does not match it
+        // either, so it never reaches the meta builder.
+        return not_found_json();
     };
     // A catalog post: details, plus a `videos` list for a series (one entry per
     // distinct S/E that the post's own files carry).
@@ -4580,17 +4803,39 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
                     &f.caption,
                 );
                 if e > 0 && seen.insert((s, e)) {
+                    // The PHP's episode label is `S{s}E{e}` with NO zero padding,
+                    // and each entry carries `number`, `released` and `thumbnail`
+                    // (backend.php:16325-16336).
+                    let thumb = if f.thumbnail.is_empty() {
+                        meta["poster"].clone()
+                    } else {
+                        serde_json::json!(f.thumbnail)
+                    };
                     videos.push(serde_json::json!({
                         "id": format!("{}:{}:{}", id, s, e),
+                        "name": format!("S{}E{}", s, e),
                         "season": s,
                         "episode": e,
-                        "name": format!("S{:02}E{:02}", s, e),
+                        "number": e,
+                        "released": iso_now(),
+                        "thumbnail": thumb,
                     }));
                 }
             }
-            if !videos.is_empty() {
-                meta["videos"] = serde_json::json!(videos);
+            // A series with no resolvable episode still needs ONE entry, or
+            // Stremio refuses the meta entirely (backend.php:16357-16368).
+            if videos.is_empty() {
+                videos.push(serde_json::json!({
+                    "id": format!("{}:1:1", id),
+                    "name": "Episode 1",
+                    "season": 1,
+                    "episode": 1,
+                    "number": 1,
+                    "released": iso_now(),
+                    "thumbnail": meta["poster"].clone(),
+                }));
             }
+            meta["videos"] = serde_json::json!(videos);
         } else {
             // Kotlin `buildAndCachePostMeta()` warms the post's file set as it builds a
             // MOVIE meta (line 7503). A series already reads its files above, so this
@@ -4598,37 +4843,110 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
             // cold origin fetch.
             prefetch_post_files(pid);
         }
+        // The PHP echoes the id the CLIENT asked with (backend.php:16375) and
+        // always sends `background` plus `year` alongside `releaseInfo`.
+        meta["id"] = serde_json::json!(id);
+        meta["background"] = meta["poster"].clone();
+        if let Some(y) = meta.get("releaseInfo").cloned() {
+            meta["year"] = y;
+        }
         return stremio_json(200, &serde_json::json!({"meta": meta}), "no-store");
     }
-    // A direct Telegram file: resolve the display title.
-    if let Some(code) = id.strip_prefix("pm:file:") {
-        let bot = get_bot_id();
-        let resolved = if bot.is_empty() {
-            resolve_shortcode_concurrent(code, &[]).await
-        } else {
-            resolve_shortcode(code, &bot, false).await
-        };
-        let title = {
-            let t = jstr(&resolved, "title");
-            if t.is_empty() {
-                jstr(&resolved, "file_name")
+    // ── direct Telegram file (`pm_file_`, `pm:file_`, `pm:file:`) ──────────
+    // backend.php:16073-16165. The Telegram-Files catalog rows emit
+    // `pm_file_<code>`, so this is the path EVERY one of those items takes; the
+    // previous `pm:file:`-only branch left them with a null meta — a blank info
+    // page with no poster, description or Play button.
+    if let Some(code) = id
+        .strip_prefix("pm_file_")
+        .or_else(|| id.strip_prefix("pm:file_"))
+        .or_else(|| id.strip_prefix("pm:file:"))
+    {
+        let code = code.to_string();
+        let cache_key = format!("file_{}", code);
+        // The PHP pre-seeds and re-reads this for an hour (backend.php:16083).
+        if let Some(hit) = crate::cache::get("meta", &cache_key) {
+            if hit.get("meta").map(|m| !m.is_null()).unwrap_or(false) {
+                return stremio_json(200, &hit, "max-age=3600, public");
+            }
+        }
+        let mut title = String::new();
+        let mut thumb = String::new();
+        let mut size: u64 = 0;
+        // 1. `search_files` answers an exact short_code lookup; the PHP also
+        // accepts a single-result response (backend.php:16100-16109).
+        let hits = crate::wp_data::search_files(&code, 1).await;
+        if let Some(f) = hits.iter().find(|f| f.short_code == code).or_else(|| {
+            if hits.len() == 1 {
+                hits.first()
             } else {
-                t
+                None
+            }
+        }) {
+            title = f.title.trim().to_string();
+            thumb = f.thumbnail.clone();
+            size = f.file_size;
+        }
+        // 2. Missing metadata or thumbnail → a full resolve (backend.php:16113).
+        if title.is_empty() || thumb.is_empty() || size == 0 {
+            let bot = get_bot_id();
+            let res = if bot.is_empty() {
+                resolve_shortcode_concurrent(&code, &[]).await
+            } else {
+                resolve_shortcode(&code, &bot, false).await
+            };
+            if title.is_empty() {
+                title = jstr(&res, "title");
+                if title.is_empty() {
+                    title = jstr(&res, "file_name");
+                }
+            }
+            if thumb.is_empty() {
+                thumb = jstr(&res, "thumbnail_url");
+            }
+            if size == 0 {
+                size = res.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0);
+            }
+        }
+        // A direct file is NEVER null: the PHP falls back to `File <code>`
+        // (backend.php:16121-16123), because a null meta hides the Play button.
+        if title.trim().is_empty() {
+            title = format!("File {}", code);
+        }
+        let clean = {
+            let c = crate::matcher::clean_media_title(&title);
+            if c.is_empty() {
+                title.clone()
+            } else {
+                c
             }
         };
-        if title.is_empty() {
-            return stremio_json(200, &serde_json::json!({"meta": Value::Null}), "no-store");
+        let pills = file_meta_pills(&title, size);
+        let pill_line = if pills.is_empty() {
+            "Ready to stream".to_string()
+        } else {
+            pills.join("  •  ")
+        };
+        let mut genres: Vec<String> = vec!["Direct Telegram File".to_string()];
+        for p in &pills {
+            if !genres.iter().any(|g| g == p) {
+                genres.push(p.clone());
+            }
         }
-        return stremio_json(
-            200,
-            &serde_json::json!({"meta": {
-                "id": id,
-                "type": if item_type == "series" { "series" } else { "movie" },
-                "name": clean_post_title(&title),
-                "posterShape": "poster",
-            }}),
-            "no-store",
-        );
+        let body = serde_json::json!({"meta": {
+            "id": id,
+            // The PHP keeps the requested type, defaulting to `other`.
+            "type": if item_type.is_empty() { "other".to_string() } else { item_type.clone() },
+            "name": clean,
+            "poster": thumb.clone(),
+            "posterShape": "poster",
+            "background": thumb.clone(),
+            "logo": thumb,
+            "description": format!("Direct Telegram Cloud File\n{}\n\nFile: {}", pill_line, clean),
+            "genres": genres,
+        }});
+        crate::cache::put("meta", &cache_key, &body, 3600, 0);
+        return stremio_json(200, &body, "max-age=600, public");
     }
     // ── meta bridge (backend.php:16410-16455) ─────────────────────────────
     // An id that is NOT ours (`tt…`, `tmdb:…`, `tvdb:…`, …) is forwarded to the
@@ -4640,7 +4958,58 @@ async fn handle_meta(ctx: &ReqCtx, path: &str) -> Response {
     if let Some(body) = upstream::forward_meta(&settings, &item_type, &id).await {
         return stremio_json(200, &body, "max-age=3600, public");
     }
-    stremio_json(200, &serde_json::json!({"meta": Value::Null}), "no-store")
+    // ── local `media_ids_idx` fallback (backend.php:16456-16478) ───────────
+    // An upstream miss must not cost the Play button when this server already
+    // knows the title. The PHP's prefix parse is `^([A-Za-z0-9_-]+):([^:]+)`,
+    // so `tmdb:123` becomes (tmdb, 123) while a bare `tt0944947` stays
+    // (tt, tt0944947) — reproduced exactly, including its behaviour on a
+    // `tt…:S:E` id (prefix = the id, value = the season), which finds nothing.
+    let (prefix, value) = {
+        let mut it = id.splitn(2, ':');
+        let head = it.next().unwrap_or("");
+        let rest = it.next().unwrap_or("");
+        let valid_head = !head.is_empty()
+            && head
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !rest.is_empty() && valid_head {
+            (
+                head.to_ascii_lowercase(),
+                rest.split(':').next().unwrap_or("").to_string(),
+            )
+        } else {
+            ("tt".to_string(), id.clone())
+        }
+    };
+    let mut local = crate::wp_data::lookup_id(&prefix, &value).await;
+    if jstr(&local, "title").is_empty() && (prefix == "tt" || prefix == "imdb") {
+        let alt = if prefix == "tt" { "imdb" } else { "tt" };
+        let second = crate::wp_data::lookup_id(alt, &value).await;
+        if !jstr(&second, "title").is_empty() {
+            local = second;
+        }
+    }
+    let local_title = jstr(&local, "title");
+    if !local_title.is_empty() {
+        let year = jstr(&local, "year");
+        let body = serde_json::json!({"meta": {
+            "id": id,
+            "type": item_type,
+            "name": local_title,
+            "year": year,
+            "releaseInfo": year,
+            "posterShape": "poster",
+        }});
+        return stremio_json(200, &body, "max-age=3600, public");
+    }
+    // `{"meta": null}` with HTTP 404 — the PHP's last line
+    // (backend.php:16485). A 200 here makes Stremio treat the item as existing
+    // and render an empty page instead of falling back.
+    stremio_json(
+        404,
+        &serde_json::json!({"meta": Value::Null}),
+        "no-cache, no-store, must-revalidate",
+    )
 }
 
 /// Movies > Country catalogs, exactly the PHP's ids, names and order
@@ -4686,25 +5055,107 @@ const COUNTRY_CATALOG_MAP: &[(&str, &str, &str)] = &[
     ("ph", "pm_movies_philippines", "pm_series_philippines"),
 ];
 
-/// One descriptor catalog row. `extra` entries keep `name`/`isRequired` and the
-/// legacy `extraSupported` / `extraRequired` arrays the PHP also emits.
+/// `$allGenreOptions` (backend.php:15035-15059) — the genre filter dropdown.
 ///
-/// Deliberately NO `options` arrays and NO `genres`: the PHP ships the full genre
-/// and year option lists on every country row, which is how its descriptor reached
-/// 50,842 B — over Stremio's ~49 KB cap (`code 20004`). The values still work as a
-/// plain `genre`/`year` value in the extra path.
-fn catalog_row(ty: &str, id: &str, name: &str, extras: &[&str], required: &[&str]) -> Value {
-    let extra: Vec<Value> = extras
-        .iter()
-        .map(|n| serde_json::json!({"name": n, "isRequired": required.contains(n)}))
-        .collect();
+/// These are NOT a `genres` key on the catalog: the PHP emits them as
+/// `extra[name=genre].options`, which is what Stremio/Nuvio render as the
+/// Discover filter. Omitting them (as this port previously did) leaves the
+/// genre dropdown empty.
+fn all_genre_options() -> Vec<String> {
+    [
+        "Action",
+        "Adventure",
+        "Animation",
+        "Anime",
+        "Biography",
+        "Comedy",
+        "Crime",
+        "Documentary",
+        "Drama",
+        "Family",
+        "Fantasy",
+        "History",
+        "Horror",
+        "Music",
+        "Musical",
+        "Mystery",
+        "Romance",
+        "Sci-Fi",
+        "Sport",
+        "Thriller",
+        "War",
+        "Western",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// `$allYearOptions` (backend.php:15063-15067) — the current year descending
+/// to 1980, as strings.
+fn all_year_options() -> Vec<String> {
+    (1980..=current_year()).rev().map(|y| y.to_string()).collect()
+}
+
+/// `$filterOptionsCombined = array_merge($allYearOptions, $allGenreOptions)`
+/// (backend.php:15134). The YEAR list comes FIRST, exactly as the PHP merges it.
+fn filter_options_combined() -> Vec<String> {
+    let mut out = all_year_options();
+    out.extend(all_genre_options());
+    out
+}
+
+/// `date('Y')` for the local clock.
+fn current_year() -> i32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Howard Hinnant's `civil_from_days`, valid for any i64 day count.
+    let z = secs.div_euclid(86400) + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    year as i32
+}
+
+/// One `extra` entry, exactly the PHP's shape: `name`, optional `options`, then
+/// `isRequired` (backend.php:15141-15146).
+fn extra_entry(name: &str, options: Option<Vec<String>>, required: bool) -> Value {
+    let mut e = serde_json::Map::new();
+    e.insert("name".to_string(), Value::String(name.to_string()));
+    if let Some(opts) = options {
+        e.insert("options".to_string(), serde_json::json!(opts));
+    }
+    e.insert("isRequired".to_string(), Value::Bool(required));
+    Value::Object(e)
+}
+
+/// One descriptor catalog row. `supported`/`required` reproduce the PHP's legacy
+/// `extraSupported` / `extraRequired` arrays; the keyword rows emit NEITHER
+/// (backend.php:15282-15291), so pass empty slices for those.
+fn catalog_row(
+    ty: &str,
+    id: &str,
+    name: &str,
+    extra: Vec<Value>,
+    supported: &[&str],
+    required: &[&str],
+) -> Value {
     let mut row = serde_json::json!({
         "type": ty,
         "id": id,
         "name": name,
         "extra": extra,
-        "extraSupported": extras,
     });
+    if !supported.is_empty() {
+        row["extraSupported"] = serde_json::json!(supported);
+    }
     if !required.is_empty() {
         row["extraRequired"] = serde_json::json!(required);
     }
@@ -4730,31 +5181,76 @@ fn catalog_row(ty: &str, id: &str, name: &str, extras: &[&str], required: &[&str
 /// (`top`, `pm_movies_malay`, `pm_files_year`, …) was missing — which is what
 /// looked like "manifest.json catalog is broken".
 fn pm_catalogs() -> Value {
+    let genres = all_genre_options();
+    let years = all_year_options();
+    // The country rows use `$filterOptionsCombined` (years FIRST, then genres).
+    let combined = filter_options_combined();
     let mut rows: Vec<Value> = Vec::new();
     // ── 1. Movies ──────────────────────────────────────────────────────────
     rows.push(catalog_row(
         "movie",
         "top",
         "Popular",
+        vec![
+            extra_entry("search", None, false),
+            extra_entry("genre", Some(genres.clone()), false),
+            extra_entry("year", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "year", "skip"],
         &[],
     ));
-    rows.push(catalog_row("movie", "year", "New", &["genre", "skip"], &["genre"]));
+    // `year` is the PHP's "New" row: its `genre` extra carries the YEAR list
+    // (backend.php:15154), not the genre list.
+    rows.push(catalog_row(
+        "movie",
+        "year",
+        "New",
+        vec![
+            extra_entry("genre", Some(years.clone()), true),
+            extra_entry("skip", None, false),
+        ],
+        &["genre", "skip"],
+        &["genre"],
+    ));
     rows.push(catalog_row(
         "movie",
         "pm_search_movie",
         "Search Movies",
+        vec![
+            extra_entry("search", None, true),
+            extra_entry("genre", Some(genres.clone()), false),
+            extra_entry("year", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "year", "skip"],
         &["search"],
     ));
     for (id, name) in MOVIE_COUNTRY_CATALOGS {
-        rows.push(catalog_row("movie", id, name, &["genre", "year", "skip"], &[]));
+        rows.push(catalog_row(
+            "movie",
+            id,
+            name,
+            vec![
+                extra_entry("genre", Some(combined.clone()), false),
+                extra_entry("year", Some(years.clone()), false),
+                extra_entry("skip", None, false),
+            ],
+            &["genre", "year", "skip"],
+            &[],
+        ));
     }
     // ── 2. Series ──────────────────────────────────────────────────────────
     rows.push(catalog_row(
         "series",
         "top",
         "Popular",
+        vec![
+            extra_entry("search", None, false),
+            extra_entry("genre", Some(genres.clone()), false),
+            extra_entry("year", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "year", "skip"],
         &[],
     ));
@@ -4762,6 +5258,10 @@ fn pm_catalogs() -> Value {
         "series",
         "pm_series_year",
         "New",
+        vec![
+            extra_entry("genre", Some(years.clone()), true),
+            extra_entry("skip", None, false),
+        ],
         &["genre", "skip"],
         &["genre"],
     ));
@@ -4769,31 +5269,64 @@ fn pm_catalogs() -> Value {
         "series",
         "pm_search_series",
         "Search Series",
+        vec![
+            extra_entry("search", None, true),
+            extra_entry("genre", Some(genres.clone()), false),
+            extra_entry("year", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "year", "skip"],
         &["search"],
     ));
     for (id, name) in SERIES_COUNTRY_CATALOGS {
-        rows.push(catalog_row("series", id, name, &["genre", "year", "skip"], &[]));
+        rows.push(catalog_row(
+            "series",
+            id,
+            name,
+            vec![
+                extra_entry("genre", Some(combined.clone()), false),
+                extra_entry("year", Some(years.clone()), false),
+                extra_entry("skip", None, false),
+            ],
+            &["genre", "year", "skip"],
+            &[],
+        ));
     }
     // ── 3. Other (Telegram files) ──────────────────────────────────────────
+    // The PHP names these "Telegram Files" / "New" / "Telegram Files"
+    // (backend.php:15244-15277) — not the longer labels this port used.
     rows.push(catalog_row(
         "other",
         "top",
         "Telegram Files",
+        vec![
+            extra_entry("search", None, false),
+            extra_entry("genre", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "skip"],
         &[],
     ));
     rows.push(catalog_row(
         "other",
         "pm_files_year",
-        "New (Telegram Files)",
+        "New",
+        vec![
+            extra_entry("genre", Some(years.clone()), true),
+            extra_entry("skip", None, false),
+        ],
         &["genre", "skip"],
         &["genre"],
     ));
     rows.push(catalog_row(
         "other",
         "pm_search_files",
-        "Telegram Files (Search)",
+        "Telegram Files",
+        vec![
+            extra_entry("search", None, true),
+            extra_entry("genre", Some(years.clone()), false),
+            extra_entry("skip", None, false),
+        ],
         &["search", "genre", "skip"],
         &["search"],
     ));
@@ -4802,6 +5335,7 @@ fn pm_catalogs() -> Value {
         "movie",
         TRENDING_MOVIE_CATALOG,
         "Trending Movies",
+        vec![extra_entry("skip", None, false)],
         &["skip"],
         &[],
     ));
@@ -4809,6 +5343,7 @@ fn pm_catalogs() -> Value {
         "series",
         TRENDING_SERIES_CATALOG,
         "Trending Series",
+        vec![extra_entry("skip", None, false)],
         &["skip"],
         &[],
     ));
@@ -4860,11 +5395,32 @@ async fn topkw_map() -> Vec<(String, String)> {
 
 /// The keyword FILE catalogs the PHP appends to the descriptor
 /// (backend.php:15279-15292).
+///
+/// The PHP emits a quality-keyword `genre` list, the year list, and **no**
+/// `extraSupported` / `extraRequired` at all on these rows — matched exactly.
 async fn topkw_catalogs() -> Vec<Value> {
+    let years = all_year_options();
+    let quality: Vec<String> = ["4K", "1080p", "720p", "BluRay", "WEB-DL", "HEVC"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     topkw_map()
         .await
         .into_iter()
-        .map(|(id, kw)| catalog_row("other", &id, &ucwords(&kw), &["genre", "year", "skip"], &[]))
+        .map(|(id, kw)| {
+            catalog_row(
+                "other",
+                &id,
+                &ucwords(&kw),
+                vec![
+                    extra_entry("genre", Some(quality.clone()), false),
+                    extra_entry("year", Some(years.clone()), false),
+                    extra_entry("skip", None, false),
+                ],
+                &[],
+                &[],
+            )
+        })
         .collect()
 }
 
@@ -5157,6 +5713,89 @@ async fn handle_subtitles(path: &str) -> Response {
     stremio_json(200, &serde_json::json!({"subtitles": subs}), "no-store")
 }
 
+/// `fd_stremio_manifest_identity()` (backend.php:10831-10952).
+///
+/// The descriptor `id` and `description` follow the ADDRESS the addon was
+/// installed from — `.../addon.local` on this device, `.../addon.lan` on the
+/// Wi-Fi, `.../addon.tunnel` over Cloudflare, `.../addon.server` otherwise — and
+/// the description NAMES that address. A single fixed description (as this port
+/// used) loses the "which URL did I install?" hint Stremio shows on the addon
+/// card. `?mode=lan|localhost|tunnel|server` forces one, like the PHP.
+fn manifest_identity(ctx: &ReqCtx, origin: &str) -> (&'static str, String) {
+    let mut host = ctx.hdr("x-forwarded-host");
+    if host.is_empty() {
+        host = ctx.hdr("host");
+    }
+    let host = host.split(',').next().unwrap_or("").trim().to_string();
+    let fallback = if host.is_empty() {
+        "127.0.0.1:8088".to_string()
+    } else {
+        host
+    };
+    let host_name = url::Url::parse(&format!("http://{}", fallback))
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_ascii_lowercase()))
+        .unwrap_or_else(|| fallback.to_ascii_lowercase());
+
+    let mut is_tunnel = host_name.ends_with(".trycloudflare.com")
+        || host_name == "trycloudflare.com"
+        || host_name.ends_with(".tunnel.pencarimovie.com")
+        || host_name.ends_with("-tunnel.pencarimovie.com")
+        || host_name == "tunnel.pencarimovie.com";
+    // A Zero Trust Named Tunnel serves a CUSTOM hostname; the PHP also accepts
+    // whatever `custom_domain(s)` the tunnel state recorded.
+    if !is_tunnel {
+        let st = tunnel::load_state();
+        let mut domains: Vec<String> = Vec::new();
+        if let Some(cd) = st.get("custom_domain").and_then(|v| v.as_str()) {
+            if !cd.trim().is_empty() {
+                domains.push(cd.trim().to_ascii_lowercase());
+            }
+        }
+        if let Some(arr) = st.get("custom_domains").and_then(|v| v.as_array()) {
+            for d in arr {
+                if let Some(s) = d.as_str() {
+                    if !s.trim().is_empty() {
+                        domains.push(s.trim().to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        is_tunnel = domains.iter().any(|d| *d == host_name);
+    }
+
+    let forced = ctx.q("mode").unwrap_or("").trim().to_ascii_lowercase();
+    let mode: &'static str = match forced.as_str() {
+        "tunnel" => "tunnel",
+        "localhost" => "localhost",
+        "lan" => "lan",
+        "server" => "server",
+        _ if is_tunnel => "tunnel",
+        _ if matches!(host_name.as_str(), "127.0.0.1" | "localhost" | "::1") => "localhost",
+        _ if is_private_ipv4(&host_name) => "lan",
+        _ => "server",
+    };
+    let description = match mode {
+        "tunnel" => format!(
+            "Stream movies and series from Telegram via Cloudflare Tunnel HTTPS. Address: {}",
+            origin
+        ),
+        "localhost" => format!(
+            "Stream movies and series from Telegram on this device only. Address: {}",
+            origin
+        ),
+        "lan" => format!(
+            "Stream movies and series from Telegram on your Wi-Fi / LAN. Address: {}",
+            origin
+        ),
+        _ => format!(
+            "Stream movies and series from Telegram on your server. Address: {}",
+            origin
+        ),
+    };
+    (mode, description)
+}
+
 /// The addon descriptor, with the upstream catalogs bridged in
 /// (backend.php:15343-15489).
 ///
@@ -5165,13 +5804,9 @@ async fn handle_subtitles(path: &str) -> Response {
 /// `options` list and blew past Stremio's descriptor limit. The result is then
 /// fitted to [`upstream::MANIFEST_DESCRIPTOR_BUDGET`] by dropping trailing
 /// bridged catalogs — never the local `pm_*` ones.
-async fn manifest(base_url: &str) -> Value {
-    let mode: String = std::env::var("PM_MANIFEST_MODE")
-        .unwrap_or_else(|_| "local".to_string())
-        .chars()
-        .filter(|c| c.is_ascii_lowercase())
-        .collect();
-    let mode = if mode.is_empty() { "local".to_string() } else { mode };
+async fn manifest(ctx: &ReqCtx) -> Value {
+    let base_url = rtrim(&ctx.base_url).to_string();
+    let (mode, description) = manifest_identity(ctx, &base_url);
 
     let settings = load_catalog_settings_merged();
     let mut catalogs: Vec<Value> = pm_catalogs().as_array().cloned().unwrap_or_default();
@@ -5194,11 +5829,11 @@ async fn manifest(base_url: &str) -> Value {
         catalogs.clear();
     }
     let local_count = catalogs.len();
-    let mut types: Vec<String> = vec![
-        "movie".to_string(),
-        "series".to_string(),
-        "other".to_string(),
-    ];
+    // PHP: `$activeTypes` comes from `enabled_types` (backend.php:15336-15341),
+    // so a disabled media type disappears from the top-level `types` AND from
+    // every resource's `types` — the client then never asks for a row that
+    // cannot exist. Bridged upstream types are appended (backend.php:15369-15371).
+    let mut types = active_types(&settings);
     let (bridged, bridged_types) = upstream::bridged_catalogs(&settings).await;
     for t in bridged_types {
         if !types.contains(&t) {
@@ -5212,16 +5847,23 @@ async fn manifest(base_url: &str) -> Value {
         &serde_json::json!({
             "local_catalogs": local_count,
             "bridged_catalogs": bridged_count,
-            "types": types.len(),
+            "types": types.clone(),
         }),
     );
 
-    // The PHP drops the `catalog` resource when nothing survived the filters,
-    // so Stremio stops asking this addon for catalogs at all.
-    let mut resources: Vec<&str> = vec!["meta", "stream", "subtitles"];
-    if !catalogs.is_empty() {
-        resources.insert(0, "catalog");
-    }
+    // `resources` is an array of OBJECTS, exactly like the PHP
+    // (backend.php:15418-15438): each one declares the `types` it serves, and
+    // meta/stream/subtitles also carry the full `idPrefixes`. A bare string
+    // array loses that scoping — the client cannot tell that (say) a `tvdb:`
+    // id is answerable — and `catalog` is only advertised when a row actually
+    // survived the filters.
+    let resources = manifest_resources(&types, !catalogs.is_empty());
+
+    // The SHIPPED logo only. The PHP keeps a raw.githubusercontent.com copy as a
+    // fallback for deployments without `public/logo.png`; this port embeds the
+    // asset, so the GitHub URL is deliberately NOT ported (operator decision) —
+    // every build serves its own logo and never depends on that host.
+    let logo_url = format!("{}/logo.png", base_url);
 
     let doc = serde_json::json!({
         "id": format!("org.pencarimovie.addon.{}", mode),
@@ -5231,21 +5873,18 @@ async fn manifest(base_url: &str) -> Value {
         // made every APK release look like the same addon version.
         "version": crate::config::descriptor_version(),
         "name": "PencariMovie",
-        "description": "Telegram movie, series and music catalogs with 4K streaming, subtitles and direct downloads.",
+        // Names the address the addon was installed from (backend.php:10881-10951).
+        "description": description,
         "resources": resources,
         "types": types,
         // `tvdb:` / `anilist:` / `kitsu` are declared so a row bridged from an
         // upstream (whose ids are one of those) is still resolved against THIS
         // addon: that is what routes it through the meta bridge instead of
         // leaving the client with no addon to ask.
-        "idPrefixes": ["pm:", "pm_", "tt", "tmdb:", "kitsu:", "kitsu", "mal:", "anilist:", "tvdb:"],
+        "idPrefixes": ID_PREFIXES,
         "catalogs": catalogs,
-        // A path that EXISTS in the embedded `public/`: the old `/logo.png`
-        // 404s, so clients showed a broken logo (and an empty background).
-        // `/logo.png` is the PencariMovie mark; `assets/images/icon.png` was
-        // Nuvio's app icon and `nuviotv.png` their wordmark (both removed).
-        "logo": format!("{}/logo.png", rtrim(base_url)),
-        "background": format!("{}/logo.png", rtrim(base_url)),
+        "logo": logo_url.clone(),
+        "background": logo_url,
         // Stremio only renders the CONFIGURE gear when `configurable` is true —
         // the PHP declares all four keys (backend.php manifest builder), so an
         // empty object here meant the addon had no Configure button at all.
@@ -5257,6 +5896,90 @@ async fn manifest(base_url: &str) -> Value {
         },
     });
     upstream::fit_descriptor(doc, local_count)
+}
+
+/// The addon's `idPrefixes`, in the PHP's ORDER (backend.php:15458). Order is
+/// observable: the client shows the addon under the first matching prefix.
+const ID_PREFIXES: [&str; 9] = [
+    "pm_", "pm:", "tt", "tmdb:", "kitsu:", "kitsu", "mal:", "anilist:", "tvdb:",
+];
+
+/// `$activeTypes` (backend.php:15336-15341): the enabled media types, in the
+/// PHP's order, falling back to all three when nothing is selected.
+///
+/// A missing `enabled_types` map means the PHP's default (all three on); an
+/// EXISTING map with a missing/false/zero key means that type is off.
+fn active_types(settings: &Value) -> Vec<String> {
+    let all = || {
+        vec![
+            "movie".to_string(),
+            "series".to_string(),
+            "other".to_string(),
+        ]
+    };
+    let Some(map) = settings.get("enabled_types").and_then(|v| v.as_object()) else {
+        return all();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for t in ["movie", "series", "other"] {
+        if crate::session::truthy(map.get(t)) {
+            out.push(t.to_string());
+        }
+    }
+    if out.is_empty() {
+        // Never advertise an empty `types`: the client would ask for nothing.
+        return all();
+    }
+    out
+}
+
+/// The `resources` array (backend.php:15418-15438): objects, each declaring the
+/// `types` it serves, with `idPrefixes` on meta/stream/subtitles. `catalog` is
+/// advertised only when a row actually survived the filters.
+fn manifest_resources(types: &[String], has_catalogs: bool) -> Vec<Value> {
+    let mut resources: Vec<Value> = Vec::new();
+    if has_catalogs {
+        resources.push(serde_json::json!({
+            "name": "catalog",
+            "types": types,
+        }));
+    }
+    for name in ["meta", "stream", "subtitles"] {
+        resources.push(serde_json::json!({
+            "name": name,
+            "types": types,
+            "idPrefixes": ID_PREFIXES,
+        }));
+    }
+    resources
+}
+
+/// The descriptor RESPONSE (backend.php:15468-15488): a byte-stable `ETag`, a
+/// `max-age=1800, stale-while-revalidate=3600` cache policy, and a 304 when the
+/// client's `If-None-Match` already matches — so a TV box re-opening the addon
+/// does not re-download a 40 KB descriptor on every launch.
+fn manifest_response(ctx: &ReqCtx, doc: &Value) -> Response {
+    let text = serde_json::to_string(doc).unwrap_or_else(|_| "{}".to_string());
+    let etag = format!("\"{}\"", crate::fileid::md5_hex(text.as_bytes()));
+    const CACHE: &str = "max-age=1800, stale-while-revalidate=3600";
+    let client = ctx
+        .hdr("if-none-match")
+        .trim_matches(|c| c == '"' || c == '\'' || c == ' ')
+        .to_string();
+    if !client.is_empty() && client == etag.trim_matches('"') {
+        return Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, CACHE)
+            .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+            .body(Body::empty())
+            .unwrap_or_else(|_| not_found_json());
+    }
+    let mut resp = stremio_json(200, doc, CACHE);
+    if let Ok(v) = axum::http::HeaderValue::from_str(&etag) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    resp
 }
 
 /* ── version (fd_check_version, backend.php:7719) ─────────────────────────── */
@@ -5652,7 +6375,22 @@ mod tests {
         assert!(!catalog_advertised(&files_off, &row("other", "top")));
         assert!(catalog_advertised(&files_off, &row("other", "pm_search_files")));
         // One master toggle hides every `pm_topkw_*` row.
-        let topkw = catalog_row("other", "pm_topkw_0123456789", "Trending", &["skip"], &[]);
+        // Keyword rows carry the PHP's quality `genre` list, the year list and
+        // NO `extraSupported` / `extraRequired` (backend.php:15282-15291).
+        let topkw = catalog_row(
+            "other",
+            "pm_topkw_0123456789",
+            "Trending",
+            vec![
+                extra_entry("genre", None, false),
+                extra_entry("year", None, false),
+                extra_entry("skip", None, false),
+            ],
+            &[],
+            &[],
+        );
+        assert!(topkw.get("extraSupported").is_none());
+        assert!(topkw.get("extraRequired").is_none());
         let mut kw_off = default_catalog_settings();
         kw_off["enabled_catalogs"]["pm_trending_keywords"] = serde_json::json!(false);
         assert!(!catalog_advertised(&kw_off, &topkw));
@@ -5694,12 +6432,65 @@ mod tests {
         assert_eq!(row("series", "pm_search_series")["extraRequired"][0], "search");
         assert_eq!(row("other", "pm_search_files")["extraRequired"][0], "search");
         assert!(row("movie", "top").get("extraRequired").is_none());
-        // Never `genres`: Stremio caps the descriptor at ~49 KB and the genre
-        // values belong in the `genre` extra.
+        // Never a `genres` ARRAY on the catalog: Stremio caps the descriptor at
+        // ~49 KB and the genre values belong in the `genre` extra.
         assert!(catalog_rows().iter().all(|c| c.get("genres").is_none()));
-        // The local rows alone must stay far below that cap (the PHP ships the
-        // full genre/year option lists and reached 50,842 B).
-        assert!(pm_catalogs().to_string().len() < 12_000, "local rows are small");
+        // The option LISTS are the PHP's, untrimmed — they drive the Discover
+        // filter pills. A country row carries `$filterOptionsCombined`, i.e. the
+        // YEAR list FIRST and then the genres (backend.php:15134).
+        assert_eq!(all_genre_options().len(), 22, "PHP `$allGenreOptions`");
+        assert_eq!(
+            all_year_options().len(),
+            (current_year() - 1980 + 1) as usize,
+            "PHP `$allYearOptions` = date('Y') down to 1980"
+        );
+        let country = row("movie", MOVIE_COUNTRY_CATALOGS[0].0);
+        let genre_opts = country["extra"][0]["options"].as_array().unwrap();
+        assert_eq!(
+            genre_opts.len(),
+            all_year_options().len() + all_genre_options().len(),
+            "country `genre` extra = combined year+genre list"
+        );
+        assert_eq!(
+            genre_opts[0].as_str(),
+            Some(all_year_options()[0].as_str()),
+            "years come first"
+        );
+        assert_eq!(
+            genre_opts[all_year_options().len()].as_str(),
+            Some(all_genre_options()[0].as_str()),
+            "genres follow the years"
+        );
+        // The `year` / `pm_series_year` / `pm_files_year` rows carry the YEAR list
+        // on their `genre` extra (backend.php:15154, 15208, 15260).
+        for (ty, id) in [
+            ("movie", "year"),
+            ("series", "pm_series_year"),
+            ("other", "pm_files_year"),
+        ] {
+            assert_eq!(
+                row(ty, id)["extra"][0]["options"].as_array().unwrap().len(),
+                all_year_options().len(),
+                "{ty}/{id} `genre` extra is the year list"
+            );
+        }
+        // `top` / `pm_search_*` expose the genre list on `genre` and the year
+        // list on `year`.
+        let top = row("movie", "top");
+        assert_eq!(top["extra"][1]["options"].as_array().unwrap().len(), 22);
+        assert_eq!(
+            top["extra"][2]["options"].as_array().unwrap().len(),
+            all_year_options().len()
+        );
+        // The local rows are the PHP's, so they are NOT small — but they must
+        // still leave room for bridged catalogs under the 45 KB descriptor
+        // budget (`upstream::fit_descriptor` drops bridged rows first, never a
+        // local one).
+        let local = pm_catalogs().to_string().len();
+        assert!(
+            local < 32_000,
+            "local rows are {local} B; must leave room under the 45 KB budget"
+        );
     }
 
     #[test]
@@ -5817,5 +6608,258 @@ mod tests {
         assert_eq!(parse_external_id("pm:post:9000031194"), None);
         assert_eq!(parse_external_id("pm_file_1v9OPj"), None);
         assert_eq!(parse_external_id(""), None);
+    }
+
+    /* ── descriptor parity (backend.php:15303-15489) ──────────────────────── */
+
+    fn ctx_with(headers: &[(&str, &str)], base: &str, query: &[(&str, &str)]) -> ReqCtx {
+        let mut hm = axum::http::HeaderMap::new();
+        for (k, v) in headers {
+            hm.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        ReqCtx {
+            method: "GET".into(),
+            path: "/manifest.json".into(),
+            raw_path: "/manifest.json".into(),
+            query: query
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            headers: hm,
+            cookies: HashMap::new(),
+            remote: "127.0.0.1".into(),
+            local: String::new(),
+            base_url: base.to_string(),
+        }
+    }
+
+    #[test]
+    fn active_types_follow_enabled_types_with_a_three_type_fallback() {
+        assert_eq!(
+            active_types(&default_catalog_settings()).join(","),
+            "movie,series,other"
+        );
+        let mut no_movies = default_catalog_settings();
+        no_movies["enabled_types"]["movie"] = serde_json::json!(false);
+        assert_eq!(active_types(&no_movies).join(","), "series,other");
+        // backend.php:15341 — an empty result falls back to ALL THREE.
+        let mut none = default_catalog_settings();
+        for t in ["movie", "series", "other"] {
+            none["enabled_types"][t] = serde_json::json!(false);
+        }
+        assert_eq!(active_types(&none).join(","), "movie,series,other");
+        // No map at all is the PHP's `?? [all true]` default.
+        assert_eq!(
+            active_types(&serde_json::json!({})).join(","),
+            "movie,series,other"
+        );
+        // PHP `!empty()`: a missing key INSIDE an existing map is off.
+        assert_eq!(
+            active_types(&serde_json::json!({"enabled_types": {"movie": true}})).join(","),
+            "movie"
+        );
+        // `1` and `"1"` are true to PHP, `0` is false.
+        assert_eq!(
+            active_types(&serde_json::json!({
+                "enabled_types": {"movie": 1, "series": "1", "other": 0}
+            }))
+            .join(","),
+            "movie,series"
+        );
+    }
+
+    #[test]
+    fn manifest_resources_are_objects_scoped_to_the_active_types() {
+        let types: Vec<String> = ["movie", "series", "other"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let with = manifest_resources(&types, true);
+        assert_eq!(with.len(), 4);
+        assert!(with.iter().all(|r| r.is_object()), "resources are objects");
+        assert_eq!(with[0]["name"], "catalog");
+        assert_eq!(with[0]["types"], serde_json::json!(types));
+        assert!(with[0].get("idPrefixes").is_none(), "catalog has no idPrefixes");
+        for r in &with[1..] {
+            assert_eq!(r["types"], serde_json::json!(types));
+            assert_eq!(r["idPrefixes"], serde_json::json!(ID_PREFIXES));
+        }
+        let names: Vec<&str> = with.iter().map(|r| r["name"].as_str().unwrap_or("")).collect();
+        assert_eq!(names, ["catalog", "meta", "stream", "subtitles"]);
+        // No catalogs → no `catalog` resource at all (backend.php:15418).
+        let without = manifest_resources(&types, false);
+        assert_eq!(without.len(), 3);
+        assert!(without.iter().all(|r| r["name"] != "catalog"));
+        // Only the ENABLED types are advertised (backend.php:15421).
+        let only_series = manifest_resources(&["series".to_string()], true);
+        assert_eq!(only_series[0]["types"], serde_json::json!(["series"]));
+        // The PHP's order: `pm_` BEFORE `pm:` (backend.php:15458).
+        assert_eq!(
+            ID_PREFIXES.to_vec(),
+            vec![
+                "pm_",
+                "pm:",
+                "tt",
+                "tmdb:",
+                "kitsu:",
+                "kitsu",
+                "mal:",
+                "anilist:",
+                "tvdb:"
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_response_sets_an_etag_and_answers_304() {
+        let doc = serde_json::json!({"id": "org.pencarimovie.addon.localhost", "resources": []});
+        let first = manifest_response(&ctx_with(&[], "http://127.0.0.1:8088", &[]), &doc);
+        assert_eq!(first.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            first
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "max-age=1800, stale-while-revalidate=3600"
+        );
+        let etag = first
+            .headers()
+            .get(axum::http::header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.starts_with('"') && etag.ends_with('"'), "{etag}");
+        // A matching `If-None-Match` (quoted and bare) is a 304 carrying the tag.
+        for hv in [etag.clone(), etag.trim_matches('"').to_string()] {
+            let cached = manifest_response(
+                &ctx_with(&[("if-none-match", &hv)], "http://127.0.0.1:8088", &[]),
+                &doc,
+            );
+            assert_eq!(cached.status(), axum::http::StatusCode::NOT_MODIFIED);
+            assert_eq!(
+                cached.headers().get(axum::http::header::ETAG).unwrap(),
+                etag.as_str()
+            );
+            assert_eq!(
+                cached
+                    .headers()
+                    .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .unwrap(),
+                "*"
+            );
+        }
+        // A different tag still gets the body.
+        let other = manifest_response(
+            &ctx_with(
+                &[("if-none-match", "\"deadbeef\"")],
+                "http://127.0.0.1:8088",
+                &[],
+            ),
+            &doc,
+        );
+        assert_eq!(other.status(), axum::http::StatusCode::OK);
+        // The same document always hashes to the same tag.
+        let again = manifest_response(&ctx_with(&[], "http://127.0.0.1:8088", &[]), &doc);
+        assert_eq!(
+            again.headers().get(axum::http::header::ETAG).unwrap(),
+            etag.as_str()
+        );
+    }
+
+    #[test]
+    fn manifest_identity_names_the_address_it_was_installed_from() {
+        let local = ctx_with(&[("host", "127.0.0.1:8088")], "http://127.0.0.1:8088", &[]);
+        let (mode, desc) = manifest_identity(&local, "http://127.0.0.1:8088");
+        assert_eq!(mode, "localhost");
+        assert!(desc.contains("http://127.0.0.1:8088"), "{desc}");
+        assert!(desc.contains("this device only"), "{desc}");
+        // A LAN address is its own mode.
+        let lan = ctx_with(&[("host", "192.168.1.5:8088")], "http://192.168.1.5:8088", &[]);
+        let (mode, desc) = manifest_identity(&lan, "http://192.168.1.5:8088");
+        assert_eq!(mode, "lan");
+        assert!(desc.contains("192.168.1.5"), "{desc}");
+        // A tunnel hostname wins over the IP check, and names the HTTPS address.
+        let tunnel = ctx_with(
+            &[("host", "abc-tunnel.pencarimovie.com")],
+            "https://abc-tunnel.pencarimovie.com",
+            &[],
+        );
+        let (mode, desc) = manifest_identity(&tunnel, "https://abc-tunnel.pencarimovie.com");
+        assert_eq!(mode, "tunnel");
+        assert!(desc.contains("https://abc-tunnel.pencarimovie.com"), "{desc}");
+        // `?mode=` forces the identity so a tunneled page can still install an
+        // HTTP transport URL.
+        let forced = ctx_with(
+            &[("host", "127.0.0.1:8088")],
+            "http://127.0.0.1:8088",
+            &[("mode", "lan")],
+        );
+        let (mode, desc) = manifest_identity(&forced, "http://127.0.0.1:8088");
+        assert_eq!(mode, "lan");
+        assert!(desc.contains("http://127.0.0.1:8088"), "{desc}");
+        // A public host that is not a tunnel is a plain server.
+        let server = ctx_with(&[("host", "vps.example.com")], "http://vps.example.com", &[]);
+        let (mode, _desc) = manifest_identity(&server, "http://vps.example.com");
+        assert_eq!(mode, "server");
+    }
+
+    #[test]
+    fn file_pills_use_the_php_word_boundaries() {
+        // A standalone `hd` / `sd` IS a resolution pill in PHP (`\b(720p|hd)\b`).
+        assert_eq!(file_pills("Movie.2026.HD.mkv", 0), vec!["720p"]);
+        assert_eq!(file_pills("Movie.2026.SD.mkv", 0), vec!["SD"]);
+        // ... but never inside a word.
+        assert!(file_pills("HDU.Release.mkv", 0).is_empty());
+        assert!(file_pills("Shadow.Release.mkv", 0).is_empty());
+        assert_eq!(file_pills("Movie.2026.2160p.mkv", 0), vec!["4K"]);
+        assert_eq!(
+            file_pills("Movie.4K.WEB-DL.x265.mkv", 0),
+            vec!["4K", "WEB-DL", "HEVC"]
+        );
+        assert_eq!(
+            file_pills("Movie.1080p.BluRay.HEVC.mkv", 0),
+            vec!["1080p", "BluRay", "HEVC"]
+        );
+        // One resolution, one source, one codec, then the size pill.
+        assert_eq!(
+            file_pills("Movie.720p.mkv", 1_500_000_000),
+            vec!["720p".to_string(), format_bytes(1_500_000_000)]
+        );
+        assert!(file_pills("Untagged.mkv", 0).is_empty());
+    }
+
+    #[test]
+    fn file_meta_pills_use_the_php_meta_set() {
+        // The META path adds `4K UHD`, `HDTV`, `HDR` and `AVC` (backend.php:16129).
+        assert_eq!(
+            file_meta_pills("Movie.2160p.HDR.x264.mkv", 0),
+            vec!["4K UHD", "HDR", "AVC"]
+        );
+        assert_eq!(
+            file_meta_pills("Movie.720p.HDTV.mkv", 0),
+            vec!["720p", "HDTV"]
+        );
+        assert_eq!(
+            file_meta_pills("Movie.1080p.WEB-DL.x265.mkv", 0),
+            vec!["1080p", "WEB-DL", "HEVC"]
+        );
+    }
+
+    #[test]
+    fn iso_now_is_rfc3339_utc() {
+        let s = iso_now();
+        assert_eq!(s.len(), 20, "{s}");
+        assert!(s.ends_with('Z'), "{s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        assert!(s[11..13].parse::<u32>().unwrap() < 24, "{s}");
+        assert!(s[14..16].parse::<u32>().unwrap() < 60, "{s}");
     }
 }
