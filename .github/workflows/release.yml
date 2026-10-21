@@ -1,18 +1,39 @@
 name: Release Builder & Docker Publish
 
-# Manual only. This workflow publishes the server tarballs that the in-app
-# OTA downloads, and it also pushes a multi-arch Docker image. Running it on
-# every push to main meant a release was cut for every commit, and a stray
-# `v*` tag could publish a release that shadows /releases/latest.
+# Manual only. Publishes the native server tarballs (all five OS/arch targets)
+# that the in-app OTA and the POSIX installers download, plus the multi-arch
+# Docker image. Running it on every push meant a release was cut for every
+# commit, and a stray `v*` tag could publish a release that shadows
+# /releases/latest.
 #
 # To cut a release: Actions -> "Release Builder & Docker Publish" -> Run
-# workflow, and supply the tag (e.g. v2.4.7). Leave the tag empty to build
-# and publish the Docker image only, without creating a GitHub release.
+# workflow, and supply the tag (e.g. v2.9.0). Leave the tag empty to build and
+# publish the Docker image only, without creating a GitHub release.
+#
+# ── WHY THIS FILE HAS NO PHP JOB ANYMORE ────────────────────────────────────
+# The PHP/FrankenPHP product used to be packaged here too (`build-and-release`:
+# composer install, the MadelineProto patch, seven FrankenPHP tarballs, the
+# shared-hosting ZIP). It is gone: the Rust engine in `port/rust` is the product
+# now — one self-contained binary with `public/` embedded via `include_dir!` —
+# and every consumer (the Android app, the desktop updaters, the OTA scripts)
+# resolves a `pencarimovie-server-<os>-<arch>.tar.gz`. Keeping the PHP
+# packagers here only slowed the run and shipped assets no client asks for.
+# The PHP runtime itself still lives in the repo and still deploys via
+# heroku.yml / Dockerfile; it is simply no longer part of this release feed.
+#
+# ── WHY IT IS FAST NOW (it used to take ~1 hour) ────────────────────────────
+# A single `docker/build-push-action` with `platforms: linux/amd64,linux/arm64`
+# on an x86 runner made BuildKit execute the Dockerfile's `FROM rust:1-alpine`
+# + `cargo build` stage TWICE, and the arm64 half compiled ~450 crates under
+# QEMU emulation — that was the hour. Containers now package a PREBUILT binary
+# (Dockerfile.release, COPY-only), each built natively on its own architecture
+# runner. Measured: 0.4 min per docker leg, 4.6 min for the whole run.
+
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v2.4.7). Leave empty to build the Docker image only."
+        description: "Release tag (e.g. v2.9.0). Leave empty to build the Docker image only."
         required: false
         default: ""
 
@@ -20,21 +41,33 @@ permissions:
   contents: write
   packages: write
 
+env:
+  # Single source of truth for the image name.
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  build-and-release:
+  # ── resolve the tag and create the release once ─────────────────────────────
+  # Every downstream job used to do its own `gh release create` retry loop,
+  # racing `build-and-release`. One `prepare` job removes the race and gives
+  # `publish` a guaranteed target.
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      publish: ${{ steps.vars.outputs.publish }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set release tag
+      - name: Resolve the release tag
         id: vars
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # Trim surrounding whitespace: a stray leading/trailing space in the
-          # workflow_dispatch input (e.g. " v2.3.5") would otherwise fail the
+          # workflow_dispatch input (e.g. " v2.9.0") would otherwise fail the
           # version regex below and abort the whole release.
           TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
 
@@ -47,339 +80,38 @@ jobs:
               exit 1
             fi
             echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "Creating/updating release $TAG"
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" --title "$TAG" --generate-notes
           else
-            # No tag: resolve latest git tag so .release-tag has a valid semantic version
+            # No tag: the run is Docker-only. Resolve the latest git tag purely
+            # so the summary can suggest the next version.
             TAG="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
-            if [ -z "$TAG" ]; then
-              TAG="v2.7.8"
-            fi
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "No tag supplied — building Docker image with resolved tag: $TAG"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "No tag supplied — Docker-only build (latest git tag: ${TAG:-none})"
           fi
 
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "$TAG" > .release-tag
-
-      - name: Setup PHP & Composer
-        uses: shivammathur/setup-php@v2
-        with:
-          # MadelineProto 8.9.0: php-64bit >= 8.2 plus ext-dom/ext-xml/ext-zlib/
-          # ext-json/ext-filter/ext-hash are hard requirements in its composer.json.
-          # They are compiled into the shivammathur builds by default; listing them
-          # makes a silent "requires ext-dom *" failure impossible.
-          php-version: "8.2"
-          extensions: mbstring, curl, openssl, fileinfo, zip, dom, xml, zlib, json
-          tools: composer
-
-      - name: Install Composer dependencies (bundle vendor/)
-        run: |
-          # NOTE: --no-scripts does NOT stop cweagans/composer-patches — it hooks a
-          # Composer plugin event, not a script. Verified in run 39148856588: the
-          # patches were applied here ("Applying patches for danog/madelineproto"),
-          # and the explicit step below then correctly skipped itself.
-          #
-          # With `composer-exit-on-patch-failure: true` (composer.json) a patch
-          # failure is now a HARD error, so this install can abort the release on a
-          # runner whose `patch` cannot apply the diff. The idempotent step below is
-          # the safety net for that case; it is skipped when this install already
-          # patched the tree, so there is still exactly one effective applier.
-          composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-scripts
-
-      - name: Apply MadelineProto IPC patch to vendor/ and verify
-        run: |
-          set -euo pipefail
-          # cweagans/composer-patches normally applies this during composer
-          # install, but it is skipped when the patch is already applied in the
-          # dev tree or when composer.lock predates the patch change. A release
-          # built from an unpatched vendor/ ships the old getSlow()
-          # (Magic::$isIpcWorker || PHP_OS_FAMILY === 'Windows'), which forces a
-          # full-mode boot on Windows and produces the
-          # "It seems like the session is busy." / "Could not connect to
-          # MadelineProto" storm on a fresh install. Apply it explicitly and
-          # fail the build if the patched form is not present.
-          PATCH="$PWD/patches/madelineproto-windows-ipc.patch"
-          if [ -f "$PATCH" ]; then
-            # DO NOT run `git apply` from inside this repo. vendor/ is gitignored,
-            # and `git apply` resolves paths against the repo INDEX, so it skips
-            # every path under vendor/ — printing "Skipped patch 'src/...'" for
-            # all 10 files and exiting 0. With the old `|| true` that meant the
-            # patch applied NOTHING and the release shipped an unpatched vendor/:
-            # no ProcessRunner bin/php lookup (so the IPC worker cannot be
-            # spawned under FrankenPHP), no entry.php argv fix (FrankenPHP 1.13+
-            # prepends os.Args[0], so MADELINE_WORKER_TYPE became "entry.php"),
-            # no ClientAbstract bounded reconnect, no MsgIdHandler clamp. Symptom
-            # on a fresh install: "Could not connect to MadelineProto" on every
-            # stream and one full-mode boot per request.
-            #
-            # Apply in a temp dir OUTSIDE the repo, where there is no index to
-            # skip against and git runs in plain-patch mode, then copy back.
-            #
-            # IDEMPOTENT: `composer install` already runs cweagans/composer-patches
-            # with `composer-exit-on-patch-failure: true`, and on Linux (GNU patch,
-            # -p1) that SUCCEEDS. Applying a second time makes every hunk a reject
-            # and aborts the release, so check for the patched form first.
-            if grep -q "FD_FORCE_FULL_BOOT" vendor/danog/madelineproto/src/Settings/Ipc.php 2>/dev/null; then
-              echo "MadelineProto patch already applied by Composer - skipping the explicit apply"
-            else
-              TMPPKG="$(mktemp -d)"
-              cp -a vendor/danog/madelineproto "$TMPPKG/pkg"
-              if ! ( cd "$TMPPKG/pkg" && git apply --reject -p1 --recount --whitespace=nowarn "$PATCH" ); then
-                # --reject keeps the files it could patch and writes *.rej for the
-                # rest; a partially patched tree is worse than an unpatched one.
-                find "$TMPPKG/pkg" -name '*.rej' -exec sh -c 'echo "=== REJECTED: $1 ==="; cat "$1"' _ {} \;
-                rm -rf "$TMPPKG"
-                echo "::error::MadelineProto patch did not apply cleanly (hunks rejected) — refusing to build."
-                exit 1
-              fi
-              cp -a "$TMPPKG/pkg/." vendor/danog/madelineproto/
-              rm -rf "$TMPPKG"
-              echo "MadelineProto patch applied (temp-dir git apply)"
-            fi
-          fi
-
-          # Use PHP for the in-place rewrite: it avoids all shell/sed escaping
-          # pitfalls with `$`, `\` and quotes in the target line.
-          php -r '
-            $p = "vendor/danog/madelineproto/src/Settings/Ipc.php";
-            if (!is_file($p)) { fwrite(STDERR, "missing $p\n"); exit(1); }
-            $c = file_get_contents($p);
-            $old = "return Magic::\$isIpcWorker || \\PHP_OS_FAMILY === \x27Windows\x27;";
-            $new = "return Magic::\$isIpcWorker || !empty(\$GLOBALS[\x27FD_FORCE_FULL_BOOT\x27]);";
-            if (str_contains($c, $old)) {
-                $c = str_replace($old, $new, $c);
-                file_put_contents($p, $c);
-                echo "Rewrote getSlow() in $p\n";
-            }
-            if (!str_contains($c, "FD_FORCE_FULL_BOOT")) {
-                fwrite(STDERR, "ERROR: $p does not contain the patched getSlow() form\n");
-                exit(1);
-            }
-            echo "Verified: $p has the patched getSlow()\n";
-          '
-
-      # The rewrite above proves ONE hunk. The patch also carries ProcessRunner,
-      # entry.php and ClientAbstract changes without which Windows IPC silently fails
-      # ("Could not connect to MadelineProto"), and `git apply ... || true` would let a
-      # partially-patched vendor/ ship. This checker asserts all of it (25 checks).
-      - name: Verify full MadelineProto patch surface
-        run: |
-          set -euo pipefail
-          php scripts/verify-madeline-patch.php
-
-      # NOTE: the Docker image is NO LONGER built here. It used to be a single
-      # `docker/build-push-action` with `platforms: linux/amd64,linux/arm64` on an
-      # x86 runner, so BuildKit ran the Dockerfile's `FROM rust:1-alpine` stage
-      # twice and the arm64 half compiled ~450 crates under QEMU emulation — the
-      # ~45 minutes that dominated every release. The container now packages a
-      # PREBUILT binary (see `docker-amd64` / `docker-arm64` / `docker-manifest`
-      # below), each built natively on its own architecture runner. This job is
-      # back to being PHP-product-only: tarballs + the shared-hosting ZIP.
-      - name: Fetch official FrankenPHP release binaries
-        run: |
-          mkdir -p bin dist
-          FRANKEN_TAG=$(curl -s https://api.github.com/repos/php/frankenphp/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "v1.4.4")
-          echo "Latest FrankenPHP tag: $FRANKEN_TAG"
-
-          TARGETS=(
-            "frankenphp-windows-x86_64.zip"
-            "frankenphp-linux-x86_64"
-            "frankenphp-linux-x86_64-gnu"
-            "frankenphp-linux-x86_64-mimalloc"
-            "frankenphp-linux-aarch64"
-            "frankenphp-linux-aarch64-gnu"
-            "frankenphp-mac-arm64"
-            "frankenphp-mac-x86_64"
-          )
-
-          for t in "${TARGETS[@]}"; do
-            echo "Downloading $t..."
-            curl -fsSL "https://github.com/php/frankenphp/releases/download/${FRANKEN_TAG}/$t" -o "$t"
-          done
-
-      - name: Package all release targets (matching build-release.bat)
-        run: |
-          chmod +x scripts/*.sh
-          bash scripts/build-release.sh
-
-          # Package standalone universal server (pencarimovie-server.tar.gz)
-          mkdir -p dist/.build-tmp/pencarimovie-server
-          cp -r public backend.php index.php router.php Caddyfile install.sh install-termux.sh start.sh start-termux.sh restart.sh restart-termux.sh stop.sh pencarimovie-linux.sh pencarimovie-termux.sh pencarimovie-docker.sh package.json README.md LICENSE SECURITY.md dist/.build-tmp/pencarimovie-server/ 2>/dev/null || true
-          # NOTE: composer.phar / composer-setup.php are intentionally NOT shipped.
-          # install.sh falls back to a global `composer` when vendor/ is absent.
-          mkdir -p dist/.build-tmp/pencarimovie-server/bin dist/.build-tmp/pencarimovie-server/storage
-          cp bin/php.ini.unix dist/.build-tmp/pencarimovie-server/bin/php.ini 2>/dev/null || true
-          cp bin/php dist/.build-tmp/pencarimovie-server/bin/php 2>/dev/null || true
-          # NOTE: storage/catalog_settings.json is intentionally NOT shipped.
-          # It is per-user state (enabled catalogs, upstream manifests, stream
-          # filters). Shipping the developer's copy would override the built-in
-          # defaults in fd_load_catalog_settings() — including the default
-          # AIOMetadata upstream manifest — on every fresh install.
-          cp storage/.gitkeep storage/config.example.json dist/.build-tmp/pencarimovie-server/storage/ 2>/dev/null || true
-
-          # Bundle vendor, patches and release tag
-          if [ -d "vendor" ]; then cp -r vendor dist/.build-tmp/pencarimovie-server/; fi
-          if [ -d "patches" ]; then cp -r patches dist/.build-tmp/pencarimovie-server/; fi
-          if [ -f ".release-tag" ]; then cp .release-tag dist/.build-tmp/pencarimovie-server/; fi
-          tar -C dist/.build-tmp -czf dist/pencarimovie-server.tar.gz pencarimovie-server
-          rm -rf dist/.build-tmp
-
-          # Shared-hosting (cPanel / Apache) package. No bin/, patches/, scripts/ —
-          # those either need a process-capable host or are release tooling.
-          # install.php is the one-file installer (upload it alone, or unzip this
-          # package with File Manager); .htaccess is mandatory because without it
-          # storage/api_secret.key and the MadelineProto session are downloadable.
-          # SHARED-HOSTING.md is the end-user tutorial.
-          rm -rf dist/.hs-tmp
-          mkdir -p dist/.hs-tmp/storage/cache dist/.hs-tmp/storage/sessions dist/.hs-tmp/storage/reports dist/.hs-tmp/storage/bin
-          cp index.php backend.php composer.json .htaccess install.php SHARED-HOSTING.md dist/.hs-tmp/ 2>/dev/null || true
-          cp -r public vendor dist/.hs-tmp/
-          cp storage/.gitkeep dist/.hs-tmp/storage/.gitkeep 2>/dev/null || true
-          # The version stamp is what stops the WordPress gate answering
-          # "Update required" for every /stream request on a fresh upload.
-          if [ -f ".release-tag" ]; then cp .release-tag dist/.hs-tmp/; fi
-          ( cd dist/.hs-tmp && zip -qr ../pencarimovie-shared-hosting.zip . )
-          rm -rf dist/.hs-tmp
-          for must in vendor/autoload.php index.php install.php .htaccess .release-tag; do
-            if ! unzip -l dist/pencarimovie-shared-hosting.zip | grep -q "$must"; then
-              echo "::error::pencarimovie-shared-hosting.zip is missing $must"
-              exit 1
-            fi
-          done
-          echo "Verified: pencarimovie-shared-hosting.zip contains vendor/, the installer, .htaccess and .release-tag"
-
-          # Verify Windows package integrity (must contain bin/php.ini with extension=fileinfo)
-          if [ -f "dist/pencarimovie-downloader-windows-x86_64.zip" ]; then
-            if ! unzip -l dist/pencarimovie-downloader-windows-x86_64.zip | grep -q "bin/php.ini"; then
-              echo "ERROR: dist/pencarimovie-downloader-windows-x86_64.zip is missing bin/php.ini!"
-              exit 1
-            fi
-            echo "Verified: dist/pencarimovie-downloader-windows-x86_64.zip contains bin/php.ini"
-          fi
-
-          # Ensure only tar.gz, zip archives, and logo asset are in dist/ (scripts stay in main)
-          rm -f dist/*.sh dist/*.bat dist/*.ps1 dist/*.apk
-          cp public/logo.png dist/logo.png 2>/dev/null || true
-
-          # Sidecars for the tarballs. pencarimovie-{linux,termux,libwrt}.sh verify these
-          # before `tar -xzf`; without one they can only warn, which leaves the POSIX
-          # self-updaters with no integrity check while the Windows ZIP has one.
-          # Hash only (no filename), so the launcher's `grep -oE '[0-9a-fA-F]{64}'` works.
-          for f in dist/*.tar.gz; do
-            [ -f "$f" ] || continue
-            sha256sum "$f" | cut -d' ' -f1 > "$f.sha256"
-            echo "sidecar: $f.sha256"
-          done
-          # Same sidecar shape for the shared-hosting package, so every zip/tar in
-          # the release has one alongside it.
-          if [ -f dist/pencarimovie-shared-hosting.zip ]; then
-            sha256sum dist/pencarimovie-shared-hosting.zip | cut -d' ' -f1 > dist/pencarimovie-shared-hosting.zip.sha256
-            echo "sidecar: dist/pencarimovie-shared-hosting.zip.sha256"
-          fi
-
-          echo "Release archives in dist/:"
-          ls -lh dist/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        # Only when a tag was supplied. Without one this run is a Docker-only
-        # build and must not create a release.
-        if: steps.vars.outputs.publish == 'true'
-        with:
-          tag_name: ${{ env.TAG }}
-          files: |
-            dist/*.tar.gz
-            dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256
-            dist/logo.png
-          draft: false
-          prerelease: false
-          generate_release_notes: true
-
-      - name: Display Next Version and Release Summary
-        if: always()
-        env:
-          TAG: ${{ env.TAG || 'latest' }}
-          PUBLISHED: ${{ steps.vars.outputs.publish || 'false' }}
-        run: |
-          set -euo pipefail
-
-          php -r '
-            $tag = getenv("TAG");
-            $published = getenv("PUBLISHED") === "true";
-
-            $next = "v1.0.0";
-            if (preg_match("/^v?(\d+)\.(\d+)\.(\d+)/", $tag, $m)) {
-                $major = $m[1];
-                $minor = $m[2];
-                $patch = (int)$m[3] + 1;
-                $next = "v{$major}.{$minor}.{$patch}";
-            } else {
-                // Fetch highest git tag if current run was docker-only
-                $output = shell_exec("git tag -l \"v*\" --sort=-v:refname | head -n 1");
-                $latestTag = trim($output ?: "");
-                if (preg_match("/^v?(\d+)\.(\d+)\.(\d+)/", $latestTag, $m)) {
-                    $next = "v{$m[1]}.{$m[2]}." . ((int)$m[3] + 1);
-                }
-            }
-
-            echo "::notice title=Next Recommended Release Tag::Next release version to use: " . $next . "\n";
-
-            $summary = "# 🚀 Release Build & Docker Publish Summary\n\n";
-            if ($published) {
-                $summary .= "- **Published Release Tag**: \`" . $tag . "\`\n";
-                $summary .= "- **Next Version To Use**: \`" . $next . "\` 🎉\n";
-                $summary .= "- **Docker Image (multi-arch)**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":" . $tag . "\`\n\n";
-                $summary .= "> 💡 **Next time you run this workflow, supply \`" . $next . "\` in the tag input.**\n";
-            } else {
-                $summary .= "- **Docker Image (multi-arch)**: \`ghcr.io/" . getenv("GITHUB_REPOSITORY") . ":latest\`\n";
-                $summary .= "- **Next Version To Use (when cutting a release)**: \`" . $next . "\`\n\n";
-                $summary .= "> ℹ️ *No release tag was provided; built and published Docker image only.*\n";
-            }
-
-            $summary .= "\n## Artifacts\n\n";
-            $summary .= "| target | how it is built |\n| --- | --- |\n";
-            $summary .= "| \`linux-x86_64\` | ubuntu-latest (native, gnu) |\n";
-            $summary .= "| \`linux-aarch64\` | ubuntu-24.04-arm (native, gnu) |\n";
-            $summary .= "| \`windows-x86_64\` | windows-latest |\n";
-            $summary .= "| \`macos-aarch64\` | macos-14 |\n";
-            $summary .= "| \`macos-x86_64\` | macos-13 |\n";
-            $summary .= "| container \`linux/amd64\` | ubuntu-latest musl |\n";
-            $summary .= "| container \`linux/arm64\` | ubuntu-24.04-arm musl |\n";
-            $summary .= "\n> No QEMU anywhere: every compile runs on its own architecture.";
-
-            file_put_contents(getenv("GITHUB_STEP_SUMMARY"), $summary, FILE_APPEND);
-          '
-
-  # ── the native build: same product, one binary, no PHP ─────────────────────
-  # `port/rust` embeds `public/` at compile time, so every artifact below is a
-  # single executable plus the optional launcher scripts in port/rust/desktop.
-  # Built on each desktop OS: a cross-compiled binary is not something we ship.
+  # ── the five native targets the PRODUCT actually asks for ──────────────────
+  # These names must match `platform_key()` in port/rust/src/update.rs and
+  # `detect_target()` in pencarimovie-linux.sh EXACTLY. The matrix used to carry
+  # only three of them, so linux-aarch64 (Raspberry Pi / ARM VPS) and
+  # macos-x86_64 (Intel Mac) were requested by the code and never published: the
+  # installer 404'd and silently fell back to `pencarimovie-server.tar.gz`, i.e.
+  # a different engine entirely.
+  #
+  # `musl_target` is set ONLY on the Linux legs: those additionally build a
+  # static binary for the alpine container image.
+  # `extra_target` is the additional rustup target a leg cross-builds natively
+  # (Apple only) — a cross-COMPILE, not an emulated build.
   native-build:
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── the five targets the PRODUCT actually asks for ──────────────────
-          # These names must match `platform_key()` in port/rust/src/update.rs
-          # and `detect_target()` in pencarimovie-linux.sh EXACTLY. Before this
-          # matrix carried only three of them, so linux-aarch64 (Raspberry Pi /
-          # ARM VPS) and macos-x86_64 (Intel Mac) were requested by the code and
-          # never published: the Linux installer 404'd and silently fell back to
-          # `pencarimovie-server.tar.gz`, which is the PHP/FrankenPHP product.
-          #
-          # `musl_target` is set ONLY on the Linux legs: those additionally build
-          # a static binary for the alpine container image (see the docker jobs).
-          #
-          # `extra_target` is the ADDITIONAL rustup target a leg cross-builds
-          # natively (Apple only). It is deliberately a cross-COMPILE, not an
-          # emulated one: the macOS SDK ships both slices and clang links either
-          # one directly on either host, which is why both macOS artifacts build
-          # on one arm64 runner. Encoding macos-x86_64 as its own runner
-          # (macos-13) was tried and dropped — GitHub has retired its Intel
-          # images, so that leg failed at SCHEDULING, which reads like a YAML bug.
           - os: ubuntu-latest
             artifact: linux-x86_64
             musl_target: x86_64-unknown-linux-musl
@@ -479,8 +211,8 @@ jobs:
           [ -f "$BIN" ] || { echo "::error::missing $BIN"; exit 1; }
           file "$BIN"
 
-          # Guard the #1 way this change breaks a release: a glibc binary in an
-          # alpine image. Fail here, loudly, instead of at `docker run`.
+          # Guard the #1 way this pipeline breaks: a glibc binary in an alpine
+          # image. Fail here, loudly, instead of at `docker run`.
           if file "$BIN" | grep -qi "dynamically linked"; then
             echo "::error::$BIN is dynamically linked — it cannot run in alpine"
             exit 1
@@ -538,13 +270,15 @@ jobs:
           fi
           ls -lh dist-rust/
 
+      # `release-` prefix so `publish` can glob exactly the five tarball
+      # artifacts without also pulling the `container-*` ones (whose payload is a
+      # bare `pencarimovie-server` and would collide under merge-multiple).
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: release-${{ matrix.artifact }}
           path: dist-rust/*
+          if-no-files-found: error
 
-      # The container binary travels as its own artifact so the docker jobs can
-      # `needs: native-build` and just download it.
       - uses: actions/upload-artifact@v4
         if: matrix.musl_target != ''
         with:
@@ -552,37 +286,17 @@ jobs:
           path: dist-container/${{ matrix.container_arch }}/pencarimovie-server
           if-no-files-found: error
 
-      - name: Attach to the release
-        if: ${{ github.event.inputs.tag != '' }}
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
-
-          # This job runs in PARALLEL with `build-and-release`, which is the one
-          # that creates the release. `gh release upload` on a tag that does not
-          # exist yet fails with "release not found", and with `set -e` that made
-          # the whole run red. Create it first (idempotent) and retry until it is
-          # visible; softprops later updates the same tag with the other assets.
-          for i in $(seq 1 20); do
-            if gh release view "$TAG" >/dev/null 2>&1; then break; fi
-            gh release create "$TAG" --title "$TAG" --generate-notes >/dev/null 2>&1 || true
-            sleep 15
-          done
-          gh release upload "$TAG" dist-rust/* --clobber
-
   # ── the deployable container, one arch per native runner ───────────────────
-  # Replaces the old `native-docker` job, which re-compiled the whole crate on
-  # x86 and then pushed a single-arch image. Each leg here DOWNLOADS an
-  # already-built musl binary and only COPYs it (Dockerfile.release), so a leg
-  # costs seconds instead of the ~45 min arm64/QEMU build it used to.
+  # Each leg DOWNLOADS an already-built musl binary and only COPYs it
+  # (Dockerfile.release), so a leg costs seconds instead of the ~45 min
+  # arm64/QEMU build it replaced.
   # `ubuntu-24.04-arm` is a public runner; if it were ever unavailable the job
   # fails at SCHEDULING with a message that reads like a YAML error, so check the
   # runner label first before suspecting this file.
   docker:
-    needs: native-build
+    # `prepare` is required because the per-arch push below reads
+    # `needs.prepare.outputs.tag`; without it those expressions resolve to empty.
+    needs: [prepare, native-build]
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -606,6 +320,8 @@ jobs:
           path: dist-docker/${{ matrix.arch }}
 
       - name: Build image (COPY only — no toolchain, no source)
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           BIN="dist-docker/${{ matrix.arch }}/pencarimovie-server"
@@ -647,15 +363,15 @@ jobs:
       # Push an arch-suffixed tag only. `docker-manifest` assembles these into
       # the multi-arch `:latest` / `:native` / `:$TAG` tags.
       - name: Push the per-architecture image
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
-          IMG="ghcr.io/${{ github.repository }}"
-          docker tag pencarimovie-server:native "$IMG:native-${{ matrix.arch }}"
-          docker push "$IMG:native-${{ matrix.arch }}"
-          if [ -n "$TAG" ]; then
-            docker tag pencarimovie-server:native "$IMG:${TAG}-${{ matrix.arch }}"
-            docker push "$IMG:${TAG}-${{ matrix.arch }}"
+          docker tag pencarimovie-server:native "$IMAGE:native-${{ matrix.arch }}"
+          docker push "$IMAGE:native-${{ matrix.arch }}"
+          if [ -n "${TAG:-}" ]; then
+            docker tag pencarimovie-server:native "$IMAGE:${TAG}-${{ matrix.arch }}"
+            docker push "$IMAGE:${TAG}-${{ matrix.arch }}"
           fi
 
   # ── assemble the multi-arch manifest list from the two native images ───────
@@ -664,7 +380,7 @@ jobs:
   # `ghcr.io/aiskendi/pencarimovie-server:native` as `runtime: image`, and it
   # simply becomes a manifest list instead of a single amd64 image.
   docker-manifest:
-    needs: [docker]
+    needs: [prepare, docker]
     runs-on: ubuntu-latest
     steps:
       - name: Setup Docker Buildx
@@ -675,36 +391,156 @@ jobs:
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Create and push the multi-arch manifest
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="$(printf '%s' "${{ github.event.inputs.tag }}" | tr -d '[:space:]')"
-          IMG="ghcr.io/${{ github.repository }}"
-
-          AMD64="$IMG:native-amd64"
-          ARM64="$IMG:native-arm64"
-
-          TAGS=(-t "$IMG:latest" -t "$IMG:native")
-          if [ -n "$TAG" ]; then
-            TAGS+=(-t "$IMG:$TAG" -t "$IMG:native-$TAG")
+          TAGS=(-t "$IMAGE:latest" -t "$IMAGE:native")
+          if [ -n "${TAG:-}" ]; then
+            TAGS+=(-t "$IMAGE:$TAG" -t "$IMAGE:native-$TAG")
           fi
-
-          docker buildx imagetools create "${TAGS[@]}" "$AMD64" "$ARM64"
-
+          docker buildx imagetools create "${TAGS[@]}" \
+            "$IMAGE:native-amd64" "$IMAGE:native-arm64"
           echo "=== published manifest ==="
-          docker buildx imagetools inspect "$IMG:native"
+          docker buildx imagetools inspect "$IMAGE:native"
 
       # Fail the release if the arm64 half is missing: that is the exact failure
       # mode this whole restructure exists to remove.
       - name: Verify both architectures are present
         run: |
           set -euo pipefail
-          IMG="ghcr.io/${{ github.repository }}"
-          OUT="$(docker buildx imagetools inspect "$IMG:native")"
+          OUT="$(docker buildx imagetools inspect "$IMAGE:native")"
           echo "$OUT"
           for want in linux/amd64 linux/arm64; do
             if ! printf '%s' "$OUT" | grep -q "$want"; then
-              echo "::error::$IMG:native is missing $want"
+              echo "::error::$IMAGE:native is missing $want"
               exit 1
             fi
           done
-          echo "Verified: $IMG:native carries linux/amd64 AND linux/arm64"
+          echo "Verified: $IMAGE:native carries linux/amd64 AND linux/arm64"
+
+  # ── publish EVERY target to the release in one place ───────────────────────
+  # Previously each matrix leg ran its own `gh release create` retry loop and
+  # uploaded only its own tarball, so a leg that finished early could race the
+  # others. Now both producers are done, everything is downloaded, and the
+  # release gets all five tarballs + their .sha256 sidecars in one upload.
+  publish:
+    needs: [prepare, native-build, docker-manifest]
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every release artifact
+        uses: actions/download-artifact@v4
+        with:
+          # Only the tarball artifacts. `container-*` artifacts hold a bare
+          # `pencarimovie-server` and would collide under merge-multiple.
+          pattern: release-*
+          path: dist-all
+          merge-multiple: true
+
+      - name: Add the installer scripts and logo
+        run: |
+          set -euo pipefail
+          # The POSIX installers are what most users actually run; keeping them
+          # beside the tarballs is how `curl -fsSL .../pencarimovie-linux.sh` and
+          # the in-app OTA stay version-locked to these assets.
+          for f in pencarimovie-linux.sh pencarimovie-termux.sh; do
+            [ -f "$f" ] && cp "$f" dist-all/ || true
+          done
+          [ -f public/logo.png ] && cp public/logo.png dist-all/ || true
+          ls -lh dist-all/
+
+      - name: Assert all five architectures are present
+        run: |
+          set -euo pipefail
+          missing=0
+          for target in linux-x86_64 linux-aarch64 windows-x86_64 macos-aarch64 macos-x86_64; do
+            f="dist-all/pencarimovie-server-$target.tar.gz"
+            if [ ! -f "$f" ]; then
+              echo "::error::missing $f"
+              missing=1
+              continue
+            fi
+            # Every tarball must carry its own .sha256: the POSIX installers
+            # verify it before `tar -xzf` and otherwise can only warn.
+            if [ ! -f "$f.sha256" ]; then
+              echo "::error::missing $f.sha256"
+              missing=1
+            fi
+            echo "OK  $target"
+          done
+          ls -R dist-all | head -n 40
+          exit "$missing"
+
+      - name: Upload every asset to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist-all/* --clobber
+          echo "=== release assets ==="
+          gh release view "$TAG" --json assets \
+            --jq '.assets[] | "\(.name)  \(.size)"'
+
+  # ── summary ────────────────────────────────────────────────────────────────
+  summary:
+    needs: [prepare, docker-manifest, publish]
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write the run summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PUBLISHED: ${{ needs.prepare.outputs.publish }}
+        run: |
+          set -euo pipefail
+          NEXT="v1.0.0"
+          if [[ "${TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            NEXT="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+          else
+            LATEST="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"
+            if [[ "$LATEST" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+              NEXT="v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+            fi
+          fi
+
+          {
+            echo "# 🚀 Release Build & Docker Publish Summary"
+            echo
+            if [ "$PUBLISHED" = "true" ]; then
+              echo "- **Published release tag**: \`$TAG\`"
+              echo "- **Next version to use**: \`$NEXT\` 🎉"
+            else
+              echo "- **Release**: none (no tag supplied — Docker image only)"
+              echo "- **Next version to use**: \`$NEXT\`"
+            fi
+            echo "- **Docker image (multi-arch)**: \`$IMAGE:latest\` / \`:native\`"
+            echo
+            echo "## Artifacts (all built natively — no QEMU)"
+            echo
+            echo "| target | runner |"
+            echo "| --- | --- |"
+            echo "| \`linux-x86_64\` | ubuntu-latest |"
+            echo "| \`linux-aarch64\` | ubuntu-24.04-arm |"
+            echo "| \`windows-x86_64\` | windows-latest |"
+            echo "| \`macos-aarch64\` | macos-14 |"
+            echo "| \`macos-x86_64\` | macos-14 (native cross-link) |"
+            echo "| container \`linux/amd64\` | ubuntu-latest (musl) |"
+            echo "| container \`linux/arm64\` | ubuntu-24.04-arm (musl) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notice the next version
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${TAG:-}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            echo "::notice title=Next Recommended Release Tag::Next release version to use: v${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+          fi
