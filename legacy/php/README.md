@@ -35,6 +35,15 @@ root) into one self-contained binary.
 | `test_kudrat_series.php`                 | The 18-check series-matcher regression harness.                                                                                                                     |
 | `SHARED-HOSTING.md`                      | cPanel/ByetHost deployment tutorial.                                                                                                                                |
 
+## Two files that did NOT move: `tray.ico` / `tray.png`
+
+They stayed at the repository root. `release.yml` stages them into **every Rust
+release artifact** (`cp tray.ico "stage/$NAME/pencarimovie.ico"`), so they are
+product assets, not legacy ones — moving them here silently stripped the tray icon
+from all five tarballs (caught by running the packaging path end-to-end).
+`legacy/php/tray.ps1` looks for them next to itself and therefore falls back to a
+stock icon if you ever run this tree standalone.
+
 ## Things that moved here that you might not expect
 
 - **`SHARED-HOSTING.md`** — it documents installing the PHP build on cPanel. It is
