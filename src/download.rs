@@ -576,6 +576,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
 
+    // A bot is usable when this instance already holds its session file, OR when
+    // the environment supplies its token (`BOT_TOKENS`) and it can be logged in
+    // here on demand. Without the second half a scaled-out deploy only ever uses
+    // the bots whose session happens to live on the instance the request landed
+    // on — measured on Heroku: 5 dynos, 5 independent pools, the added bot used
+    // by one dyno in five.
+    let usable = |id: &str| has_local_session(id) || crate::session::env_token_for(id).is_some();
+
     let mut candidates: Vec<String> = Vec::new();
     if !short_code.is_empty() {
         if let Some(picked) = pick_pool_bot() {
@@ -585,15 +593,15 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             }
         }
     }
-    if !active_bot.is_empty() && !candidates.contains(&active_bot) && has_local_session(&active_bot) {
+    if !active_bot.is_empty() && !candidates.contains(&active_bot) && usable(&active_bot) {
         candidates.push(active_bot.clone());
     }
-    if !bot_id.is_empty() && !candidates.contains(&bot_id) && has_local_session(&bot_id) {
+    if !bot_id.is_empty() && !candidates.contains(&bot_id) && usable(&bot_id) {
         candidates.push(bot_id.clone());
     }
     for b in get_bot_pool() {
         let id = jstr(&b, "bot_id");
-        if !id.is_empty() && !candidates.contains(&id) && has_local_session(&id) {
+        if !id.is_empty() && !candidates.contains(&id) && usable(&id) {
             candidates.push(id);
         }
     }
@@ -757,11 +765,17 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         .chain(std::iter::once(active_bot.clone()))
         .chain(candidates.iter().cloned())
     {
-        if candidate.is_empty() || !has_local_session(&candidate) || tried.contains(&candidate) {
+        // `has_local_session` alone would skip an env-supplied bot on an instance
+        // that has not logged it in yet, so accept it and pass its token through.
+        let env_token = crate::session::env_token_for(&candidate);
+        if candidate.is_empty()
+            || (!has_local_session(&candidate) && env_token.is_none())
+            || tried.contains(&candidate)
+        {
             continue;
         }
         tried.push(candidate.clone());
-        match state.telegram.boot(&candidate, None).await {
+        match state.telegram.boot(&candidate, env_token.as_deref()).await {
             Ok(e) => {
                 bot_id = candidate;
                 entry = Some(e);

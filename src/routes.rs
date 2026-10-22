@@ -51,9 +51,9 @@ use crate::respond::{
     stremio_locked_stream, text_response,
 };
 use crate::session::{
-    add_pool_bot, auto_provision_guest, clear_session, clock_skew_message, get_bot_id, get_bot_pool,
-    has_local_session, is_guest_provision_in_progress, load_session_meta, measure_clock_offset,
-    remove_pool_bot, save_session_meta,
+    add_pool_bot, auto_provision_guest, clear_session, clock_skew_message, env_bot_tokens,
+    env_token_for, get_bot_id, get_bot_pool, has_local_session, is_guest_provision_in_progress,
+    load_session_meta, measure_clock_offset, remove_pool_bot, save_session_meta,
 };
 use crate::storage::{env, now, storage_path};
 use crate::tunnel;
@@ -858,6 +858,10 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 "ok": 1,
                 "active_bot_id": active,
                 "total_bots": list.len(),
+                // How many of the entries above come from `BOT_TOKENS` (they are
+                // shared by every instance; the rest are this instance's disk
+                // state and are not visible to its siblings).
+                "env_bots": env_bot_tokens().len(),
                 "bots": list,
             }),
         );
@@ -956,6 +960,20 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
         let bot_id = jstr(&input, "bot_id");
         if bot_id.is_empty() {
             return json_response(400, &serde_json::json!({"ok": 0, "message": "bot_id is required."}));
+        }
+        // A `BOT_TOKENS` bot has no file entry, so deleting it here would only
+        // hide it until the next request re-adds it from the environment.
+        if env_token_for(&bot_id).is_some() {
+            return json_response(
+                400,
+                &serde_json::json!({
+                    "ok": 0,
+                    "message": "This bot comes from the BOT_TOKENS environment variable. Remove its token there and restart the server.",
+                    "limited_by_env": true,
+                    "pool": get_bot_pool(),
+                    "active_bot_id": get_bot_id(),
+                }),
+            );
         }
         let pool = remove_pool_bot(&bot_id);
         return json_response(

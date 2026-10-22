@@ -26,6 +26,11 @@
       "description": "Concurrent /api/download bodies before 503 + Retry-After. The engine default is 0 (unlimited), which suits self-hosting; a PaaS with a short request timeout wants an explicit cap, because overflow past it dies on the router timeout (Heroku H12 at 30s) and returns an HTML error page instead of a retryable JSON 503.",
       "value": "256",
       "required": false
+    },
+    "BOT_TOKENS": {
+      "description": "Optional pool of Telegram bot tokens, comma/space/newline separated. Set this when running more than one instance: the bot pool file lives on each instance's own ephemeral disk, so a bot added in the dashboard is only used by the instance that stored it. With BOT_TOKENS every instance logs in all of them and downloads are spread across the pool.",
+      "value": "",
+      "required": false
     }
   },
   "formation": {

@@ -175,6 +175,12 @@ TUNNEL_TOKEN=eyJh...
 # Optional: Custom Telegram Bot API Token (overrides guest auto-provisioning)
 BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
+# Optional: a whole bot POOL from the environment (comma / space / newline
+# separated). Use this on any host that runs more than one instance: the pool
+# file lives on each instance's own disk, so bots added in the dashboard are
+# only visible to the instance that happened to answer the request.
+# BOT_TOKENS=111111111:AAA...,222222222:BBB...,333333333:CCC...
+
 # Optional: Local Network IP Override (if running behind multi-adapter Docker bridge)
 # LAN_IP=192.168.1.100
 
@@ -189,18 +195,19 @@ BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 
 ### Configuration Variables Reference
 
-| Variable          | Default              | Description                                                                                                                                                                                                                |
-| :---------------- | :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PORT`            | `8088`               | Port where the server listens (or provided by PaaS runtime).                                                                                                                                                               |
-| `SERVER_PASSWORD` | `123456`             | Password for dashboard access on public IPs, tunnels and cloud hosts. LAN is password-free.                                                                                                                                |
-| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for public addon URLs (`/<token>/manifest.json`); makes the link permanent.                                                                                                                            |
-| `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                                                                                                                                               |
-| `PM_APP_ROOT`     | `storage/`           | Where sessions, auth and caches live.                                                                                                                                                                                      |
-| `PM_INFLIGHT`     | _(auto)_             | Maximum concurrent requests (`0` = auto).                                                                                                                                                                                  |
-| `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = **unlimited** (the default). Set a number only on a host with a short request timeout — past the cap a viewer gets a fast `503` + `Retry-After` instead of dying on the proxy timeout. |
-| `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                                      |
-| `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                                 |
-| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                                                                                                                                                  |
+| Variable          | Default              | Description                                                                                                                                                                                                                                                                                                    |
+| :---------------- | :------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`            | `8088`               | Port where the server listens (or provided by PaaS runtime).                                                                                                                                                                                                                                                   |
+| `SERVER_PASSWORD` | `123456`             | Password for dashboard access on public IPs, tunnels and cloud hosts. LAN is password-free.                                                                                                                                                                                                                    |
+| `SERVER_TOKEN`    | _(auto-generated)_   | Static access token for public addon URLs (`/<token>/manifest.json`); makes the link permanent.                                                                                                                                                                                                                |
+| `BOT_TOKEN`       | _(auto-provision)_   | Telegram Bot API token. If omitted, the server mints and rotates guest bots.                                                                                                                                                                                                                                   |
+| `BOT_TOKENS`      | _(auto-provision)_   | Pool of bot tokens, comma/space/newline separated (alias `TG_BOT_TOKENS`). **Required for a multi-instance deploy** — the on-disk pool is per instance, so a bot added in the dashboard is only used by the instance that stored it. Every instance logs in all of these and downloads are spread across them. |
+| `PM_APP_ROOT`     | `storage/`           | Where sessions, auth and caches live.                                                                                                                                                                                                                                                                          |
+| `PM_INFLIGHT`     | _(auto)_             | Maximum concurrent requests (`0` = auto).                                                                                                                                                                                                                                                                      |
+| `PM_MAX_STREAMS`  | `0`                  | Maximum simultaneous streams. `0` = **unlimited** (the default). Set a number only on a host with a short request timeout — past the cap a viewer gets a fast `503` + `Retry-After` instead of dying on the proxy timeout.                                                                                     |
+| `PM_PIPELINE`     | _(auto)_             | Download pipeline depth (`0` = auto).                                                                                                                                                                                                                                                                          |
+| `PM_CACHE_DB`     | `storage/cache.redb` | Cache database path; `off` keeps the cache in memory only.                                                                                                                                                                                                                                                     |
+| `PM_LISTEN_HOST`  | _(auto)_             | Bind address: loopback locally, all interfaces on a PaaS.                                                                                                                                                                                                                                                      |
 
 ---
 

@@ -29,7 +29,7 @@ use crate::config::wp_api_base;
 use crate::credentials::{save_api_secret, get_api_secret};
 use crate::httpc::http_json;
 use crate::log::log;
-use crate::storage::{env, now, storage_path};
+use crate::storage::{now, storage_path};
 
 /* ── identity ────────────────────────────────────────────────────────────── */
 
@@ -75,6 +75,63 @@ pub fn clear_session_meta() {
     let _ = fs::remove_file(session_meta_path());
 }
 
+/// Bot tokens supplied by the environment, in order.
+///
+/// `BOT_TOKENS` (plural) is a comma / semicolon / whitespace separated list;
+/// `TG_BOT_TOKENS` is an alias, and the legacy single `BOT_TOKEN` /
+/// `TG_BOT_TOKEN` counts as a one-element list.
+///
+/// Why this exists: the bot pool is per-process DISK state (`bot_pool.json`
+/// plus `sessions/<bot_id>/session.rust.json`). On a PaaS with more than one
+/// instance — Heroku `web.1..web.N`, Fly machines, a scaled Render service —
+/// every instance has its own ephemeral disk, so a bot added through
+/// `/api/bots/add` exists on exactly ONE instance. Measured on Heroku with 5
+/// dynos: 14 `/api/bots` reads returned **5 distinct pools**, each holding only
+/// its own auto-provisioned guest bot, and the bot the user added was visible
+/// on one of them. An env list is the only bot state every instance shares.
+/// Split a `BOT_TOKENS` value (comma / semicolon / any whitespace, so a
+/// newline-separated `heroku config:set` paste works) and append each token not
+/// already present.
+fn parse_token_list(raw: &str, out: &mut Vec<String>) {
+    for part in raw.split([',', ';', '\n', '\r', '\t', ' ']) {
+        let token = part.trim();
+        // A bot token is always `<digits>:<secret>`; requiring the colon keeps a
+        // stray word in the list from being treated as a credential.
+        if !token.is_empty() && token.contains(':') && !out.iter().any(|t| t == token) {
+            out.push(token.to_string());
+        }
+    }
+}
+
+pub fn env_bot_tokens() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // `std::env::var` directly (not the `env()` helper) so an EMPTY `BOT_TOKENS`
+    // cannot shadow the singular fallbacks.
+    for key in ["BOT_TOKENS", "TG_BOT_TOKENS"] {
+        if let Ok(raw) = std::env::var(key) {
+            parse_token_list(&raw, &mut out);
+        }
+    }
+    for key in ["BOT_TOKEN", "TG_BOT_TOKEN"] {
+        if let Ok(raw) = std::env::var(key) {
+            parse_token_list(&raw, &mut out);
+        }
+    }
+    out
+}
+
+/// The env token that owns `bot_id`, so a bot listed only in `BOT_TOKENS` can be
+/// logged in on demand (it has no session file on a freshly booted instance).
+pub fn env_token_for(bot_id: &str) -> Option<String> {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    env_bot_tokens()
+        .into_iter()
+        .find(|t| t.split(':').next().unwrap_or("").trim() == id)
+}
+
 pub fn get_bot_id() -> String {
     let meta = load_session_meta();
     let from_meta = meta
@@ -86,9 +143,8 @@ pub fn get_bot_id() -> String {
     if !from_meta.is_empty() {
         return from_meta;
     }
-    let env_token = env("BOT_TOKEN").or_else(|| env("TG_BOT_TOKEN")).unwrap_or_default();
-    if !env_token.is_empty() {
-        let id = env_token.split(':').next().unwrap_or("").trim();
+    if let Some(first) = env_bot_tokens().first() {
+        let id = first.split(':').next().unwrap_or("").trim();
         if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) {
             return id.to_string();
         }
@@ -157,7 +213,10 @@ fn read_pool_file() -> Vec<Value> {
         .unwrap_or_default()
 }
 
-pub fn get_bot_pool() -> Vec<Value> {
+/// The on-disk pool, repaired with the active bot when `session_meta.json`
+/// proves it existed. Every MUTATION uses this (never the env-merged view), so a
+/// bot supplied by `BOT_TOKENS` is never written into `bot_pool.json`.
+fn file_pool() -> Vec<Value> {
     let mut pool = read_pool_file();
     let active = get_bot_id();
     // Only repair a genuinely missing entry (session_meta.json on disk), exactly
@@ -183,6 +242,38 @@ pub fn get_bot_pool() -> Vec<Value> {
     pool
 }
 
+/// The pool as every reader sees it: the on-disk entries plus every bot the
+/// environment supplies. On a multi-instance deploy this is what makes all
+/// instances agree on the pool — see [`env_bot_tokens()`]. Env entries carry
+/// `"is_env": true` and are NOT persisted, so unsetting the variable removes
+/// them again.
+pub fn get_bot_pool() -> Vec<Value> {
+    let mut pool = file_pool();
+    for token in env_bot_tokens() {
+        let id = token.split(':').next().unwrap_or("").trim().to_string();
+        if id.is_empty() {
+            continue;
+        }
+        if pool
+            .iter()
+            .any(|b| b.get("bot_id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        {
+            continue;
+        }
+        pool.push(serde_json::json!({
+            "bot_id": id,
+            "bot_username": "",
+            "bot_name": format!("Bot {}", id),
+            "status": "online",
+            "source": "env",
+            "is_env": true,
+            "added_at": now(),
+            "updated_at": now(),
+        }));
+    }
+    pool
+}
+
 pub fn save_bot_pool(pool: &[Value]) {
     let body = serde_json::to_string_pretty(&Value::Array(pool.to_vec()))
         .unwrap_or_else(|_| "[]".to_string());
@@ -194,7 +285,7 @@ pub fn add_pool_bot(bot_data: Value) -> Vec<Value> {
     if bot_id.is_empty() {
         return Vec::new();
     }
-    let mut pool = get_bot_pool();
+    let mut pool = file_pool();
     let mut found = false;
     for item in pool.iter_mut() {
         if item.get("bot_id").and_then(|v| v.as_str()) == Some(bot_id.as_str()) {
@@ -232,7 +323,9 @@ pub fn remove_pool_bot(bot_id: &str) -> Vec<Value> {
     if id.is_empty() {
         return get_bot_pool();
     }
-    let next: Vec<Value> = get_bot_pool()
+    // File pool only: an env-supplied bot has no file entry, and filtering the
+    // merged view would persist the env entries into `bot_pool.json`.
+    let next: Vec<Value> = file_pool()
         .into_iter()
         .filter(|b| b.get("bot_id").and_then(|v| v.as_str()) != Some(id))
         .collect();
@@ -253,10 +346,20 @@ pub fn remove_pool_bot(bot_id: &str) -> Vec<Value> {
     }
     if next.is_empty() {
         let _ = fs::remove_file(bot_pool_path());
-        clear_session_meta();
-        clear_session();
+        // With `BOT_TOKENS` set the machine still has bots, so promote the first
+        // env bot instead of leaving the instance with no active session.
+        match env_bot_tokens().first() {
+            Some(token) => {
+                let id = token.split(':').next().unwrap_or("").trim().to_string();
+                save_session_meta(&id, "", "");
+            }
+            None => {
+                clear_session_meta();
+                clear_session();
+            }
+        }
     }
-    next
+    get_bot_pool()
 }
 
 pub fn pick_pool_bot() -> Option<Value> {
@@ -506,6 +609,30 @@ mod tests {
             "Your clock is 7m 12s behind Telegram's server time."
         );
     }
+
+    /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
+    /// shares, so the parsing has to survive whatever an operator pastes into a
+    /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
+    /// accidental junk.
+    #[test]
+    fn bot_token_list_parses_every_separator_and_dedupes() {
+        let mut out = Vec::new();
+        parse_token_list(
+            "111:AAA, 222:BBB\n333:CCC\t111:AAA  ,\n  ;444:DDD",
+            &mut out,
+        );
+        assert_eq!(out, vec!["111:AAA", "222:BBB", "333:CCC", "444:DDD"]);
+
+        // A word without the `id:secret` colon is not a credential.
+        let mut out = Vec::new();
+        parse_token_list("BOT_TOKEN 555:EEE notatoken", &mut out);
+        assert_eq!(out, vec!["555:EEE"]);
+
+        let mut out = Vec::new();
+        parse_token_list("", &mut out);
+        assert!(out.is_empty());
+    }
+
 }
 
 pub fn is_clock_or_authkey_error(message: &str) -> bool {
@@ -675,16 +802,18 @@ pub async fn auto_provision_guest(
         }
     }
 
-    // Static BOT_TOKEN / TG_BOT_TOKEN wins when present (container installs).
-    if let Some(env_token) = env("BOT_TOKEN").or_else(|| env("TG_BOT_TOKEN")) {
-        let env_token = env_token.trim().to_string();
-        let id_part = env_token.split(':').next().unwrap_or("").to_string();
+    // Env-supplied tokens win when present (container / multi-instance installs).
+    // Every token is tried in order: on a PaaS each instance must be able to log
+    // in pool bots it did not add itself, and one expired token must not take the
+    // whole pool down.
+    for token in env_bot_tokens() {
+        let id_part = token.split(':').next().unwrap_or("").trim().to_string();
         let target = if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
             id_part
         } else {
             format!("env_{}", random_suffix())
         };
-        match tg.boot(&target, Some(&env_token)).await {
+        match tg.boot(&target, Some(&token)).await {
             Ok(entry) => {
                 save_session_meta(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
                 let meta = load_session_meta();
@@ -695,7 +824,10 @@ pub async fn auto_provision_guest(
                     error: None,
                 });
             }
-            Err(e) => log("BOT_TOKEN from environment failed to boot", &serde_json::json!({"error": e})),
+            Err(e) => log(
+                "env bot token failed to boot",
+                &serde_json::json!({"bot_id": target, "error": e}),
+            ),
         }
     }
 

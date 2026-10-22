@@ -259,6 +259,53 @@ async fn main() -> anyhow::Result<()> {
     });
     storage::prune_cache_files(false);
 
+    // Bring every env-supplied pool bot up before the first request, so each
+    // instance holds a session for all of them and `pick_pool_bot()` can spread
+    // downloads across the pool. Detached and best-effort: a slow or expired
+    // token must never delay the listener. Why an env list at all is explained on
+    // `session::env_bot_tokens()` — the pool file is per-instance disk state.
+    {
+        let boot_state = state.clone();
+        tokio::spawn(async move {
+            let tokens = session::env_bot_tokens();
+            if tokens.is_empty() {
+                return;
+            }
+            log::stderr_log(
+                "booting env bot pool",
+                Some(&serde_json::json!({ "bots": tokens.len() })),
+            );
+            for (idx, token) in tokens.into_iter().enumerate() {
+                let id = token.split(':').next().unwrap_or("").trim().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                match boot_state.telegram.boot(&id, Some(&token)).await {
+                    Ok(entry) => {
+                        if idx == 0 && session::get_bot_id().is_empty() {
+                            session::save_session_meta(
+                                &entry.identity.id,
+                                &entry.identity.username,
+                                &entry.identity.first_name,
+                            );
+                        }
+                        log::stderr_log(
+                            "env pool bot ready",
+                            Some(&serde_json::json!({
+                                "bot_id": entry.identity.id,
+                                "username": entry.identity.username,
+                            })),
+                        );
+                    }
+                    Err(e) => log::stderr_log(
+                        "env pool bot failed",
+                        Some(&serde_json::json!({ "bot_id": id, "error": e })),
+                    ),
+                }
+            }
+        });
+    }
+
     let _ = STATE.set(state.clone());
     // One fallback handles every path, exactly like backend.php's dispatch block.
     let app = Router::new().fallback(serve_all);
