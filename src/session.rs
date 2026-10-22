@@ -29,7 +29,7 @@ use crate::config::wp_api_base;
 use crate::credentials::{save_api_secret, get_api_secret};
 use crate::httpc::http_json;
 use crate::log::log;
-use crate::storage::{now, storage_path};
+use crate::storage::{env, now, storage_path};
 
 /* ── identity ────────────────────────────────────────────────────────────── */
 
@@ -401,6 +401,28 @@ pub fn pick_pool_bot() -> Option<Value> {
     Some(picked)
 }
 
+/// How many bots this instance should keep warm (`PM_POOL_SIZE`, default **1** =
+/// the previous behaviour).
+///
+/// The pool exists to spread downloads over several Telegram auth keys and to
+/// survive one bot hitting a flood-wait; every bot also brings its own
+/// `--workers` connections. **This is the only pool knob a hosted user needs** —
+/// the bots themselves are leased from the origin's own pool, so there is no
+/// token to paste anywhere.
+pub fn pool_target_size() -> usize {
+    clamp_pool_size(
+        env("PM_POOL_SIZE")
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(1),
+    )
+}
+
+/// More than 8 bots per instance buys nothing (each already brings `--workers`
+/// connections) and every lease consumes one of the origin's per-bot slots.
+fn clamp_pool_size(n: usize) -> usize {
+    n.clamp(1, 8)
+}
+
 /* ── guest provisioning ──────────────────────────────────────────────────── */
 
 fn provision_lock_path() -> PathBuf {
@@ -608,6 +630,16 @@ mod tests {
             clock_skew_message(-432),
             "Your clock is 7m 12s behind Telegram's server time."
         );
+    }
+
+    /// `PM_POOL_SIZE` is a plain number in a config var, so 0 / typo / absurd
+    /// values must not disable the pool or lease a hundred bots.
+    #[test]
+    fn pool_size_is_clamped_to_a_sane_range() {
+        assert_eq!(clamp_pool_size(0), 1);
+        assert_eq!(clamp_pool_size(1), 1);
+        assert_eq!(clamp_pool_size(3), 3);
+        assert_eq!(clamp_pool_size(99), 8);
     }
 
     /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
@@ -831,6 +863,28 @@ pub async fn auto_provision_guest(
         }
     }
 
+    // The origin keeps its own pool of bots and hands out the least-used one on
+    // every `provision-session` call, so leasing is also how a multi-instance
+    // deploy builds a pool without anyone handling tokens — see
+    // `ensure_pool_size()`.
+    match lease_guest_bot(tg).await {
+        Ok(res) => {
+            save_session_meta(&res.bot_id, &res.bot_username, &res.bot_name);
+            log(
+                "guest bot provisioned",
+                &serde_json::json!({"bot_id": res.bot_id, "username": res.bot_username}),
+            );
+            Ok(res)
+        }
+        Err(e) => Err(ProvisionResult::error(e)),
+    }
+}
+
+/// One lease from the origin's bot pool: `GET /provision-session`, then log that
+/// bot in here. Never touches `session_meta.json` — the caller decides which bot
+/// becomes the active one (provisioning takes the first, `ensure_pool_size()`
+/// keeps the bot that is already active).
+async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<ProvisionResult, String> {
     let mut last_error: Option<String> = None;
     for attempt in 0..2 {
         let url = format!(
@@ -867,11 +921,6 @@ pub async fn auto_provision_guest(
                 } else {
                     entry.identity.id.clone()
                 };
-                save_session_meta(&real_id, &entry.identity.username, &entry.identity.first_name);
-                log(
-                    "guest bot provisioned",
-                    &serde_json::json!({"bot_id": real_id, "username": entry.identity.username}),
-                );
                 return Ok(ProvisionResult {
                     bot_id: real_id,
                     bot_username: entry.identity.username.clone(),
@@ -885,18 +934,80 @@ pub async fn auto_provision_guest(
                     &serde_json::json!({"error": e, "bot_id": target, "attempt": attempt + 1}),
                 );
                 if is_clock_or_authkey_error(&e) {
-                    return Err(ProvisionResult::error(friendly_login_error(&e)));
+                    return Err(friendly_login_error(&e));
                 }
                 last_error = Some(e);
             }
         }
     }
-    match last_error {
-        Some(e) => Err(ProvisionResult::error(e)),
-        None => Err(ProvisionResult::error(
-            "Could not obtain guest bot session from server.",
-        )),
+    Err(last_error
+        .unwrap_or_else(|| "Could not obtain guest bot session from server.".to_string()))
+}
+
+/// Top this instance's bot pool up to [`pool_target_size`].
+///
+/// Every instance leases its OWN bots from the origin. That is what makes a
+/// multi-instance deploy work with no tokens and no shared disk: `bot_pool.json`
+/// and `sessions/<bot_id>/` are per-instance state, and the download candidate
+/// filter skips a pool bot whose session lives on a different instance
+/// (measured on Heroku: 5 dynos, 14 `/api/bots` reads, 5 distinct pools of one
+/// bot each — the "extra dynos only use 1 bot" report).
+///
+/// Returns how many bots the pool holds with a usable session.
+pub async fn ensure_pool_size(tg: &crate::telegram::TelegramPool) -> usize {
+    let target = pool_target_size();
+    let count = || {
+        get_bot_pool()
+            .iter()
+            .filter(|b| {
+                let id = b.get("bot_id").and_then(|v| v.as_str()).unwrap_or("");
+                !id.is_empty() && crate::telegram::has_session_file(id)
+            })
+            .count()
+    };
+    let mut have = count();
+    if have >= target {
+        return have;
     }
+    // The same lock provisioning uses, so a startup top-up and a
+    // request-triggered provision can never log in bots concurrently.
+    let _lock = match ProvisionLock::acquire(60_000).await {
+        Some(l) => l,
+        None => return have,
+    };
+    have = count();
+    let had_active = !get_bot_id().is_empty();
+    while have < target {
+        match lease_guest_bot(tg).await {
+            Ok(res) => {
+                let make_active = !had_active && have == 0;
+                add_pool_bot(serde_json::json!({
+                    "bot_id": res.bot_id,
+                    "bot_username": res.bot_username,
+                    "bot_name": res.bot_name,
+                    "status": "online",
+                    "is_active": make_active,
+                    "updated_at": now(),
+                }));
+                if make_active {
+                    save_session_meta(&res.bot_id, &res.bot_username, &res.bot_name);
+                }
+                have += 1;
+                log(
+                    "pool leased guest bot",
+                    &serde_json::json!({"bot_id": res.bot_id, "have": have, "target": target}),
+                );
+            }
+            Err(e) => {
+                log(
+                    "pool lease failed",
+                    &serde_json::json!({"error": e, "have": have, "target": target}),
+                );
+                break;
+            }
+        }
+    }
+    have
 }
 
 /// Only used by `/api/provision` to echo the secret; kept here so the route has

@@ -306,6 +306,27 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Top this instance's pool up to `PM_POOL_SIZE` by leasing bots from the
+    // origin's own pool. Detached for the same reason as the warm above: a lease
+    // is an HTTP round-trip plus a Telegram login and must not delay the
+    // listener. This is what makes a scaled-out deploy hold MORE than one bot per
+    // instance without anyone pasting tokens (`bot_pool.json` and the sessions
+    // are per-instance disk state, so a pool added on one instance is invisible
+    // to its siblings).
+    {
+        let pool_state = state.clone();
+        tokio::spawn(async move {
+            let have = session::ensure_pool_size(&pool_state.telegram).await;
+            log::stderr_log(
+                "bot pool ready",
+                Some(&serde_json::json!({
+                    "bots": have,
+                    "target": session::pool_target_size(),
+                })),
+            );
+        });
+    }
+
     let _ = STATE.set(state.clone());
     // One fallback handles every path, exactly like backend.php's dispatch block.
     let app = Router::new().fallback(serve_all);
@@ -334,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
             "workers": workers,
             "inflight": inflight,
             "max_streams": max_streams,
+            "pool_size": session::pool_target_size(),
             "storage": storage::storage_dir().display().to_string(),
             "version": config::app_version(),
             "runtime": format!("pencarimovie-server {}", config::app_version()),
@@ -348,7 +370,7 @@ async fn main() -> anyhow::Result<()> {
         host.clone()
     };
     println!(
-        "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n",
+        "\n  PencariMovie Server\n  Local:       http://{}:{}\n  Listening:   {}:{}\n  Storage:     {}\n  Workers:     {} (one Telegram connection each)\n  Inflight:    {} parts per connection ({} total)\n  Max streams: {}\n  Bot pool:    {} (PM_POOL_SIZE; bots leased per instance)\n",
         shown,
         port,
         host,
@@ -357,7 +379,8 @@ async fn main() -> anyhow::Result<()> {
         workers,
         inflight,
         workers * inflight,
-        max_streams
+        max_streams,
+        session::pool_target_size()
     );
     if host == "0.0.0.0" || host == "::" {
         println!("  LAN/TV:      http://<this-device-ip>:{}\n", port);
