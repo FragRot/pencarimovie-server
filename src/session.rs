@@ -318,6 +318,26 @@ pub fn add_pool_bot(bot_data: Value) -> Vec<Value> {
     pool
 }
 
+/// Record a successfully booted env-supplied bot's REAL identity, so the pool
+/// list shows `@username` instead of the placeholder name derived from its id
+/// ("Bot 8990816622"). `get_bot_pool()` only fills that placeholder for an env
+/// bot that has no on-disk entry yet, and this is what creates one.
+pub fn remember_env_identity(bot_id: &str, username: &str, name: &str) {
+    let id = bot_id.trim();
+    if id.is_empty() {
+        return;
+    }
+    add_pool_bot(serde_json::json!({
+        "bot_id": id,
+        "bot_username": username,
+        "bot_name": if name.is_empty() { username } else { name },
+        "status": "online",
+        "source": "env",
+        "is_env": true,
+        "updated_at": now(),
+    }));
+}
+
 pub fn remove_pool_bot(bot_id: &str) -> Vec<Value> {
     let id = bot_id.trim();
     if id.is_empty() {
@@ -837,6 +857,7 @@ pub async fn auto_provision_guest(
         };
         match tg.boot(&target, Some(&token)).await {
             Ok(entry) => {
+                remember_env_identity(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
                 save_session_meta(&entry.identity.id, &entry.identity.username, &entry.identity.first_name);
                 let meta = load_session_meta();
                 return Ok(ProvisionResult {

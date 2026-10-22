@@ -282,6 +282,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 match boot_state.telegram.boot(&id, Some(&token)).await {
                     Ok(entry) => {
+                        // Real @username/name for the pool list (see
+                        // `session::remember_env_identity`).
+                        session::remember_env_identity(
+                            &entry.identity.id,
+                            &entry.identity.username,
+                            &entry.identity.first_name,
+                        );
                         if idx == 0 && session::get_bot_id().is_empty() {
                             session::save_session_meta(
                                 &entry.identity.id,
