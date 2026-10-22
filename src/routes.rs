@@ -862,8 +862,6 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
                 // shared by every instance; the rest are this instance's disk
                 // state and are not visible to its siblings).
                 "env_bots": env_bot_tokens().len(),
-                // How many bots this instance tries to keep warm (`PM_POOL_SIZE`).
-                "pool_target": crate::session::pool_target_size(),
                 "bots": list,
             }),
         );

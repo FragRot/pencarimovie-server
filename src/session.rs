@@ -29,7 +29,7 @@ use crate::config::wp_api_base;
 use crate::credentials::{save_api_secret, get_api_secret};
 use crate::httpc::http_json;
 use crate::log::log;
-use crate::storage::{env, now, storage_path};
+use crate::storage::{now, storage_path};
 
 /* ── identity ────────────────────────────────────────────────────────────── */
 
@@ -401,27 +401,20 @@ pub fn pick_pool_bot() -> Option<Value> {
     Some(picked)
 }
 
-/// How many bots this instance should keep warm (`PM_POOL_SIZE`, default **1** =
-/// the previous behaviour).
+/// Exactly ONE guest bot is leased per instance — no more, and there is **no
+/// knob** to raise it.
 ///
-/// The pool exists to spread downloads over several Telegram auth keys and to
-/// survive one bot hitting a flood-wait; every bot also brings its own
-/// `--workers` connections. **This is the only pool knob a hosted user needs** —
-/// the bots themselves are leased from the origin's own pool, so there is no
-/// token to paste anywhere.
-pub fn pool_target_size() -> usize {
-    clamp_pool_size(
-        env("PM_POOL_SIZE")
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(1),
-    )
-}
-
-/// More than 8 bots per instance buys nothing (each already brings `--workers`
-/// connections) and every lease consumes one of the origin's per-bot slots.
-fn clamp_pool_size(n: usize) -> usize {
-    n.clamp(1, 8)
-}
+/// Every guest bot is a lease from the origin's shared pool
+/// (`provision-session`, `<20` provisions per bot, 300 candidates ≈ 6 000
+/// leases total). A per-instance multiplier would therefore let anyone drain that
+/// budget just by scaling out or by setting an environment variable, so the limit
+/// is a constant rather than a setting.
+///
+/// A user who wants a bigger pool adds **their own bots** — `BOT_TOKENS` in the
+/// environment, or the dashboard's Bot Pool UI — which costs the origin nothing.
+/// Their bots count towards this same one-bot check, so adding one means no guest
+/// is leased at all.
+pub const GUEST_BOTS_PER_INSTANCE: usize = 1;
 
 /* ── guest provisioning ──────────────────────────────────────────────────── */
 
@@ -632,14 +625,11 @@ mod tests {
         );
     }
 
-    /// `PM_POOL_SIZE` is a plain number in a config var, so 0 / typo / absurd
-    /// values must not disable the pool or lease a hundred bots.
+    /// The guest-bot limit is a constant, not a setting: raising it must stay a
+    /// code change, so nobody can farm the origin's provisioning from a config var.
     #[test]
-    fn pool_size_is_clamped_to_a_sane_range() {
-        assert_eq!(clamp_pool_size(0), 1);
-        assert_eq!(clamp_pool_size(1), 1);
-        assert_eq!(clamp_pool_size(3), 3);
-        assert_eq!(clamp_pool_size(99), 8);
+    fn one_guest_bot_per_instance_is_a_constant() {
+        assert_eq!(GUEST_BOTS_PER_INSTANCE, 1);
     }
 
     /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
@@ -944,18 +934,18 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
         .unwrap_or_else(|| "Could not obtain guest bot session from server.".to_string()))
 }
 
-/// Top this instance's bot pool up to [`pool_target_size`].
+/// Make sure this instance holds at least [`GUEST_BOTS_PER_INSTANCE`] bot with a
+/// usable session, leasing ONE guest bot from the origin when it does not.
 ///
-/// Every instance leases its OWN bots from the origin. That is what makes a
-/// multi-instance deploy work with no tokens and no shared disk: `bot_pool.json`
-/// and `sessions/<bot_id>/` are per-instance state, and the download candidate
-/// filter skips a pool bot whose session lives on a different instance
-/// (measured on Heroku: 5 dynos, 14 `/api/bots` reads, 5 distinct pools of one
-/// bot each — the "extra dynos only use 1 bot" report).
+/// Why per instance and not shared: `bot_pool.json` and `sessions/<bot_id>/` are
+/// per-instance disk state, and the download candidate filter skips a pool bot
+/// whose session lives on another instance. A pooled fleet therefore aggregates
+/// one bot per instance (measured on Heroku: 5 dynos, 14 `/api/bots` reads, 5
+/// distinct pools of one bot each), and nobody can multiply that from a config
+/// var — see [`GUEST_BOTS_PER_INSTANCE`].
 ///
 /// Returns how many bots the pool holds with a usable session.
-pub async fn ensure_pool_size(tg: &crate::telegram::TelegramPool) -> usize {
-    let target = pool_target_size();
+pub async fn ensure_guest_bot(tg: &crate::telegram::TelegramPool) -> usize {
     let count = || {
         get_bot_pool()
             .iter()
@@ -965,49 +955,43 @@ pub async fn ensure_pool_size(tg: &crate::telegram::TelegramPool) -> usize {
             })
             .count()
     };
-    let mut have = count();
-    if have >= target {
-        return have;
+    // A user-supplied bot (env or dashboard) satisfies the requirement, so no
+    // guest lease is spent.
+    if count() >= GUEST_BOTS_PER_INSTANCE {
+        return count();
     }
     // The same lock provisioning uses, so a startup top-up and a
     // request-triggered provision can never log in bots concurrently.
     let _lock = match ProvisionLock::acquire(60_000).await {
         Some(l) => l,
-        None => return have,
+        None => return count(),
     };
-    have = count();
-    let had_active = !get_bot_id().is_empty();
-    while have < target {
-        match lease_guest_bot(tg).await {
-            Ok(res) => {
-                let make_active = !had_active && have == 0;
-                add_pool_bot(serde_json::json!({
-                    "bot_id": res.bot_id,
-                    "bot_username": res.bot_username,
-                    "bot_name": res.bot_name,
-                    "status": "online",
-                    "is_active": make_active,
-                    "updated_at": now(),
-                }));
-                if make_active {
-                    save_session_meta(&res.bot_id, &res.bot_username, &res.bot_name);
-                }
-                have += 1;
-                log(
-                    "pool leased guest bot",
-                    &serde_json::json!({"bot_id": res.bot_id, "have": have, "target": target}),
-                );
-            }
-            Err(e) => {
-                log(
-                    "pool lease failed",
-                    &serde_json::json!({"error": e, "have": have, "target": target}),
-                );
-                break;
-            }
-        }
+    // Re-check after the lock: a concurrent provision may have just satisfied it.
+    if count() >= GUEST_BOTS_PER_INSTANCE {
+        return count();
     }
-    have
+    let had_active = !get_bot_id().is_empty();
+    match lease_guest_bot(tg).await {
+        Ok(res) => {
+            add_pool_bot(serde_json::json!({
+                "bot_id": res.bot_id,
+                "bot_username": res.bot_username,
+                "bot_name": res.bot_name,
+                "status": "online",
+                "is_active": !had_active,
+                "updated_at": now(),
+            }));
+            if !had_active {
+                save_session_meta(&res.bot_id, &res.bot_username, &res.bot_name);
+            }
+            log(
+                "pool leased guest bot",
+                &serde_json::json!({"bot_id": res.bot_id, "bots": count()}),
+            );
+        }
+        Err(e) => log("pool lease failed", &serde_json::json!({"error": e})),
+    }
+    count()
 }
 
 /// Only used by `/api/provision` to echo the secret; kept here so the route has

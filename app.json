@@ -31,11 +31,6 @@
       "description": "Optional pool of Telegram bot tokens, comma/space/newline separated. Set this when running more than one instance: the bot pool file lives on each instance's own ephemeral disk, so a bot added in the dashboard is only used by the instance that stored it. With BOT_TOKENS every instance logs in all of them and downloads are spread across the pool.",
       "value": "",
       "required": false
-    },
-    "PM_POOL_SIZE": {
-      "description": "How many Telegram bots each instance keeps warm (1-8, default 1). Bots are leased automatically from the server's own pool, so no tokens are needed; each bot is a separate auth key with its own connections, which spreads downloads and survives one bot hitting a flood-wait. Set 2-3 per instance when running many instances behind one domain.",
-      "value": "1",
-      "required": false
     }
   },
   "formation": {
