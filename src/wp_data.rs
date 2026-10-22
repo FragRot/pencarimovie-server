@@ -513,7 +513,11 @@ pub async fn stream_files_by_title(
         ("type".to_string(), media_type.to_string()),
         ("title".to_string(), title.to_string()),
     ];
-    if !year.is_empty() {
+    // Series files in the origin database almost never have the `year` column populated
+    // (filenames are e.g. Show.S01E01.mkv). Passing `year` causes the origin to filter
+    // `WHERE year = ...`, returning 0 rows or dropping 70-100% of episode files.
+    // Like `stream_files_episode` and the legacy PHP engine, series queries must not pass `year`.
+    if !year.is_empty() && media_type != "series" {
         params.push(("year".to_string(), year.to_string()));
     }
     if !id.is_empty() {
@@ -537,7 +541,28 @@ pub async fn stream_files_by_title(
     // request answer "no file matched the title" (measured: `tt11540908:1:1`
     // "Carrie" returned 75,264 B of real files that were parsed as ZERO).
     let items = rows_of(&res, &["items", "files"]);
-    let files = items.iter().filter_map(wp_file_from).collect();
+    let mut files: Vec<WpFile> = items.iter().filter_map(wp_file_from).collect();
+
+    // If year was passed (e.g. for a movie) and returned 0 files, fallback to querying
+    // without year so files untagged with a release year in WordPress can still be found
+    // and verified by the local matcher.
+    if files.is_empty() && !year.is_empty() && media_type != "series" {
+        let mut fallback_params = vec![
+            ("type".to_string(), media_type.to_string()),
+            ("title".to_string(), title.to_string()),
+        ];
+        if !id.is_empty() {
+            fallback_params.push(("id".to_string(), id.to_string()));
+        }
+        let fallback_url = query_add(rest_route("stream_files"), &fallback_params);
+        let fallback_res = httpc::cached_wp_json(&fallback_url, stream_ajax_ttl("stream_files"), 15).await;
+        let fallback_items = rows_of(&fallback_res, &["items", "files"]);
+        let fallback_files: Vec<WpFile> = fallback_items.iter().filter_map(wp_file_from).collect();
+        if !fallback_files.is_empty() {
+            files = fallback_files;
+        }
+    }
+
     (resolved_title, resolved_year, files)
 }
 

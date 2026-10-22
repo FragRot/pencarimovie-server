@@ -210,9 +210,30 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|| storage::env("PM_LISTEN_HOST"))
         .or_else(|| storage::env("HOST"))
         .unwrap_or_else(|| default_bind_host(cfg!(target_os = "android"), paas_env_present()).to_string());
+    // DEFAULT: 4 connections, on every platform.
+    //
+    // `workers × inflight` is the number of `upload.getFile` parts the engine can
+    // have in flight — a SHARED budget for every viewer, not a per-viewer one.
+    // With the old default of ONE connection that budget was 8 parts for the whole
+    // process, so a single player that seeks once while another stream is open kept
+    // the route queued: a 55-request real session at `--workers 1` logged repeated
+    // `download refused` / `pre-flight budget exhausted`, while the same session at
+    // `--workers 4` logged 55/55 served with `timed out: 0`, `gate saturated: 0`,
+    // `attempt failed: 0`, `download refused: 0` (Telegram's `FLOOD_WAIT` 1-3 s on
+    // individual parts is absorbed by the per-part retry path). 4 x 8 = 32 parts is
+    // also the shape the engine's own inflight note describes as correct — the TS
+    // port holds 200/200 with 4 sessions x 4 in flight — and `grammers` multiplexes
+    // a whole DC over ONE connection, so parallel connections are the only way to
+    // scale a busy host.
+    //
+    // Measured on a phone (CPH2581, API 36) as well as on desktop: 8/8 sequential
+    // and 4/4 concurrent 512 KB reads succeed at the default, so this does not cost
+    // correctness on Android. `PM_WORKERS` overrides it, matching the other knobs
+    // (`PM_INFLIGHT`, `PM_LISTEN_PORT`); a handset can still pass `--workers 1`.
     let workers: usize = arg_value("--workers")
+        .or_else(|| storage::env("PM_WORKERS"))
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
+        .unwrap_or(4)
         .max(1);
     // Telegram's own guidance is N connections x a handful of in-flight parts
     // per connection. grammers multiplexes a whole DC over ONE connection, so

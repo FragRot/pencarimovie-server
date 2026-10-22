@@ -369,30 +369,54 @@ pub async fn bridged_catalogs(settings: &Value) -> (Vec<Value>, Vec<String>) {
 /// The LOCAL catalogs (`local_count`, i.e. `pm_*`) are never dropped — they are
 /// the addon's own rows, and trimming those would break the dashboard.
 pub fn fit_descriptor(mut manifest: Value, local_count: usize) -> Value {
+    let start_len = serde_json::to_string(&manifest)
+        .map(|t| t.len())
+        .unwrap_or(0);
+    let mut dropped: Vec<String> = Vec::new();
     loop {
         let len = serde_json::to_string(&manifest)
             .map(|t| t.len())
             .unwrap_or(0);
         if len <= MANIFEST_DESCRIPTOR_BUDGET {
-            return manifest;
+            break;
         }
         let cats = match manifest.get_mut("catalogs").and_then(|v| v.as_array_mut()) {
             Some(c) => c,
-            None => return manifest,
+            None => break,
         };
         if cats.len() <= local_count {
             log(
                 "manifest over the descriptor budget with only local catalogs",
                 &json!({"bytes": len, "catalogs": cats.len()}),
             );
-            return manifest;
+            break;
         }
-        let dropped = cats.pop();
+        match cats.pop() {
+            Some(d) => dropped.push(s(&d, "id")),
+            None => break,
+        }
+    }
+    // ONE line, never one per dropped row. An upstream advertising 300+ catalogs
+    // made this loop drop 193 rows on EVERY manifest build and emit 193 log lines
+    // each time — measured 3,021 of the last 4,000 log lines, which buried the
+    // events that actually need reading (failed downloads, NO_STREAMS incidents).
+    if !dropped.is_empty() {
+        let end_len = serde_json::to_string(&manifest)
+            .map(|t| t.len())
+            .unwrap_or(start_len);
         log(
-            "manifest descriptor over budget, dropping a bridged catalog",
-            &json!({"bytes": len, "dropped": dropped.map(|d| s(&d, "id")).unwrap_or_default()}),
+            "manifest descriptor over budget, bridged catalogs dropped",
+            &json!({
+                "from_bytes": start_len,
+                "to_bytes": end_len,
+                "budget": MANIFEST_DESCRIPTOR_BUDGET,
+                "dropped": dropped.len(),
+                "first_dropped": dropped.first().cloned().unwrap_or_default(),
+                "last_dropped": dropped.last().cloned().unwrap_or_default(),
+            }),
         );
     }
+    manifest
 }
 
 /* ── catalog forwarding ───────────────────────────────────────────────────── */

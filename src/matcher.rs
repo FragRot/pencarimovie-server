@@ -1986,6 +1986,156 @@ mod tests {
     }
 
     #[test]
+    fn series_matches_hey_kay_navin_unyeared_file() {
+        assert!(series_file_matches_title(
+            "Hey.Kay.Navin.S01E01.Something.New.1080p.ZEE5.WEB.DL.DDP5.1.mkv",
+            "Hey Kay Navin? 2026 • TvSeries",
+            1,
+            1,
+            "2026",
+            "",
+            &["Something New".to_string()]
+        ));
+        assert!(series_file_matches_title(
+            "Hey.Kay.Navin.S01E01.Something.New.1080p.ZEE5.WEB.DL.DDP5.1.mkv",
+            "Hey Kay Navin",
+            1,
+            1,
+            "2026",
+            "",
+            &["Something New".to_string()]
+        ));
+    }
+
+    /// Verbatim port of the `MUST NOT REGRESS` cases in
+    /// `legacy/php/test_kudrat_series.php` (which backend.php:9347 names as this
+    /// guard's regression test). `series_year` is the FIRST year of the entry
+    /// title, exactly as the PHP derives `$postYear`.
+    ///
+    /// Do NOT relax: "The Glory" (2022, Netflix Korean) and "Glory" (2025) are
+    /// different shows. The year guard exists to keep them apart, and the
+    /// single-word foreign-indicator guard must NOT run for a leading-"The"
+    /// title or the whole Korean/NF catalogue of The Glory disappears.
+    #[test]
+    fn series_glory_cases_from_php_regression_suite() {
+        // (title, year, file, caption, season, episode, expect)
+        let cases: [(&str, &str, &str, &str, i32, i32, bool); 11] = [
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "Kudrat.1968.High.Council.2026.EP1.MalaySub.mp4",
+                "Kudrat 1968: High Council (2026) EP1 MalaySub",
+                1,
+                1,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "KUDRAT.1968.High.Council.2026.EP1.kakifilem.mp4",
+                "KUDRAT (1968) High Council (2026) EP1 kakifilem",
+                1,
+                1,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "FNP22.Kudrat.1968.High.Council.2026.EP01.Subs.Malay.mp4",
+                "KUDRAT 1968: HIGH COUNCIL (2026) MALAY #EP01",
+                1,
+                1,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "Kudrat.1968.High.Council.S01E01.Teguh.1080p.NF.WEB.DL.AAC2.0.H.264.mkv",
+                "Kudrat.1968.High.Council.S01E01.Teguh.1080p.NF.WEB-DL.AAC2.0.H.264-snomyuoua",
+                1,
+                1,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "Kudrat.1968.High.Council.S01E04.Teguh.1080p.NF.WEB.DL.AAC2.0.H.264.mkv",
+                "Kudrat.1968.High.Council.S01E04.Teguh.1080p.NF.WEB-DL.AAC2.0.H.264-snomyuoua",
+                1,
+                4,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "Kudrat.1968.High.Council.S01E01.1968.1080p.NF.WEB.DL.AAC2.0.H.264.mkv",
+                "Kudrat.1968.High.Council.S01E01.1968.1080p.NF.WEB-DL.AAC2.0.H.264-snomyuoua",
+                1,
+                1,
+                true,
+            ),
+            (
+                "Kudrat 1968: High Council 2026 • TvSeries",
+                "1968",
+                "KUDRAT.1968.High.Council.2026.EP2.kakifilem.mp4",
+                "KUDRAT (1968) High Council (2026) EP2 kakifilem",
+                1,
+                1,
+                false,
+            ),
+            (
+                "Kudrat 1968: High Council • TvSeries",
+                "1968",
+                "Kudrat.1968.High.Council.2026.EP1.MalaySub.mp4",
+                "Kudrat 1968: High Council EP1 MalaySub",
+                1,
+                1,
+                true,
+            ),
+            (
+                "The Glory 2022 • TvSeries",
+                "2022",
+                "The.Glory.S01E16.Hindi.English.Korean.480p.WEB.DL.ESubs.BollyFlix.mkv",
+                "The Glory S01E16 Hindi English Korean 480p WEB-DL ESubs BollyFlix",
+                1,
+                16,
+                true,
+            ),
+            (
+                "The Glory 2022 • TvSeries",
+                "2022",
+                "The.Glory.2022.S01E16.1080p.WEB.DL.Hindi.Korean.AAC.mkv",
+                "The Glory 2022 S01E16 1080p WEB-DL Hindi Korean AAC",
+                1,
+                16,
+                true,
+            ),
+            (
+                "Glory 2025 • TvSeries",
+                "2025",
+                "The.Glory.S01E16.Hindi.English.Korean.480p.WEB.DL.ESubs.BollyFlix.mkv",
+                "The Glory S01E16 Hindi English Korean 480p WEB-DL ESubs BollyFlix",
+                1,
+                16,
+                false,
+            ),
+        ];
+        for (i, (title, year, file, caption, s, e, expect)) in cases.iter().enumerate() {
+            assert_eq!(
+                series_file_matches_title(file, title, *s, *e, year, caption, &[]),
+                *expect,
+                "php case {} {}  S{}E{}\n  series: {}\n  file:   {}",
+                i + 1,
+                if *expect { "expect=match" } else { "expect=no-match" },
+                s,
+                e,
+                title,
+                file
+            );
+        }
+    }
+
+    #[test]
     fn series_rejects_unrelated_year() {
         assert!(!series_file_matches_title(
             "Some.Other.Show.2015.S01E01.1080p.mkv",

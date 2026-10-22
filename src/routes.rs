@@ -2294,9 +2294,53 @@ async fn resolve_episode_files(
     season: i32,
     episode: i32,
 ) -> EpisodeResolution {
+    resolve_episode_files_with(post_id, "", Vec::new(), title, year, imdb_id, season, episode).await
+}
+
+/// The same ladder for a series reached through an EXTERNAL id (`tt…`, `tmdb:…`).
+///
+/// The PHP runs
+/// `fd_fetch_episode_stream_files(0, $targetSeason, $targetEpisode, 250,
+/// ['title' => …, 'year' => …, 'id' => $itemId, 'imdb_id' => …, 'episode_names' => …])`
+/// (backend.php:17093): postId **0**, so step 0 has no post to read, the origin's
+/// `id` parameter is the EXTERNAL id, and every other step runs off the resolved
+/// title. Skipping it left the `tt…` route with only the title search's first
+/// page — measured `tt21344706` S01E01 → **20** files, while the same episode
+/// through `pm:post:8798798206` → **86**.
+///
+/// `seed` is whatever the caller already resolved (the title search). It goes
+/// through the same `$add()` filter below, so it cannot smuggle in a foreign file.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_external_episode_files(
+    external_id: &str,
+    title: &str,
+    year: &str,
+    imdb_id: &str,
+    season: i32,
+    episode: i32,
+    seed: Vec<crate::wp_data::WpFile>,
+) -> EpisodeResolution {
+    resolve_episode_files_with("", external_id, seed, title, year, imdb_id, season, episode).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_episode_files_with(
+    post_id: &str,
+    external_id: &str,
+    seed: Vec<crate::wp_data::WpFile>,
+    title: &str,
+    year: &str,
+    imdb_id: &str,
+    season: i32,
+    episode: i32,
+) -> EpisodeResolution {
     const MAX_FILES: usize = 250;
     /// `$thinThreshold = max(3, ceil($maxFiles / 4))` — backend.php:10290.
     const THIN_MIN: usize = 3;
+
+    // A post id is only usable when it is all digits. The external route arrives
+    // with none, exactly like the PHP's `$postId = 0`.
+    let has_post = !post_id.is_empty() && post_id.chars().all(|c| c.is_ascii_digit());
 
     let mut title = title.to_string();
     let mut year = year.to_string();
@@ -2316,8 +2360,37 @@ async fn resolve_episode_files(
         upstream::episode_names(&settings, imdb_id, season, episode, &title, &year).await
     };
 
+    // ── 0a. what the caller already resolved ─────────────────────────────────
+    // On the external route this is the title search. It runs through `$add()`
+    // like every other source, so the strict matcher still decides.
+    if !seed.is_empty() {
+        add_episode_files(
+            &mut all,
+            &mut seen,
+            &seed,
+            &title,
+            &keyword,
+            &year,
+            season,
+            episode,
+            &episode_names,
+            MAX_FILES,
+        );
+        log(
+            "stream: episode files from the title search",
+            &serde_json::json!({
+                "external_id": external_id, "season": season, "episode": episode,
+                "searched": seed.len(), "matched": all.len(),
+            }),
+        );
+    }
+
     // ── 0. the post's own file set ───────────────────────────────────────────
-    let post_files = crate::wp_data::fetch_post_files_paged(post_id, 200, 600, 3).await;
+    let post_files = if has_post {
+        crate::wp_data::fetch_post_files_paged(post_id, 200, 600, 3).await
+    } else {
+        Vec::new()
+    };
     if !post_files.is_empty() {
         if year.is_empty() {
             if let Some(derived) = crate::wp_data::derive_year_from_files(&post_files) {
@@ -2354,8 +2427,15 @@ async fn resolve_episode_files(
 
     // ── 1. the per-episode index search ──────────────────────────────────────
     let mut fast_path_done = false;
-    if all.len() < MAX_FILES && post_id.chars().all(|c| c.is_ascii_digit()) {
-        let id_param = format!("post:{}", post_id);
+    if all.len() < MAX_FILES && (has_post || !external_id.is_empty()) {
+        // The origin resolves the identity from this `id`. With a post it is
+        // `post:<id>`; on the external route it is the `tt…`/`tmdb:…` id itself
+        // — the PHP's `'id' => $itemId` (backend.php:17096).
+        let id_param = if has_post {
+            format!("post:{}", post_id)
+        } else {
+            external_id.to_string()
+        };
         let more = crate::wp_data::stream_files_episode(
             "series",
             &keyword,
@@ -2409,7 +2489,7 @@ async fn resolve_episode_files(
 
     // ── 2. `get_post` when the title is still unknown ────────────────────────
     let mut fetched_fallback_post = false;
-    if title.is_empty() {
+    if title.is_empty() && has_post {
         // Cache-first, so this is normally free: the route already asked for it.
         let p = crate::wp_data::get_post(post_id).await;
         let t = crate::wp_data::post_title(&p);
@@ -2632,6 +2712,20 @@ async fn handle_external_stream(
             title = if r2.is_empty() { aka.clone() } else { r2 };
         }
     }
+    // Clean keyword fallback: if title with symbols/decorations returned no files,
+    // retry with cleaned title (e.g. without punctuation / trailing type tags).
+    if files.is_empty() {
+        let clean = stream_keyword_from_post_title(&title);
+        if !clean.is_empty() && clean != title {
+            let (r3, _, f3) = crate::wp_data::stream_files_by_title(kind, &clean, &year, item_id).await;
+            if !f3.is_empty() {
+                files = f3;
+                if !r3.is_empty() {
+                    title = r3;
+                }
+            }
+        }
+    }
     // The origin answers `resolved_title` with the SEARCH KEYWORD, not the real
     // title (it drops a trailing type word: "The Super Mario Galaxy"), so the
     // matcher is given both names — the type-word rule is what keeps that case
@@ -2643,6 +2737,30 @@ async fn handle_external_stream(
         );
         title = resolved;
     }
+
+    // A SERIES must run the FULL `fd_fetch_episode_stream_files()` ladder, not
+    // just the title search. The title search answers a single page; the
+    // per-episode index search and the probe ladder are what surface the
+    // episode's other releases (another group's copy, other qualities). The PHP
+    // enters that ladder with postId 0 on this branch (backend.php:17093), which
+    // is exactly what `resolve_external_episode_files()` is for.
+    let (eff_season, eff_episode) = effective_season_episode(kind == "series", season, episode);
+    if kind == "series" {
+        let r = resolve_external_episode_files(
+            item_id,
+            &title,
+            &year,
+            &episode_media_id,
+            eff_season,
+            eff_episode,
+            files,
+        )
+        .await;
+        title = r.title;
+        year = r.year;
+        files = r.files;
+    }
+
     Some(
         build_streams_from_files(
             ctx,
@@ -2653,8 +2771,8 @@ async fn handle_external_stream(
             &aka,
             &episode_media_id,
             files,
-            season,
-            episode,
+            eff_season,
+            eff_episode,
             upstream,
         )
         .await,

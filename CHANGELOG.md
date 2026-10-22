@@ -2,6 +2,38 @@
 
 All notable changes to the PencariMovie Server / Downloader project will be documented in this file.
 
+## [2.9.7] - 2026-10-22
+
+### Fixed
+
+- **Series returned "No Streams Found" when opened through an external id** (`tt…`,
+  `tmdb:…`). Two separate causes, both on the origin query rather than the matcher:
+  - `/stream-files` was sent `year=…` for series. The origin applies it as a real
+    filter and series episode rows are un-tagged, so `title=Hey Kay Navin&year=2026`
+    answered 0 rows where `title=Hey Kay Navin` answered 10. `year` is now omitted for
+    series (matching the PHP at `backend.php:10180`), with a no-year retry for movies.
+  - The external-id route never ran the episode ladder. The PHP calls
+    `fd_fetch_episode_stream_files(0, …)` (`backend.php:17093`); this port only did the
+    title search, so one episode listed 20 files through `tt…` and 86 through
+    `pm:post:…`. The route now runs the same ladder with the external id as the origin
+    `id`.
+- **`--workers` default raised from 1 to 4 on every platform.** `workers × inflight`
+  is the `upload.getFile` part budget shared by all viewers, and 1 connection meant 8
+  parts for the whole process — a second stream starved the first. A real session at
+  `--workers 1` logged repeated `download refused`; at 4 it logged 55/55 served with
+  zero refusals. `PM_WORKERS` overrides it.
+- **Manifest descriptor trimming no longer floods the log.** One line per dropped
+  bridged catalog (3,021 of the last 4,000 log lines with a 300-catalog upstream) is
+  now a single summary with `from_bytes`/`to_bytes`/`dropped`.
+
+### Added
+
+- **PHP `MUST NOT REGRESS` matcher cases ported** from
+  `legacy/php/test_kudrat_series.php`: 11 cases covering "The Glory" (2022) vs
+  "Glory" (2025) and the embedded-name-year titles ("Kudrat 1968: High Council 2026").
+  They pin the strict leading-"The" check, the single-word year guard and the
+  single-word foreign-indicator exemption.
+
 ## [2.3.3] - 2026-09-29
 
 ### Added
