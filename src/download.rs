@@ -816,6 +816,19 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         );
     };
 
+    // Which bot actually serves this request. `pick_pool_bot()` round-robins over
+    // the pool, so a burst must show several bot ids here — that is how streaming
+    // load balancing is verified (group the lines by bot_id in the logs).
+    log(
+        "download served by bot",
+        &serde_json::json!({
+            "bot_id": bot_id,
+            "short_code": short_code,
+            "pool_size": candidates.len(),
+            "range": ctx.hdr("range"),
+        }),
+    );
+
     file_name = stream_filename(&file_name, &file_mime);
     file_mime = guess_video_mime(&file_name, &file_mime);
 
