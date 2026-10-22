@@ -202,6 +202,10 @@ jobs:
             "https://api.heroku.com/apps/${HEROKU_APP}" \
             | python3 -c 'import json,sys;print(json.load(sys.stdin).get("web_url",""))')"
           [ -n "$URL" ] || URL="https://stream.pencarimovie.com"
+          # Heroku's `web_url` ends with a SLASH (`https://<app>.herokuapp.com/`),
+          # so `${URL}/api/version` produced `…herokuapp.com//api/version`. Some
+          # proxies and the dashboard's URL checks treat that as a different path.
+          while [ "${URL%/}" != "$URL" ]; do URL="${URL%/}"; done
           echo "Probing ${URL}/api/version"
 
           for i in $(seq 1 30); do
