@@ -80,6 +80,11 @@ pub fn is_temp_app_dir(dir: &Path) -> bool {
     real.to_string_lossy().contains("frankenphp_")
 }
 
+/// Does this directory look like an existing install?
+///
+/// `session.madeline` is the marker a **legacy PHP** install leaves behind; it is
+/// checked so upgrading in place finds the same `storage/` instead of creating a
+/// second one. Nothing here writes that name any more.
 pub fn storage_has_session(dir: &Path) -> bool {
     dir.join("session.madeline").exists()
         || dir.join("bot_id.txt").exists()

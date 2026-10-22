@@ -1,6 +1,6 @@
 //! Bot API `file_id` decoder.
 //!
-//! Port of `vendor/danog/madelineproto/src/MTProtoTools/Files.php`
+//! Bot API `file_id` decoding — the TL layout Telegram uses for file references.
 //! (`unpackFileId`) plus `vendor/danog/tg-file-decoder` (`base64urlDecode`,
 //! `rleDecode`, TL string). grammers needs an
 //! `InputDocumentFileLocation { id, access_hash, file_reference }` **and** the

@@ -1184,7 +1184,6 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
             .unwrap_or_default();
         let target = match base.as_str() {
             "debug.log" => Some(storage_path("debug.log")),
-            "madelineproto.log" => Some(storage_path("MadelineProto.log")),
             _ => None,
         };
         let Some(target) = target else {

@@ -830,7 +830,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         let reason = if flood > 0 { "RATE_LIMITED" } else { "NO_SESSION" };
         record_refusal(
             ctx, started, status, reason,
-            &boot_err.clone().unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
+            &boot_err.clone().unwrap_or_else(|| "No valid Telegram session.".to_string()),
             &short_code,
             serde_json::json!({
                 "bots_tried": tried.len(),
@@ -848,7 +848,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             .unwrap_or_default();
         let mut body = serde_json::json!({
             "ok": 0,
-            "message": boot_err.unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
+            "message": boot_err.unwrap_or_else(|| "No valid Telegram session.".to_string()),
             // The verbatim Telegram error, always present so nothing is hidden
             // behind a friendly line: "rpc error 420: FLOOD_WAIT caused by
             // auth.importBotAuthorization (value: 460)", "API credentials are

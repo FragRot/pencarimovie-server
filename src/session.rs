@@ -172,19 +172,6 @@ pub fn clear_bot_id() {
     let _ = fs::remove_file(bot_id_cache_path());
 }
 
-/// PHP path for the *session directory*; the port's own session file lives in it.
-pub fn get_bot_session_path(bot_id: &str) -> PathBuf {
-    let id = bot_id.trim();
-    if id.is_empty() {
-        return storage_path("session.madeline");
-    }
-    let safe: String = id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    storage_path(&format!("sessions/{}/session.madeline", safe))
-}
-
 pub fn has_local_session(bot_id: &str) -> bool {
     let id = bot_id.trim();
     if !id.is_empty() {
@@ -855,6 +842,7 @@ pub fn clear_session_directory(dir: &std::path::Path) {
 
 pub fn clear_session() {
     let _ = fs::remove_dir_all(storage_path("sessions"));
+    // Legacy PHP (MadelineProto) session directory, if this install ever had one.
     let _ = fs::remove_dir_all(storage_path("session.madeline"));
     crate::telegram::disconnect_all();
 }

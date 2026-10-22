@@ -1,14 +1,13 @@
-//! The `madeline` group of the ledger, re-implemented on grammers.
+//! Telegram transport on `grammers`.
 //!
-//! `fd_boot_madeline()` / `fd_ensure_ipc_worker()` / the IPC state helpers have
-//! no counterpart by design: grammers is a library, not an out-of-process IPC
-//! server, so the port keeps live `Client`s per bot and reuses them for every
-//! Range request. What must match is the BEHAVIOUR:
+//! Live `Client`s are kept per bot and reused for every Range request — there is
+//! no out-of-process worker and no IPC layer, because grammers is a library.
+//! What matters here:
 //!
 //! * a session that survives restarts (a JSON file implementing `Session`),
 //! * a login path of its own (`auth.ImportBotAuthorization` via
 //!   `Client::bot_sign_in`, never a copied session),
-//! * `downloadToBrowser()` replaced by `iter_download()` + `chunk_size` /
+//! * a download primitive built on `iter_download()` + `chunk_size` /
 //!   `skip_chunks` (the per-connection Telegram primitive),
 //! * `FILE_REFERENCE_EXPIRED` surfaced as a typed error so the caller can
 //!   re-resolve once.
@@ -39,9 +38,8 @@ use crate::fileid::{DecodedFileId, is_document_file_id, location_kind};
 use crate::log::log;
 use crate::storage::storage_path;
 
-/// The port's own session file, kept in the same per-bot directory the PHP uses
-/// (`storage/sessions/<bot_id>/`) but with a name that cannot be mistaken for a
-/// MadelineProto session.
+/// The session file, kept per bot in `storage/sessions/<bot_id>/` with a name
+/// that cannot be mistaken for a session written by the old PHP server.
 pub const SESSION_FILE: &str = "session.rust.json";
 
 pub fn session_dir(bot_id: &str) -> PathBuf {
