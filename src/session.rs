@@ -436,6 +436,96 @@ pub fn pick_pool_bot() -> Option<Value> {
 /// is leased at all.
 pub const GUEST_BOTS_PER_INSTANCE: usize = 1;
 
+/* ── login flood guard ───────────────────────────────────────────────────── */
+
+/// When Telegram rate-limited us, and until when — kept in the server's own cache
+/// (`storage/cache.redb`, see [`crate::cache`]), not in a file of its own.
+///
+/// Telegram answers `auth.importBotAuthorization` with `420 FLOOD_WAIT` after too
+/// many logins, and **every further attempt re-arms the wait**. A public addon is
+/// the worst case for that: a client that retries (a player reopening a stream,
+/// a dozen viewers at once) turns one throttle into a permanent lockout.
+/// Measured on this deployment: 6 bots x 5 dynos logging in on one restart
+/// produced `FLOOD_WAIT (value: 455..961)` and every subsequent
+/// `/api/download` answered 403 for ~15 minutes.
+///
+/// The entry's TTL is the wait itself, so it expires by construction and nothing
+/// has to clean it up.
+const FLOOD_NS: &str = "telegram_flood";
+const FLOOD_KEY: &str = "global";
+
+/// Seconds left on the recorded flood wait (0 = nothing recorded / expired).
+pub fn flood_remaining() -> i64 {
+    crate::cache::get(FLOOD_NS, FLOOD_KEY)
+        .and_then(|v| v.get("until").and_then(|u| u.as_i64()))
+        .map(|until| (until - now()).max(0))
+        .unwrap_or(0)
+}
+
+/// Record a `FLOOD_WAIT` seen in a boot error. Returns the seconds recorded
+/// (0 when the error was not a flood wait). Never shortens an existing wait.
+pub fn note_flood(error: &str) -> i64 {
+    let secs = parse_flood_seconds(error);
+    if secs <= 0 {
+        return 0;
+    }
+    if secs <= flood_remaining() {
+        return secs;
+    }
+    let body = serde_json::json!({"until": now() + secs, "seconds": secs, "recorded_at": now()});
+    crate::cache::put(FLOOD_NS, FLOOD_KEY, &body, secs, secs);
+    log("telegram login flood wait recorded", &body);
+    secs
+}
+
+/// `(value: 460)`, `value: 460`, `FLOOD_WAIT_460` — grammers/Telegram render the
+/// wait in all three shapes.
+fn parse_flood_seconds(error: &str) -> i64 {
+    let lower = error.to_ascii_lowercase();
+    if !lower.contains("flood_wait") && !lower.contains("flood wait") {
+        return 0;
+    }
+    let digits_after = |needle: &str| -> i64 {
+        if let Some(pos) = lower.find(needle) {
+            let rest = &lower[pos + needle.len()..];
+            let mut num = String::new();
+            for ch in rest.chars() {
+                if ch.is_ascii_digit() {
+                    num.push(ch);
+                } else if !num.is_empty() {
+                    break;
+                } else if ch != '_' && ch != ' ' && ch != ':' && ch != '(' {
+                    break;
+                }
+            }
+            num.parse::<i64>().unwrap_or(0)
+        } else {
+            0
+        }
+    };
+    let mut secs = digits_after("value:");
+    if secs == 0 {
+        secs = digits_after("flood_wait_");
+    }
+    if secs == 0 {
+        // Last resort: the first number after the FLOOD_WAIT marker.
+        if let Some(pos) = lower.find("flood_wait") {
+            let rest = &lower[pos..];
+            let num: String = rest
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            secs = num.parse::<i64>().unwrap_or(0);
+        }
+    }
+    if secs > 0 {
+        secs.min(86_400)
+    } else {
+        0
+    }
+}
+
 /* ── guest provisioning ──────────────────────────────────────────────────── */
 
 fn provision_lock_path() -> PathBuf {
@@ -652,6 +742,36 @@ mod tests {
         assert_eq!(GUEST_BOTS_PER_INSTANCE, 1);
     }
 
+    /// Telegram renders the login wait in several shapes, and a missed parse means
+    /// the guard does nothing while the addon keeps re-arming the throttle.
+    #[test]
+    fn flood_wait_is_parsed_from_every_shape() {
+        assert_eq!(
+            parse_flood_seconds(
+                "bot sign-in failed: request error: rpc error 420: FLOOD_WAIT caused by \
+                 auth.importBotAuthorization (value: 460)"
+            ),
+            460
+        );
+        assert_eq!(parse_flood_seconds("FLOOD_WAIT_120"), 120);
+        assert_eq!(parse_flood_seconds("rpc error 420: FLOOD_WAIT 45"), 45);
+        assert_eq!(parse_flood_seconds("bot sign-in failed: invalid token"), 0);
+        assert_eq!(parse_flood_seconds(""), 0);
+    }
+
+    /// The recorded wait must actually gate the next login — that is the whole
+    /// point of the guard (a public addon otherwise retries itself into a lockout).
+    #[test]
+    fn a_recorded_flood_wait_blocks_the_next_login() {
+        assert_eq!(flood_remaining(), 0);
+        let secs = note_flood(
+            "rpc error 420: FLOOD_WAIT caused by auth.importBotAuthorization (value: 30)",
+        );
+        assert_eq!(secs, 30);
+        assert!(flood_remaining() > 0, "a recorded wait must gate the next login");
+        assert!(flood_remaining() <= 30);
+    }
+
     /// `BOT_TOKENS` is the only bot state every instance of a scaled-out deploy
     /// shares, so the parsing has to survive whatever an operator pastes into a
     /// PaaS config var: commas, spaces, newlines, duplicates, and the usual
@@ -765,6 +885,18 @@ fn random_suffix() -> String {
 pub async fn auto_provision_guest(
     tg: &crate::telegram::TelegramPool,
 ) -> Result<ProvisionResult, ProvisionResult> {
+    // ── login flood guard ─────────────────────────────────────────────────
+    // Never attempt a login while Telegram's FLOOD_WAIT is still running: the
+    // attempt would fail AND push the wait further out, which is how a retrying
+    // public addon locks itself out. Answer instantly instead.
+    let flood = flood_remaining();
+    if flood > 0 {
+        return Err(ProvisionResult::error(format!(
+            "Telegram rate limit: bot login paused for another {}s. Please retry shortly.",
+            flood
+        )));
+    }
+
     // ── clock pre-check ───────────────────────────────────────────────────
     let clock = measure_clock_offset().await;
     if clock.ok && clock.offset.abs() > 30 {
@@ -867,10 +999,13 @@ pub async fn auto_provision_guest(
                     error: None,
                 });
             }
-            Err(e) => log(
-                "env bot token failed to boot",
-                &serde_json::json!({"bot_id": target, "error": e}),
-            ),
+            Err(e) => {
+                note_flood(&e);
+                log(
+                    "env bot token failed to boot",
+                    &serde_json::json!({"bot_id": target, "error": e}),
+                );
+            }
         }
     }
 
@@ -940,6 +1075,7 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
                 });
             }
             Err(e) => {
+                note_flood(&e);
                 log(
                     "auto provision login failed",
                     &serde_json::json!({"error": e, "bot_id": target, "attempt": attempt + 1}),

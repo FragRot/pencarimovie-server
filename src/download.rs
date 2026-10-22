@@ -796,6 +796,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 break;
             }
             Err(e) => {
+                // A FLOOD_WAIT here must stop every other request from retrying the
+                // login too — see `session::note_flood()`.
+                crate::session::note_flood(&e);
                 log("download boot failed for bot", &serde_json::json!({"bot_id": candidate, "error": e}));
                 boot_err = Some(e);
             }
@@ -814,20 +817,35 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
         }
     }
     let Some(entry) = entry else {
+        // A Telegram login flood is retryable and must NOT look like "your bot is
+        // gone": answer 429 + retry_after so a player backs off instead of
+        // hammering the login (each retry re-arms FLOOD_WAIT).
+        let flood = crate::session::flood_remaining();
+        let status = if flood > 0 { 429 } else { 403 };
+        let reason = if flood > 0 { "RATE_LIMITED" } else { "NO_SESSION" };
         record_refusal(
-            ctx, started, 403, "NO_SESSION",
+            ctx, started, status, reason,
             &boot_err.clone().unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
             &short_code,
-            serde_json::json!({"bots_tried": tried.len(), "boot_error": boot_err.clone().unwrap_or_default()}),
-        );
-        return json_response(
-            403,
-            &serde_json::json!({
-                "ok": 0,
-                "message": boot_err.unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
-                "hint": "Call /api/botlogin first to authenticate.",
+            serde_json::json!({
+                "bots_tried": tried.len(),
+                "boot_error": boot_err.clone().unwrap_or_default(),
+                "flood_remaining": flood,
             }),
         );
+        let mut body = serde_json::json!({
+            "ok": 0,
+            "message": boot_err.unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
+            "hint": if flood > 0 {
+                "Telegram rate limited the bot login. This clears by itself; retry shortly."
+            } else {
+                "Call /api/botlogin first to authenticate."
+            },
+        });
+        if flood > 0 {
+            body["retry_after"] = serde_json::json!(flood);
+        }
+        return json_response(status, &body);
     };
 
     // Which bot actually serves this request. `pick_pool_bot()` round-robins over
