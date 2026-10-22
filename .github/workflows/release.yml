@@ -47,6 +47,20 @@ env:
   # Single source of truth for the image name.
   IMAGE: ghcr.io/${{ github.repository }}
 
+# ONE run per commit.
+#
+# A human `workflow_dispatch` and the bot dispatch from `deploy-heroku.yml` used to
+# run at the same time for the same SHA, both building `:sha-<short>` and both
+# racing `gh release create` — one push showed up as three "Release Builder" runs
+# (a `github-actions[bot]` dispatch per push beside the real one). Serialising on
+# the commit turns the second run into a no-op instead of a duplicate build.
+#
+# NOT `cancel-in-progress`: a run WITH a tag must never be replaced by the
+# Docker-only dispatch (empty tag), which would silently drop the release.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: false
+
 jobs:
   # ── resolve the tag and create the release once ─────────────────────────────
   # Every downstream job used to do its own `gh release create` retry loop,

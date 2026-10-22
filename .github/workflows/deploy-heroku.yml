@@ -117,11 +117,27 @@ jobs:
           # Not yet: ask `release.yml` for a Docker-only build of this commit and
           # WAIT for the tag. Waiting on the registry (not on a run id) keeps the
           # logic simple and is immune to the dispatch/list race.
-          echo "::notice::${REF} is not published yet - dispatching release.yml (Docker-only)"
-          gh workflow run release.yml --ref main -f tag="" || {
-            echo "::error::Could not dispatch release.yml"
-            exit 1
-          }
+          #
+          # But never dispatch when a release run for THIS commit is already
+          # queued or running. That check is the difference between one release
+          # run and three: a push makes this job run while a human
+          # `workflow_dispatch` for the same SHA is still building, the registry
+          # lookup above legitimately misses (the image is not pushed yet), and
+          # the dispatch then duplicated the whole build as `github-actions[bot]`.
+          # The wait below is identical either way, so an in-flight run is simply
+          # awaited.
+          INFLIGHT="$(gh run list --workflow release.yml --commit "$GITHUB_SHA" \
+            --json status \
+            --jq '[.[] | select(.status == "queued" or .status == "in_progress")] | length')"
+          if [ "${INFLIGHT:-0}" -gt 0 ]; then
+            echo "::notice::release.yml already queued/running for $GITHUB_SHA (${INFLIGHT}) - waiting for ${REF} instead of dispatching a duplicate"
+          else
+            echo "::notice::${REF} is not published yet - dispatching release.yml (Docker-only)"
+            gh workflow run release.yml --ref main -f tag="" || {
+              echo "::error::Could not dispatch release.yml"
+              exit 1
+            }
+          fi
 
           deadline=$(( $(date +%s) + IMAGE_WAIT_SECONDS ))
           while [ "$(date +%s)" -lt "$deadline" ]; do
