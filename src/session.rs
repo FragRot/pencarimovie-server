@@ -462,6 +462,16 @@ pub fn flood_remaining() -> i64 {
         .unwrap_or(0)
 }
 
+/// The Telegram error text that produced the recorded wait, verbatim.
+///
+/// Kept so a refused login can quote Telegram instead of inventing its own
+/// wording — "FLOOD_WAIT ... (value: 460)" is what an operator can act on.
+pub fn flood_last_error() -> String {
+    crate::cache::get(FLOOD_NS, FLOOD_KEY)
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
 /// Record a `FLOOD_WAIT` seen in a boot error. Returns the seconds recorded
 /// (0 when the error was not a flood wait). Never shortens an existing wait.
 pub fn note_flood(error: &str) -> i64 {
@@ -472,7 +482,12 @@ pub fn note_flood(error: &str) -> i64 {
     if secs <= flood_remaining() {
         return secs;
     }
-    let body = serde_json::json!({"until": now() + secs, "seconds": secs, "recorded_at": now()});
+    let body = serde_json::json!({
+        "until": now() + secs,
+        "seconds": secs,
+        "recorded_at": now(),
+        "error": error,
+    });
     crate::cache::put(FLOOD_NS, FLOOD_KEY, &body, secs, secs);
     log("telegram login flood wait recorded", &body);
     secs
@@ -891,10 +906,19 @@ pub async fn auto_provision_guest(
     // public addon locks itself out. Answer instantly instead.
     let flood = flood_remaining();
     if flood > 0 {
-        return Err(ProvisionResult::error(format!(
-            "Telegram rate limit: bot login paused for another {}s. Please retry shortly.",
-            flood
-        )));
+        let last = flood_last_error();
+        return Err(ProvisionResult::error(if last.is_empty() {
+            format!(
+                "Telegram rate limit: bot login paused for another {}s. Please retry shortly.",
+                flood
+            )
+        } else {
+            // Quote Telegram, do not paraphrase it.
+            format!(
+                "Telegram rate limit: bot login paused for another {}s.\nTelegram said: {}",
+                flood, last
+            )
+        }));
     }
 
     // ── clock pre-check ───────────────────────────────────────────────────

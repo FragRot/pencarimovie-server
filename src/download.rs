@@ -554,15 +554,20 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             }
             Err(prov) => {
                 let connecting = is_guest_provision_in_progress();
+                let message = if connecting {
+                    "Connecting guest bot in progress. Please refresh or try again in a few seconds.".to_string()
+                } else {
+                    prov.error
+                        .clone()
+                        .unwrap_or_else(|| "Telegram Bot is not connected. Please connect your bot token in Settings to stream.".to_string())
+                };
                 return json_response(
                     if connecting { 503 } else { 403 },
                     &serde_json::json!({
                         "ok": 0,
-                        "message": if connecting {
-                            "Connecting guest bot in progress. Please refresh or try again in a few seconds.".to_string()
-                        } else {
-                            prov.error.unwrap_or_else(|| "Telegram Bot is not connected. Please connect your bot token in Settings to stream.".to_string())
-                        },
+                        "message": message,
+                        // Verbatim reason from Telegram / the origin, never hidden.
+                        "error_detail": prov.error.unwrap_or_default(),
                         "hint": if connecting {
                             "Guest bot session is initializing. Please refresh playback shortly."
                         } else {
@@ -833,9 +838,22 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                 "flood_remaining": flood,
             }),
         );
+        let detail = boot_err
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let last = crate::session::flood_last_error();
+                if last.is_empty() { None } else { Some(last) }
+            })
+            .unwrap_or_default();
         let mut body = serde_json::json!({
             "ok": 0,
             "message": boot_err.unwrap_or_else(|| "No valid MadelineProto session.".to_string()),
+            // The verbatim Telegram error, always present so nothing is hidden
+            // behind a friendly line: "rpc error 420: FLOOD_WAIT caused by
+            // auth.importBotAuthorization (value: 460)", "API credentials are
+            // missing: …", "bot sign-in failed: …".
+            "error_detail": detail,
             "hint": if flood > 0 {
                 "Telegram rate limited the bot login. This clears by itself; retry shortly."
             } else {
