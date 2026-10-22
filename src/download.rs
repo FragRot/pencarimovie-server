@@ -73,7 +73,8 @@ impl Drop for ActivityGuard {
     }
 }
 
-/// Cap on the pre-flight (resolve + retries + priming chunk) in seconds.
+/// Cap on ONE pre-flight attempt chain (resolve + retries + priming chunk), in
+/// seconds.
 ///
 /// Nothing in this phase has been written to the client yet, so a player that
 /// gives up leaves a request doing work for the whole retry chain: with the
@@ -81,7 +82,14 @@ impl Drop for ActivityGuard {
 /// then had several of them running at once. An abandoned pre-flight is capped
 /// so the work ends quickly; a real client is unaffected because a working
 /// resolve finishes in ~1-3 s.
+///
+/// The budget REFRESHES when an attempt makes progress (a re-resolve returned a
+/// new `file_id`, or an alternate bot was found) — see `hard_deadline` below.
 const PREFLIGHT_BUDGET_SECS: u64 = 20;
+
+/// Absolute ceiling on the whole pre-flight, across however many budget refreshes
+/// it earns, so a pathological resolve chain cannot hold a worker for minutes.
+const PREFLIGHT_HARD_CAP_SECS: u64 = 45;
 
 /// `file_id_mt` (preferred) or `file_id` from a resolve result, or `""`.
 fn id_of(v: &Value) -> String {
@@ -102,21 +110,93 @@ fn id_of(v: &Value) -> String {
 /// untouched — 256 KB was one part more per window 0 for no extra benefit.
 const PRIME_BYTES: u64 = 512 * 1024;
 
-/// How many 1 MB windows to keep in flight per stream.
+/// `(skip0, prime_want)` — how much to pull from `aligned` so a body that must
+/// start at `start` can be produced.
 ///
-/// Default **8**: that is the depth the PHP downloader measured at 7.5-9.7 MiB/s
-/// (see the spool notes in the root `AGENTS.md`), and 4 was clearly too shallow —
-/// a phone streaming over its own loopback managed only 0.3-0.7 MiB/s with 4.
-/// `PM_PIPELINE=<n>` overrides it, clamped to 1..=32; the `--inflight` gate is a
-/// separate bound on the real parts in flight, so a too-large value cannot open
-/// an unbounded number of `upload.getFile` calls.
+/// `aligned` sits up to 1 MB BELOW `start`, so priming with just `prime` bytes
+/// threw the WHOLE prime away as `skip` on any seek/tail request, and the
+/// follow-on windows then over-ran EOF: the response promised a `Content-Length`
+/// and delivered **0 bytes**. Measured on a real phone for a 3 229 198 462-byte
+/// file:
+///
+/// ```text
+/// -r 3229130462-   (68 KB to EOF) -> 206, content-length 68000, 0 bytes in 25 s
+/// -r 3229198459-   (final 3 bytes) -> 206, content-length 3,    0 bytes in 25 s
+/// -r 0-1048575                     -> 206, 1 048 576 bytes in 1.59 s
+/// ```
+///
+/// Every player probes the tail before it starts (MP4 `moov`, Matroska `Cues`),
+/// so that is what made playback stall right after the first request.
+fn prime_window(start: u64, aligned: u64, total: u64, file_size: u64) -> (u64, u64) {
+    let prime = total.min(PRIME_BYTES);
+    let skip0 = start.saturating_sub(aligned);
+
+    // Round the head up to a whole part (`MAX_CHUNK`, 512 KB — the largest part
+    // grammers' parser can accept), then never beyond one 1 MB block.
+    //
+    // This is not cosmetic. `plan_limit()` can only pick a big part when the
+    // position DIVIDES by it, so a head that ends on an arbitrary offset leaves
+    // the next window at an offset only 4 KB can divide — and that window is then
+    // fetched as 128-256 tiny parts instead of one. Measured on a seek
+    // (`start = aligned + 1`, 8 MB): **245 KB/s**, against 2.9 MB/s for the same
+    // request one byte earlier. Rounding the head keeps every following window at
+    // a part-friendly offset.
+    //
+    // The grain is 512 KB rather than a whole part so the FIRST bytes of the body
+    // are not delayed by a full-megabyte fetch; a head that lands on a 512 KB
+    // offset is completed to the next 1 MB boundary by one extra 512 KB window in
+    // `handle_download()` (`p % mb != 0`).
+    //
+    // MadelineProto gets the same property for free: `downloadToCallable()` plans
+    // `$x = $offset - $offset % $part_size` and steps by a whole `$part_size`
+    // (1 MB), so only its FIRST and LAST parts are partial.
+    let want = skip0.saturating_add(prime);
+    let want = want
+        .saturating_add(crate::telegram::MAX_CHUNK - 1)
+        / crate::telegram::MAX_CHUNK
+        * crate::telegram::MAX_CHUNK;
+    let want = want
+        .min(crate::telegram::MB)
+        .min(file_size.saturating_sub(aligned));
+    (skip0, want)
+}
+
+/// One fetch window, clamped so it never asks past the last byte. A window that
+/// over-runs EOF makes Telegram error and the body dies short of the
+/// `Content-Length` already sent.
+fn window(p: u64, want: u64, file_size: u64) -> Option<(u64, u64)> {
+    let avail = file_size.saturating_sub(p);
+    let w = want.min(avail);
+    (w > 0).then_some((p, w))
+}
+
+/// How many 1 MB windows to keep in flight per stream (`PM_PIPELINE` overrides,
+/// clamped to 1..=64).
+///
+/// **The part size is not tunable.** grammers' parser asserts
+/// `len < MessageContainer::MAXIMUM_SIZE`
+/// ([`grammers-mtproto-0.11.0/src/manual_tl.rs:75`](C:/Users/ewangtlex/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/grammers-mtproto-0.11.0/src/manual_tl.rs:75)),
+/// where that limit is `1_044_456 - SIZE_OVERHEAD`, so a FULL 1 MB
+/// `upload::GetFile` reply aborts the connection's runner
+/// (`SenderPoolRunner was dropped during retry at send`) and 512 KB
+/// (`telegram::MAX_CHUNK`) is a hard ceiling. MadelineProto's 1 MB parts — the
+/// reason the PHP build felt faster — are out of reach without a custom MTProto
+/// client, so concurrency is the only lever here.
+///
+/// Measured on a phone (OnePlus CPH2581, 32 MB range mid-file, same 4K MKV):
+/// `1 x 8` (the old defaults) **0.81 MB/s**; `4 x 8` 1.44; `8 x 8` 1.56;
+/// `1 x 32` 1.40-1.62; `8 x 32` 1.46-1.82; `16 x 32` 1.40 (over-subscribed).
+/// **Pipeline depth is NOT a reliable knob**: `8 x 32` measured 1.93 MB/s with
+/// `PM_PIPELINE=64` in one run and 0.52 MB/s with the same settings in the next —
+/// the phone's Telegram path varies far more than the depth helps. Hence the
+/// modest default of 16, and 8 connections x 32 parts as the app's setting.
 fn pipeline_depth() -> usize {
     static DEPTH: OnceLock<usize> = OnceLock::new();
     *DEPTH.get_or_init(|| {
         crate::storage::env("PM_PIPELINE")
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|v| v.clamp(1, 32))
-            .unwrap_or(8)
+            .map(|v| v.clamp(1, 64))
+            .unwrap_or(16)
     })
 }
 use crate::telegram::{DocTarget, prepare_file_target};
@@ -961,8 +1041,20 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // and pull the priming chunk; dropped when this function returns (either the
     // stream takes over or we give up).
     let _preflight_activity = ActivityGuard::new(&ACTIVE_PREFLIGHTS);
-    let preflight_deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS);
+    let preflight_started = std::time::Instant::now();
+    let mut preflight_deadline =
+        preflight_started + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS);
+    // The budget REFRESHES whenever an attempt earns a retry by making progress
+    // (fresh `file_id`, or an alternate bot whose reference is valid), but never
+    // past this hard cap.
+    //
+    // Without the refresh, a re-resolve whose new reference was never tried killed
+    // playback. Measured on the phone (`short_code QbgnM0`, libmpv): attempt 1
+    // answered `FILE_REFERENCE_EXPIRED (400)` after ~140 s, the forced re-resolve
+    // then returned a valid id, and the loop-top check compared against the
+    // ORIGINAL 20 s deadline, broke out immediately, and the player got
+    // `410 FILE_REFERENCE_EXPIRED` — with a working reference sitting in `target`.
+    let hard_deadline = preflight_started + std::time::Duration::from_secs(PREFLIGHT_HARD_CAP_SECS);
 
     // Prime with ONE chunk, never with `total`. `total` is the whole remaining
     // range, so a plain GET of a 4 GB file (which is what `<video>` sends on
@@ -970,7 +1062,10 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // response headers were written: the player sat at `readyState 0 /
     // networkState 2` forever and Nuvio logged "still downloading data".
     // A Range request looked fine only because there `total` was already small.
-    let prime = total.min(PRIME_BYTES);
+    // See `prime_window()`: the priming fetch must cross the `skip0` gap between
+    // `aligned` and `start`, or the prime is discarded and the tail range stalls.
+    let (skip0, prime_want) = prime_window(start, aligned, total, file_size);
+    let _ = skip0;
     for attempt in 1..=max_attempts {
         if std::time::Instant::now() >= preflight_deadline {
             log(
@@ -979,7 +1074,7 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             );
             break;
         }
-        match crate::telegram::fetch_range_gated(&client, client_gate.as_ref(), &target, aligned, prime)
+        match crate::telegram::fetch_range_gated(&client, client_gate.as_ref(), &target, aligned, prime_want)
             .await
         {
             Ok(buf) => {
@@ -1066,6 +1161,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                                 client_gate = g;
                             }
                         }
+                        // Progress: give the retry that uses this new reference
+                        // its own window (bounded by the hard cap).
+                        preflight_deadline = (std::time::Instant::now()
+                            + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+                            .min(hard_deadline);
                         continue;
                     }
                     // Same id back: walk the pool for a bot whose reference is valid.
@@ -1128,6 +1228,11 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
                             &serde_json::json!({"short_code": short_code, "wait_s": secs, "attempt": attempt}),
                         );
                         tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        // Same reasoning as above: the next attempt is a real
+                        // attempt, not a repeat of a dead reference.
+                        preflight_deadline = (std::time::Instant::now()
+                            + std::time::Duration::from_secs(PREFLIGHT_BUDGET_SECS))
+                            .min(hard_deadline);
                     }
                     continue;
                 }
@@ -1218,8 +1323,9 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     /* ── commit headers, then stream ────────────────────────────────────── */
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
     let target_for_task = target.clone();
-    let client_for_task = client.clone();
-    let gate_for_task = client_gate.clone();
+    // The whole connection pool, not one slot: a single stream must STRIPE its
+    // windows across connections (see the closure below).
+    let entry_for_task = entry.clone();
     let short_code_for_task = short_code.clone();
     let bot_for_task = bot_id.clone();
     let file_size_for_task = file_size;
@@ -1296,25 +1402,58 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
             // truncated stream (the "buffers after fast-forward" symptom).
             let mut rem = remaining + skip as u64;
             let mb = crate::telegram::MB;
-            if rem > 0 && plen > 0 && plen < mb {
-                let want = (mb - plen).min(rem);
-                plan.push((p, want));
-                p += want;
-                rem -= want;
+            // Finish the CURRENT 1 MB window first, so every later window starts on
+            // an exact 1 MB boundary — full-size Telegram parts.
+            //
+            // This used to be `plen < mb`, which silently skipped the step whenever
+            // the prime crossed a whole window. `prime_window()` now fetches
+            // `skip0 + PRIME` (up to ~1.5 MB), so `p` could stay unaligned;
+            // `plan_limit()` then collapses the part size to 4 KB and one 1 MB
+            // window costs 256 parts instead of 2 — measured as the "speed is not
+            // full speed" regression after the tail-range fix.
+            //
+            // MadelineProto keeps the same invariant: `downloadToCallable()` plans
+            // `$x = $offset - $offset % $part_size` and steps by a whole part, so
+            // only the FIRST and LAST parts are partial.
+            if rem > 0 && plen > 0 && p % mb != 0 {
+                let want = (mb - (p % mb)).min(rem);
+                if let Some(win) = window(p, want, file_size) {
+                    plan.push(win);
+                    p += win.1;
+                    rem -= win.1;
+                }
             }
             while rem > 0 {
-                let want = rem.min(mb);
-                plan.push((p, want));
-                p += want;
-                rem -= want;
+                match window(p, rem.min(mb), file_size) {
+                    Some(win) => {
+                        plan.push(win);
+                        p += win.1;
+                        rem -= win.1;
+                    }
+                    None => break,
+                }
             }
         }
 
+        // STRIPE the windows across the bot's connections instead of pinning the
+        // whole stream to ONE of them.
+        //
+        // This is the throughput fix, and it is NOT the same thing as the pipeline
+        // depth. MEASURED from a phone with a 240-250 ms RTT to the remote: ONE
+        // connection tops out at ~0.4-0.5 MB/s whatever the destination and
+        // whatever the depth — Telegram direct 0.33-0.38 MB/s, and the Heroku
+        // addon (which is itself next to Telegram and measured 4.85 MB/s from a
+        // wired PC) 0.49 MB/s from that same phone. That is a TCP window/BDP
+        // limit (`window / RTT`), so the only way past it is parallel connections:
+        // with `--workers 8` each in-flight window gets its own. Before this,
+        // `pick_slot()` was called ONCE per request, so `--workers` only ever
+        // helped *different* streams and a single viewer was stuck on one
+        // connection.
         let stream = futures_util::stream::iter(plan.into_iter().enumerate().map(|(i, (p, w))| {
-            let client = client_for_task.clone();
-            let gate = gate_for_task.clone();
+            let entry = entry_for_task.clone();
             let target = target_for_task.clone();
             async move {
+                let (client, gate) = entry.pick_slot();
                 let res =
                     crate::telegram::fetch_range_gated(&client, gate.as_ref(), &target, p, w).await;
                 (i, res)
@@ -1650,5 +1789,96 @@ mod tests {
         let name = stream_filename("video", "video/mp4");
         assert_eq!(name, "video.mp4");
         assert_eq!(guess_video_mime(&name, ""), "video/mp4");
+    }
+
+    /// The exact ranges a player sends before it starts playing. Each of these
+    /// returned `Content-Length` with **0 bytes** in 25 s before the fix, because
+    /// the prime was fetched from `aligned` with only `prime` bytes.
+    const REAL_SIZE: u64 = 3_229_198_462;
+
+    fn plan_for(start: u64, end: u64) -> (u64, u64, u64) {
+        let aligned = (start / crate::telegram::MB) * crate::telegram::MB;
+        let total = end - start + 1;
+        let (skip0, prime_want) = prime_window(start, aligned, total, REAL_SIZE);
+        // The prime is served from `aligned`, so the body can start only if it
+        // reaches `start`; anything less discards the whole prime (the bug).
+        assert!(
+            prime_want > skip0,
+            "prime ({prime_want}) must cross the skip ({skip0}) for range {start}-{end}"
+        );
+        // Never more than one part, and never past EOF.
+        assert!(prime_want <= crate::telegram::MB, "head is a single 1 MB part");
+        assert!(aligned + prime_want <= REAL_SIZE);
+        (aligned, skip0, prime_want)
+    }
+
+    #[test]
+    fn tail_of_three_bytes_primes_across_the_skip() {
+        let (aligned, skip0, want) = plan_for(REAL_SIZE - 3, REAL_SIZE - 1);
+        assert!(skip0 > 0, "base must sit below the requested start");
+        assert_eq!(aligned + want, REAL_SIZE, "the prime stops exactly at EOF");
+        assert_eq!(want - skip0, 3, "exactly the 3 requested bytes remain");
+    }
+
+    #[test]
+    fn open_ended_tail_range_primes_across_the_skip() {
+        let (aligned, skip0, want) = plan_for(REAL_SIZE - 68_000, REAL_SIZE - 1);
+        assert!(skip0 > 0);
+        assert!(aligned + want <= REAL_SIZE, "never past EOF");
+        // The head either reaches EOF or stops at one part; either way it yields
+        // bytes, and any remainder is carried by the ALIGNED windows that follow.
+        assert!(want - skip0 > 0);
+        assert_eq!(
+            aligned + want,
+            REAL_SIZE.min(aligned + crate::telegram::MB),
+            "head ends at EOF or at the next 1 MB boundary"
+        );
+    }
+
+    #[test]
+    fn prefix_range_takes_no_skip() {
+        let (aligned, skip0, want) = plan_for(0, 1_048_575);
+        assert_eq!((aligned, skip0), (0, 0));
+        assert_eq!(want, PRIME_BYTES, "unchanged: one 512 KB prime");
+    }
+
+    #[test]
+    fn mid_file_seek_still_primes_across_the_skip() {
+        let start = 900_000_000u64;
+        let (aligned, skip0, want) = plan_for(start, start + 1_048_575);
+        assert!(skip0 > 0 && skip0 < crate::telegram::MB);
+        // Rounding the head up to a part boundary lands it on a whole 1 MB part,
+        // so the next window starts 1 MB aligned (no 4 KB collapse).
+        assert_eq!(want, crate::telegram::MB);
+        assert_eq!((aligned + want) % crate::telegram::MB, 0);
+    }
+
+    #[test]
+    fn head_never_leaves_a_part_hostile_offset() {
+        // `start = aligned + 1` measured 245 KB/s before the head was rounded,
+        // because the following window sat at an offset only 4 KB divides.
+        for delta in [1u64, 4_095, 4_097, 707_072, 1_048_575] {
+            let start = 1_000_000_000 + delta;
+            let (aligned, _skip0, want) = plan_for(start, start + 8 * 1_048_576 - 1);
+            let next = aligned + want;
+            assert_eq!(
+                next % crate::telegram::MAX_CHUNK,
+                0,
+                "head ends on a part boundary for start={start} (delta={delta})"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_never_cross_eof() {
+        assert_eq!(window(REAL_SIZE - 3, 3, REAL_SIZE), Some((REAL_SIZE - 3, 3)));
+        // Asking for a 1 MB window with 3 bytes left yields those 3 bytes only.
+        assert_eq!(window(REAL_SIZE - 3, crate::telegram::MB, REAL_SIZE),
+                   Some((REAL_SIZE - 3, 3)));
+        // At EOF there is nothing left to fetch.
+        assert_eq!(window(REAL_SIZE, 1024, REAL_SIZE), None);
+        // A window well inside the file is untouched.
+        assert_eq!(window(0, crate::telegram::MB, REAL_SIZE),
+                   Some((0, crate::telegram::MB)));
     }
 }

@@ -2,12 +2,17 @@
 //! `fd_diagnostics_settings_path/settings`, `fd_diagnostics_auto_report_enabled`,
 //! `fd_diagnostics_set_auto_report`, `fd_reports_dir`, `fd_device_info`,
 //! `fd_diag_prune`, `fd_diag_record`, `fd_diag_list`, `fd_diag_counts`,
-//! `fd_diag_clear`.
+//! `fd_diag_clear`, plus the uploader (`fd_diag_report_send` / `fd_diag_flush_pending`).
 //!
 //! Same storage paths and file naming (`<type>_<unix_ms>.json`, 10 per type),
-//! same category names. The uploader (`fd_diag_report_send` / flush) is NOT
-//! ported — the port writes locally and reports `ok: 0` for a send, which is
-//! listed in PARITY.md as a gap rather than faked.
+//! same category names, and the SAME `list()` shape: `fd_diag_list()` returns a
+//! SUMMARY row carrying `file` + `sent`, and the dashboard's "Send Reports"
+//! button reads both (`pending = reports.filter(r => !r.sent).map(r => r.file)`).
+//! Returning the raw report files instead left `file` undefined, so the button
+//! could never enqueue a send and always claimed "already sent".
+//!
+//! Auto-upload on record is still NOT wired (the PHP spawns a detached worker
+//! from `fd_diag_record()`); `?send=` / `?flush=1` and `report_send()` are.
 
 use std::collections::HashMap;
 use std::fs;
@@ -122,22 +127,70 @@ fn android_build_prop() -> String {
     String::new()
 }
 
-fn android_model_and_version() -> (String, String) {
-    let prop = android_build_prop();
-    if prop.is_empty() {
-        return (String::new(), String::new());
-    }
-    let model = build_prop_lookup(&prop, "ro.product.model");
-    let release = build_prop_lookup(&prop, "ro.build.version.release");
-    let sdk = build_prop_lookup(&prop, "ro.build.version.sdk");
-    let version = if release.is_empty() {
-        String::new()
-    } else if sdk.is_empty() {
-        format!("Android {}", release)
-    } else {
-        format!("Android {} (API {})", release, sdk)
-    };
-    (model, version)
+/// `getprop <key>` — the ONLY reliable source on Android 10+.
+///
+/// Modern Android removed `/system/build.prop` (it is compiled into the
+/// build-system image and the app UID cannot read it), so the build.prop probe
+/// above silently yields nothing and every report from a real phone carried an
+/// EMPTY `model` and an `os_version` of just `"android"`. Measured on a
+/// CPH2581 / Android 16: `model:""`, `hostname:""`, `os_version:"android"`.
+fn getprop(key: &str) -> String {
+    std::process::Command::new("getprop")
+        .arg(key)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn android_model_and_version() -> (String, String, String) {
+    static CACHE: OnceLock<(String, String, String)> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let prop = android_build_prop();
+            let mut model = if prop.is_empty() {
+                String::new()
+            } else {
+                build_prop_lookup(&prop, "ro.product.model")
+            };
+            let mut release = if prop.is_empty() {
+                String::new()
+            } else {
+                build_prop_lookup(&prop, "ro.build.version.release")
+            };
+            let mut sdk = if prop.is_empty() {
+                String::new()
+            } else {
+                build_prop_lookup(&prop, "ro.build.version.sdk")
+            };
+            let mut brand = if prop.is_empty() {
+                String::new()
+            } else {
+                build_prop_lookup(&prop, "ro.product.brand")
+            };
+            // `/system/build.prop` is unreadable on Android 10+; `getprop` is not.
+            if model.is_empty() {
+                model = getprop("ro.product.model");
+            }
+            if brand.is_empty() {
+                brand = getprop("ro.product.brand");
+            }
+            if release.is_empty() {
+                release = getprop("ro.build.version.release");
+            }
+            if sdk.is_empty() {
+                sdk = getprop("ro.build.version.sdk");
+            }
+            let version = if release.is_empty() {
+                String::new()
+            } else if sdk.is_empty() {
+                format!("Android {}", release)
+            } else {
+                format!("Android {} (API {})", release, sdk)
+            };
+            (model, version, brand)
+        })
+        .clone()
 }
 
 /// Free space on the volume holding the app root, in MiB.
@@ -201,7 +254,7 @@ fn os_version_string() -> String {
     CACHE
         .get_or_init(|| {
             if cfg!(target_os = "android") {
-                let (_, v) = android_model_and_version();
+                let (_, v, _) = android_model_and_version();
                 if !v.is_empty() {
                     return v;
                 }
@@ -245,8 +298,9 @@ fn proc_value(path: &str, key: &str) -> u64 {
 /// **Android**: every `/proc` read here degrades to `0`/`""` because a
 /// non-rooted app sees a stripped `/proc` (`/proc/sys/kernel/hostname` is not
 /// readable, `/proc/self/status` and `/proc/self/fd` are). That is deliberate —
-/// a diagnostics report must never fail because a counter is missing — and the
-/// model/OS fields come from `build.prop` instead, which IS readable.
+/// a diagnostics report must never fail because a counter is missing. Model /
+/// OS / brand come from `build.prop` when it is readable (Android ≤9) and from
+/// `getprop` otherwise (Android 10+ removed `/system/build.prop`).
 pub fn device_info() -> Value {
     let mem_total_kb = proc_value("/proc/meminfo", "MemTotal");
     let mem_avail_kb = proc_value("/proc/meminfo", "MemAvailable");
@@ -266,20 +320,21 @@ pub fn device_info() -> Value {
             h
         }
     };
-    let model = if cfg!(target_os = "android") {
-        android_model_and_version().0
+    let (model, brand) = if cfg!(target_os = "android") {
+        let (m, _, b) = android_model_and_version();
+        (m, if b.is_empty() { std::env::consts::ARCH.to_string() } else { b })
     } else if hostname.is_empty() {
         // A desktop has no "model"; the hostname is the useful identifier and
         // beats the literal "?" the panel used to print.
-        std::env::consts::ARCH.to_string()
+        (std::env::consts::ARCH.to_string(), std::env::consts::ARCH.to_string())
     } else {
-        hostname.clone()
+        (hostname.clone(), std::env::consts::ARCH.to_string())
     };
     serde_json::json!({
         "device_id": get_device_id(),
         "platform": std::env::consts::OS,
         "model": model,
-        "brand": std::env::consts::ARCH,
+        "brand": brand,
         "os_version": os_version_string(),
         // `2.9.2-10-g5c61011-dirty` is support info, not a version a user should
         // read in the diagnostics panel.
@@ -320,7 +375,10 @@ pub fn prune() {
     for (_, mut files) in by_type {
         files.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, path) in files.into_iter().skip(10) {
-            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(&path);
+            // `fd_diag_prune()` unlinks `$old . '.sent'` too: leaving the
+            // sidecar behind means a later same-name report looks pre-sent.
+            let _ = fs::remove_file(format!("{}.sent", path.display()));
         }
     }
 }
@@ -344,9 +402,19 @@ pub fn record(
     let file = reports_dir().join(format!("{}_{}.json", report_type, ms));
     let mut payload = serde_json::json!({
         "report_type": report_type,
-        "platform": "server",
+        // MUST match `device_info()["platform"]`, not a literal "server".
+        // Reports were filed as `platform:"server"` while `/api/diagnostics`
+        // reported `platform:"android"`, so filtering the columnar table by
+        // platform could never find a device's own incidents — and a
+        // `platform=php|android` filter (the documented vocabulary) matched
+        // neither. `runtime` keeps the engine identity that "server" was
+        // standing in for.
+        "platform": std::env::consts::OS,
+        "runtime": "pencarimovie-server",
         "device_id": get_device_id(),
-        "app_version": app_version(),
+        // `2.9.2-10-g5c61011-dirty` is support info; `/api/diagnostics` shows the
+        // cleaned version, so a report must not disagree with the panel.
+        "app_version": crate::config::clean_version(&app_version()),
         "created_at": now(),
         "error_title": title,
         "error_message": message,
@@ -414,26 +482,54 @@ fn take_slot(seen: &mut HashMap<String, i64>, key: &str, t: i64, window_s: i64) 
     true
 }
 
+/// One `fd_diag_list()` row. Pure so the shape is pinned by a test — `file` and
+/// `sent` are the two fields the dashboard's send loop depends on.
+fn summary_row(name: &str, v: &Value, sent: bool) -> Value {
+    serde_json::json!({
+        "file": name,
+        "report_type": v.get("report_type").and_then(|x| x.as_str()).unwrap_or(""),
+        "created_at": v.get("created_at").and_then(|x| x.as_i64()).unwrap_or(0),
+        "error_title": v.get("error_title").and_then(|x| x.as_str()).unwrap_or(""),
+        "failure_reason": v.get("failure_reason").and_then(|x| x.as_str()).unwrap_or(""),
+        "item_id": v.get("item_id").and_then(|x| x.as_str()).unwrap_or(""),
+        "sent": sent,
+    })
+}
+
+/// `fd_diag_list()`: SUMMARY rows, not the raw report files.
+///
+/// The shape is load-bearing, not cosmetic: the dashboard's "Send Reports"
+/// button does
+/// `pending = reports.filter(r => !r.sent).map(r => r.file).filter(Boolean)`
+/// ([`public/app.js`](../public/app.js)). Returning the raw payload (which has
+/// neither `file` nor `sent`) made `file` undefined, so `pending` was ALWAYS
+/// empty and the button answered "Nothing to send — all N report(s) were
+/// already sent" no matter how many unsent reports were on disk. Verified on a
+/// CPH2581: `/api/diagnostics` listed 10 reports, none with `file`/`sent`.
+///
+/// The full report is still available from `/api/reports?file=<name>`.
 pub fn list() -> Vec<Value> {
     let dir = reports_dir();
-    let mut out: Vec<Value> = Vec::new();
+    let mut out: Vec<(i64, Value)> = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
         for e in entries.flatten() {
-            if e.path().extension().map(|x| x == "json").unwrap_or(false) {
-                if let Ok(text) = fs::read_to_string(e.path()) {
-                    if let Ok(v) = serde_json::from_str::<Value>(&text) {
-                        out.push(v);
-                    }
-                }
+            let path = e.path();
+            if path.extension().map(|x| x == "json").unwrap_or(false) == false {
+                continue;
             }
+            let Ok(text) = fs::read_to_string(&path) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+            let created = v.get("created_at").and_then(|x| x.as_i64()).unwrap_or(0);
+            let sent = std::path::PathBuf::from(format!("{}.sent", path.display())).is_file();
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            out.push((created, summary_row(&name, &v, sent)));
         }
     }
-    out.sort_by(|a, b| {
-        let av = a.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
-        let bv = b.get("created_at").and_then(|v| v.as_i64()).unwrap_or(0);
-        bv.cmp(&av)
-    });
-    out
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, v)| v).collect()
 }
 
 /// `fd_diag_counts()`: `<type>_<digits>.json` -> `{ type: count }`.
@@ -539,11 +635,60 @@ pub async fn flush_pending() -> (usize, usize) {
     (sent, failed)
 }
 
+/// `fd_diag_clear()` deletes EVERYTHING in the reports directory, including the
+/// `.sent` sidecars and any temp file (`glob('*')`). Only removing `*.json` left
+/// the sidecars behind, which is how a cleared install still looked "already
+/// sent" for reports that no longer existed.
+/// Background auto-upload, throttled.
+///
+/// The `auto_report` toggle was stored, reported and **never acted on**: nothing
+/// called [`report_send`] outside the explicit `?send=` / `?flush=1` routes, so
+/// "Auto-send: on" uploaded nothing. The PHP spawns a detached CLI worker per
+/// incident; this port deliberately spawns no processes, so the flush hangs off
+/// the `/api/diagnostics` poll the Android service already makes every 3s.
+///
+/// Throttled to one flush per [`AUTO_FLUSH_INTERVAL_S`]: a failing origin would
+/// otherwise be retried every 3s for each pending report.
+pub const AUTO_FLUSH_INTERVAL_S: i64 = 120;
+
+static LAST_AUTO_FLUSH: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// True when this call should start a flush (and records the attempt).
+///
+/// `compare_exchange` rather than load-then-swap, so two concurrent
+/// `/api/diagnostics` polls cannot both decide to flush.
+pub fn take_auto_flush_slot() -> bool {
+    if !auto_report_enabled() {
+        return false;
+    }
+    let t = now();
+    let last = LAST_AUTO_FLUSH.load(std::sync::atomic::Ordering::Relaxed);
+    if t - last < AUTO_FLUSH_INTERVAL_S {
+        return false;
+    }
+    LAST_AUTO_FLUSH
+        .compare_exchange(last, t, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+        .is_ok()
+}
+
+/// True when an unsent report exists — cheap, so a poll can skip the flush.
+pub fn has_pending() -> bool {
+    let Ok(entries) = fs::read_dir(reports_dir()) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let path = e.path();
+        path.extension().map(|x| x == "json").unwrap_or(false)
+            && !std::path::PathBuf::from(format!("{}.sent", path.display())).is_file()
+    })
+}
+
 pub fn clear() {
     if let Ok(entries) = fs::read_dir(reports_dir()) {
         for e in entries.flatten() {
-            if e.path().extension().map(|x| x == "json").unwrap_or(false) {
-                let _ = fs::remove_file(e.path());
+            let path = e.path();
+            if path.is_file() {
+                let _ = fs::remove_file(path);
             }
         }
     }
@@ -600,6 +745,47 @@ ro.build.description=generic_x86-user 5.1.1 LMY48Z 30 test-keys
         assert!(info["device_id"].as_str().unwrap_or("").len() >= 6);
     }
     
+    /// The dashboard's send loop needs `file` and `sent`; without them it can
+    /// never enqueue a send (measured on-device: 10 reports, 0 sendable).
+    #[test]
+    fn summary_row_carries_file_and_sent() {
+        let raw = serde_json::json!({
+            "report_type": "playback_incident",
+            "created_at": 1792659577,
+            "error_title": "download refused (HTTP 400)",
+            "failure_reason": "MISSING_FILE_ID",
+            "item_id": "pm:post:9000031194",
+            "short_code": "wyjXQu"
+        });
+        let row = summary_row("playback_incident_1792659577.json", &raw, false);
+        assert_eq!(row["file"], "playback_incident_1792659577.json");
+        assert_eq!(row["sent"], false);
+        assert_eq!(row["report_type"], "playback_incident");
+        assert_eq!(row["created_at"], 1792659577);
+        assert_eq!(row["failure_reason"], "MISSING_FILE_ID");
+        // The raw file's bulk (short_code here) is what `?file=` serves instead.
+        assert!(row.get("short_code").is_none());
+        assert_eq!(summary_row("x_1.json", &raw, true)["sent"], true);
+    }
+
+    /// A report file's `<name>.json.sent` sidecar must never be listed as its own
+    /// report (only `*.json` is, and the sidecar ends in `.json.sent`).
+    #[test]
+    fn counts_strip_only_the_trailing_timestamp() {
+        for name in [
+            "playback_incident_1792659577.json",
+            "stream_incident_1.json",
+        ] {
+            let ty = name.trim_end_matches(".json").rsplit_once('_').map(|(t, tail)| {
+                assert!(tail.chars().all(|c| c.is_ascii_digit()));
+                t.to_string()
+            });
+            let expected = name.split('_').next().unwrap();
+            assert!(ty.as_deref().unwrap().starts_with(expected));
+        }
+        assert!(!"debug.log.sent".ends_with(".json"));
+    }
+
     /// The debounce is what keeps a failing stream URL (re-requested on every
     /// range and every player reopen) from burying every other incident.
     #[test]

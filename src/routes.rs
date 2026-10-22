@@ -1043,6 +1043,21 @@ pub async fn handle(state: Arc<AppState>, req: Request<Body>) -> Response {
 
     /* ── diagnostics / reports (backend.php:19149-19202) ──────────────────── */
     if p == "/api/diagnostics" && m == "GET" {
+        // Auto-upload, driven by the Android service's 3s poll. The PHP spawns a
+        // detached CLI worker per incident; this port spawns no processes, so the
+        // flush rides here instead — otherwise `auto_report: true` uploaded
+        // nothing at all (it was stored and reported, never acted on).
+        // `has_pending()` first so an idle poll costs one `read_dir`, and
+        // `take_auto_flush_slot()` throttles a failing origin to one try / 120s.
+        if crate::diagnostics::has_pending() && crate::diagnostics::take_auto_flush_slot() {
+            let (sent, failed) = crate::diagnostics::flush_pending().await;
+            if sent + failed > 0 {
+                crate::log::log(
+                    "diag auto flush",
+                    &serde_json::json!({"sent": sent, "failed": failed}),
+                );
+            }
+        }
         let mut reports = diag_list();
         reports.truncate(10);
         // `activity` is what the Android app polls to decide whether it is
@@ -1814,6 +1829,24 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
             }
         };
         let file_name = stream_filename(&title, &jstr(&resolved, "mime"));
+        // Same rule as `stream_item()` further down: only a plain MP4/M4V/WebM may
+        // be advertised as web-ready. This branch is what a FILE catalog lists
+        // (`pm_file_<code>` / `pm:file:<code>`), and it used to hardcode
+        // `notWebReady: false`, so every MKV taken from a file catalog was handed
+        // to the HTML5 <video>. Chrome/WebView cannot demux Matroska: it reads the
+        // last bytes for the Cues, aborts, and re-requests the same URL - measured
+        // on a real phone as `range: bytes=3229198459-` (the final 3 bytes of
+        // 3229198462) every ~60s, never playing, while the identical file streamed
+        // at 10.5 MB/s through libmpv once the flag routed it there.
+        let web_ready = matches!(
+            std::path::Path::new(&file_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str(),
+            "mp4" | "m4v" | "webm"
+        );
         let mime = {
             let m = jstr(&resolved, "mime");
             let m = if m.is_empty() { jstr(&resolved, "file_type") } else { m };
@@ -1850,7 +1883,7 @@ async fn handle_stream(state: &Arc<AppState>, ctx: &ReqCtx, item_type: &str, ite
                     "behaviorHints": {
                         "filename": file_name,
                         "videoSize": size,
-                        "notWebReady": false,
+                        "notWebReady": !web_ready,
                         "bingeGroup": "pencarimovie"
                     },
                 })
