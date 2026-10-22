@@ -97,12 +97,60 @@ pub async fn resolve_shortcode_fresh(short_code: &str, bot_id: &str) -> Value {
         }
     }
     log(
-        "fresh resolve memo miss - resolving with nocache",
+        "fresh resolve memo miss - resolving with STALE report",
         &serde_json::json!({"short_code": short_code, "bot_id": bot_id}),
     );
-    let res = resolve_shortcode(short_code, bot_id, true).await;
+    let res = resolve_shortcode_stale(short_code, bot_id).await;
     if has_id(&res) {
         cache::put("resolve_fresh", &key, &res, FRESH_MEMO_TTL, 0);
+    }
+    res
+}
+
+/// `?stale=1` resolve: TELL the origin that the `file_id_mt` we hold is dead.
+///
+/// The only caller is the `FILE_REFERENCE_EXPIRED` path, so "the stored id does
+/// not work" is a fact, not a guess. `force=1&nocache=1` alone cannot fix that:
+/// it drops the Redis object cache but `tgfile_messageid()` Step 3 then reads the
+/// same `tg_file_id` row back. Measured against production — three calls (plain,
+/// plain, force+nocache) returned three **byte-identical** 71-char ids, and all
+/// three downloaded as `400 FILE_REFERENCE_EXPIRED`.
+///
+/// With `stale=1` the API drops exactly that bot's dead row and re-derives the
+/// reference from the source message, then PERSISTS the new id (`tg_file_id`), so
+/// every later resolve — any client, any instance — gets the working one. The
+/// origin rate-limits this to one refresh per (bot, short_code) per 60 s and
+/// answers 503 + `retry_after` inside that window, which is why the poll below
+/// gives up quietly instead of spinning.
+pub async fn resolve_shortcode_stale(short_code: &str, bot_id: &str) -> Value {
+    let mut bot = bot_id.trim().to_string();
+    if bot.is_empty() {
+        bot = get_bot_id();
+        if bot.is_empty() {
+            return resolve_shortcode_concurrent(short_code, &[]).await;
+        }
+    }
+    let url = format!("{}/resolve-file", wp_api_base());
+    let params = vec![
+        ("short_code".to_string(), short_code.to_string()),
+        ("bot_id".to_string(), bot.clone()),
+        ("stale".to_string(), "1".to_string()),
+    ];
+    // The refresh runs a relay pass on the origin (the relaxed 12 s budget covers
+    // it); the retries below only help when the first pass had to wait for the
+    // background pre-warm.
+    let mut res = http_json(&url, &params, "GET", 12).await;
+    for delay in [1500u64, 2000, 2000] {
+        if has_id(&res) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+        res = http_json(&url, &params, "GET", 12).await;
+    }
+    if has_id(&res) {
+        // Persist the working id so the NEXT range request skips both this ladder
+        // and the dead id in the stream payload.
+        save_resolve_cache(short_code, &bot, &res);
     }
     res
 }

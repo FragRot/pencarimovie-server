@@ -584,8 +584,18 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     // by one dyno in five.
     let usable = |id: &str| has_local_session(id) || crate::session::env_token_for(id).is_some();
 
+    // A Bot API `file_id` belongs to the bot that MINTED it — its embedded
+    // `file_reference` is not interchangeable — so rotating bots for a request
+    // that already carries a file_id is guaranteed to fail. Measured on a pool
+    // burst against one stream URL: 5 of 12 ranges returned `410
+    // FILE_REFERENCE_EXPIRED`, and every 410 body named a DIFFERENT bot than the
+    // one the id had been resolved for. Rotation therefore only happens when we
+    // still have to resolve (no `bot_id` in the payload), where `pick_pool_bot()`
+    // is exactly what spreads the *resolves* over the pool, and the id it returns
+    // is then bound to the bot that will use it.
+    let bot_bound = !bot_id.is_empty();
     let mut candidates: Vec<String> = Vec::new();
-    if !short_code.is_empty() {
+    if !bot_bound && !short_code.is_empty() {
         if let Some(picked) = pick_pool_bot() {
             let id = jstr(&picked, "bot_id");
             if !id.is_empty() {
@@ -599,10 +609,14 @@ pub async fn handle_download(state: &Arc<AppState>, ctx: &ReqCtx) -> Response {
     if !bot_id.is_empty() && !candidates.contains(&bot_id) && usable(&bot_id) {
         candidates.push(bot_id.clone());
     }
-    for b in get_bot_pool() {
-        let id = jstr(&b, "bot_id");
-        if !id.is_empty() && !candidates.contains(&id) && usable(&id) {
-            candidates.push(id);
+    // Pool bots are only useful when the payload does not name one; with a
+    // bound bot they would download with a foreign file_id and 410.
+    if !bot_bound {
+        for b in get_bot_pool() {
+            let id = jstr(&b, "bot_id");
+            if !id.is_empty() && !candidates.contains(&id) && usable(&id) {
+                candidates.push(id);
+            }
         }
     }
     if candidates.is_empty() {
