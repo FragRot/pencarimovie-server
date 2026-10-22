@@ -980,6 +980,7 @@ pub async fn auto_provision_guest(
     // Every token is tried in order: on a PaaS each instance must be able to log
     // in pool bots it did not add itself, and one expired token must not take the
     // whole pool down.
+    let mut env_err: Option<String> = None;
     for token in env_bot_tokens() {
         let id_part = token.split(':').next().unwrap_or("").trim().to_string();
         let target = if !id_part.is_empty() && id_part.chars().all(|c| c.is_ascii_digit()) {
@@ -1005,6 +1006,7 @@ pub async fn auto_provision_guest(
                     "env bot token failed to boot",
                     &serde_json::json!({"bot_id": target, "error": e}),
                 );
+                env_err = Some(format!("bot {}: {}", target, e));
             }
         }
     }
@@ -1022,7 +1024,12 @@ pub async fn auto_provision_guest(
             );
             Ok(res)
         }
-        Err(e) => Err(ProvisionResult::error(e)),
+        Err(e) => Err(ProvisionResult::error(match env_err {
+            // Report BOTH sides: the origin lease failure and why the pool bots
+            // could not be used (usually a Telegram FLOOD_WAIT).
+            Some(env) => format!("{} (pool bots: {})", e, env),
+            None => e,
+        })),
     }
 }
 
@@ -1045,6 +1052,25 @@ async fn lease_guest_bot(tg: &crate::telegram::TelegramPool) -> Result<Provision
         let ok = truthy(resp.get("ok"));
         let token = resp.get("bot_token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
         if !ok || token.is_empty() {
+            // Surface what the origin actually said. This used to be logged only,
+            // so every failure reached the player as the useless
+            // "Could not obtain guest bot session from server." — including
+            // "No eligible guest bot available (<10 subscribers, <20 provisions)"
+            // and a Cloudflare/WP error page, which need completely different
+            // reactions. `message` is the plugin's own error text.
+            let detail = resp
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(|m| m.trim().to_string())
+                .unwrap_or_default();
+            last_error = Some(if detail.is_empty() {
+                format!(
+                    "provision-session returned {}",
+                    if ok { "no bot_token" } else { "ok=0" }
+                )
+            } else {
+                format!("provision-session: {}", detail)
+            });
             log(
                 "provision endpoint returned error or incomplete payload",
                 &serde_json::json!({"resp": resp, "attempt": attempt + 1}),
